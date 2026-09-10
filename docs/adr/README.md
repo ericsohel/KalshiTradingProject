@@ -25,3 +25,5 @@ choose and why, you have not made a decision; you have made a default.
 | [0013](0013-parquet-duckdb-over-database.md) | Parquet files and DuckDB instead of a database server | accepted |
 | [0014](0014-fill-model-band.md) | Three fill models reported as a band, never one number | accepted |
 | [0015](0015-market-making-first-strategy.md) | Passive market making as the first strategy | accepted |
+| [0016](0016-client-side-rate-limit-mirror.md) | Mirror Kalshi's token buckets client-side | accepted |
+| [0017](0017-tolerant-inbound-taxonomies.md) | Inbound taxonomies decode as strings; directional bits stay closed | accepted |

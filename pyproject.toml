@@ -15,6 +15,12 @@ dependencies = [
   "zstandard>=0.23",
   # Keyframes and baked tables.
   "pyarrow>=17",
+  # REST transport; its MockTransport makes the client testable without a network.
+  "httpx>=0.27",
+  # WebSocket client with built-in ping/pong handling and per-message timeouts.
+  "websockets>=13",
+  # RSA-PSS request signing.
+  "cryptography>=43",
 ]
 
 [project.scripts]

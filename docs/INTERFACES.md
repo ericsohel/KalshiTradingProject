@@ -413,10 +413,81 @@ duplicate, and backpressure behavior is described in docs/ARCHITECTURE.md 7.1.
 `on_event` receives every trade, ticker, lifecycle event, and gap, and every snapshot
 and delta that was actually applied to a book.
 
+### 8.5 `tape.recorder.auditor`
+
 ```python
-class Auditor:                # next: samples markets, fetches REST books, diffs against local books
-class Recorder:               # next: composition root for `tape record`
+class RecordSink(Protocol):          # tape.recorder.writer; SegmentSink satisfies it
+    @property
+    def conn_id(self) -> int: ...
+    def put(self, record: Record) -> bool: ...
+
+class AuditResult(Struct): ticker; recv_wall_ns; levels_rest; levels_local;
+                           mismatched_levels; max_abs_diff_e2; exact: bool
+class AuditStats(Struct):  rounds; books_sampled; books_exact; books_mismatched;
+                           books_skipped_stale; books_missing_local; books_invalid_rest;
+                           levels_mismatched
+    exact_ratio -> tuple[int, int]   # (books_exact, books_sampled); (0, 0) means no data; never divided
+
+def round_robin_choice(tickers: Sequence[str], count: int, cursor: int) -> tuple[tuple[str, ...], int]
+
+class Auditor:
+    def __init__(self, rest: KalshiRest, books: Callable[[], Mapping[str, Book]], clock: Clock,
+                 *, sink_for: Callable[[str], RecordSink | None], sample_size: int)
+    async def audit_once(self) -> tuple[AuditResult, ...]
+    async def run(self, *, interval_s: float, stop: asyncio.Event, sleep=asyncio.sleep) -> None
+    stats: AuditStats
 ```
+
+Sampling is round-robin over sorted, non-stale tickers, so every book is audited over
+successive rounds without randomness. REST books are fetched in batches of at most 100
+and converted to YES space with `tape.wire.convert.rest_orderbook_levels`: REST has no
+`use_yes_price` flag, so `no_dollars` are NO-leg prices and are complemented into asks.
+Each comparison uses the local book as it stands when the response arrives, so a book
+that disappeared mid-request counts as `books_missing_local`. An AUDIT record goes to
+the owning connection's sink and carries that connection's id. A malformed or crossed
+REST snapshot is counted in `books_invalid_rest` and skipped; an HTTP or transport error
+skips its batch; neither stops the round.
+
+### 8.6 `tape.recorder.recorder`
+
+```python
+class PeriodicTask(Protocol):
+    async def run(self, *, stop: asyncio.Event) -> None
+class RecorderConfig(Struct): ...           # built from Settings by tape.cli.recorder_config
+PINNED_SPEC_VERSIONS: Mapping[str, str]     # copied into every segment header
+def keyframe_path(root: Path, wall_ns: int, interval_s: int) -> Path
+
+class Recorder:
+    def __init__(self, config: RecorderConfig, *, clock: Clock, rest: KalshiRest,
+                 limiter: RateLimiter, session_builder: SessionBuilder, sink_builder: SinkBuilder,
+                 sleep, jitter, periodic_tasks: Sequence[PeriodicTask] = ())
+    async def run(self) -> None
+    async def stop(self) -> None; def request_stop(self) -> None     # idempotent
+    def books(self) -> Mapping[str, Book]                            # merged across book connections
+    def sink_for(self, ticker: str) -> SegmentSink | None
+    def latest_tickers(self) -> Mapping[str, Ticker]                 # live state, never taped
+    def status(self) -> RecorderStatus
+    periodic_tasks: tuple[PeriodicTask, ...]
+```
+
+`tape.recorder.recorder` is an adapter and cannot import `tape.config`, so it takes a
+`RecorderConfig`; `tape.cli.build_recorder(settings, *, http, clock, host)` is the
+composition root that wires real dependencies and the auditor.
+
+Connection layout: connection 0 is live-only and carries the unfiltered `ticker` channel
+(ADR 0018); connection 1 is taped and carries `market_lifecycle_v2`; connections
+`2 .. 2 + book_connections - 1` are taped and carry planner groups on `orderbook_delta`
+and `trade` with `use_yes_price`. The layout must fit `max_connections`.
+
+Startup reads `GET /exchange/status` and resizes the rate limiter from
+`GET /account/limits`. Every `universe_refresh_s` the recorder pages the open,
+non-multivariate markets (logging when a listing is cut short by the page cap), selects
+the universe, replans with the previous plan, and applies each connection's groups.
+Every `keyframe_interval_s` it writes merged books to
+`data_dir/keyframes/YYYY-MM-DD/HH/MM.parquet`. Every `status_interval_s` it logs one
+structured status line. A failing periodic task is logged and does not stop capture; a
+failing supervisor surfaces. Shutdown stops periodic tasks, writes a final keyframe,
+stops every supervisor, and closes every sink so everything is flushed.
 
 The recorder's hot path per frame: read, enqueue raw bytes for the writer,
 `decode_envelope`, `GapTracker.observe`, then off the hot path full decode, book apply,
@@ -557,17 +628,58 @@ TapeError
 
 ## 17. Configuration (`tape.config`)
 
-Loaded from a TOML file plus environment overrides, validated into a frozen struct:
+A TOML file plus environment overrides, validated into frozen structs with
+`forbid_unknown_fields`, so a misspelled key is an error rather than a silent default.
+Loading uses the standard library's `tomllib`; there is no configuration dependency.
 
-```
-[kalshi]   env = "prod" | "demo"; key_id; private_key_path; rest_timeout_s = 10; ws_silence_timeout_s = 30
-[recorder] data_dir; max_connections = 16; group_size = 500; universe.min_volume_24h = "1.00";
-           universe.max_l2_markets = 4000; universe.showcase_series = ["KXBTC15M", "KXPAYROLLS", ...];
-           keyframe_interval_s = 300; audit_interval_s = 300; audit_sample = 200; writer_queue_max = 200_000
-[bus]      endpoint = "ipc:///tmp/tape.pub"; hwm = 100_000
-[api]      bind = "127.0.0.1:8080"; max_tickers_per_client = 10; max_clients = 200; cors_origins = [...]
-[engine]   mode = "replay" | "shadow" | "live"; subaccount; write_key_id; write_key_path; bankroll_e6; kill_switch = true
+```toml
+[kalshi]
+env = "prod"                    # "prod" | "demo"; REST and WS URLs derive from it
+key_id = "..."                  # the API key id, not a secret
+private_key_path = "~/.config/tape/keys/prod-read.pem"   # must be mode 600
+rest_timeout_s = 10
+ws_silence_timeout_s = 30
+
+[recorder]
+data_dir = "data"
+max_connections = 16            # ticker + control + book_connections must fit
+book_connections = 2
+group_size = 500                # at most 500 (ADR 0010)
+keyframe_interval_s = 300       # whole minutes dividing an hour
+audit_interval_s = 300
+audit_sample = 200
+writer_queue_max = 200000
+universe_refresh_s = 300
+status_interval_s = 60
+
+[recorder.universe]
+min_volume_24h = "1000.00"      # fixed-point string, never a float
+max_l2_markets = 2000
+showcase_series = ["KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDECISION"]
+exclude_mve = true
 ```
 
-Secrets are file paths, never values. `tape config check` validates and prints the
-effective configuration with secrets redacted.
+```python
+class Settings(Struct): kalshi: KalshiSettings; recorder: RecorderSettings
+def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings   # ConfigError on any problem
+def redacted(settings: Settings) -> dict[str, object]                      # for `tape config check`
+ENDPOINTS: Mapping[Env, KalshiEndpoints]                                    # prod and demo, fixed
+```
+
+Rules:
+
+- **Endpoints are never free text.** `env` selects them, so a demo key cannot be pointed at
+  production by a typo in a URL. Demo and production credentials are separate.
+- **Environment overrides** are `TAPE_<SECTION>__<KEY>`, nesting with double
+  underscores, for example `TAPE_RECORDER__UNIVERSE__MAX_L2_MARKETS=500`. A list takes
+  comma-separated items. `environ` is injected; the process environment is never read
+  globally.
+- **Paths**: a leading `~` expands from the injected `HOME`; relative paths resolve
+  against the directory holding the configuration file, not the working directory.
+- **Validation**: positive intervals, `group_size` at most 500, the private key file must
+  exist and be readable by its owner alone, and `data_dir` must be writable.
+- **Secrets are paths, never values.** `tape config check` prints the effective settings
+  with nothing to redact beyond what is already only a path.
+
+The real configuration lives in `tape.toml`, ignored by git; `config/tape.example.toml`
+is the committed template.

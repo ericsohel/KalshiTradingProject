@@ -7,4 +7,5 @@ as published at `https://docs.kalshi.com/openapi.yaml` and
 on any difference so that changes are reviewed deliberately (ADR 0003).
 
 To update: replace the files, run the contract tests, update `tape.wire` if needed,
-and record the new versions here and in `SegmentHeader.spec_versions`.
+and record the new versions here and in `PINNED_SPEC_VERSIONS` in
+`tape.recorder.recorder`, which every segment header copies.

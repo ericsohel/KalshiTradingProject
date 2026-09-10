@@ -144,7 +144,7 @@ src/tape/
   api/               FastAPI app: REST, WS fan-out, Arrow       (adapter)
   gateway/           live execution and reconciliation          (adapter)
   probe/             penny-order calibration harness            (adapter)
-  cli.py             typer entry points                         (shell)
+  cli.py             argparse entry points (stdlib)                         (shell)
   config.py          settings schema                            (shell)
 ```
 
@@ -161,7 +161,7 @@ modules may import anything. A lint check enforces this (see
   live-only connection carries the unfiltered `ticker` channel, 99% of all traffic; its
   frames are decoded and published but never stored. One taped control connection
   carries `market_lifecycle_v2`, which is small and essential for replay. N "book" connections carry `orderbook_delta` and
-  `trade` groups. N starts at 4 and grows when a connection's message rate or the
+  `trade` groups. N starts at 2 (`book_connections`) and grows when a connection's message rate or the
   server's buffer-overflow error (code 25) indicates saturation. The default account
   limit is 200 connections; the recorder never exceeds a configured ceiling (default 16).
 - **Authentication.** Every connection signs `timestamp + "GET" + "/trade-api/ws/v2"`

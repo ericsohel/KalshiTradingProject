@@ -245,7 +245,10 @@ Data record
                       kind 3: JSON {"sid", "expected_seq", "got_seq"}
                       kind 4: JSON {"event": "open"|"close"|"error", "detail"}
                               or {"event": "writer_overflow", "dropped": N}
-                      kind 5: JSON {"ticker", "rest_snapshot", "local_snapshot", "mismatched_levels"}
+                      kind 5: JSON {"ticker", "levels_rest", "levels_local", "mismatched_levels",
+                                    "max_abs_diff_e2"} plus "rest_levels" and
+                                    "local_levels" only when mismatched, so a mismatch is
+                                    diagnosable from the tape alone
 ```
 
 Readers validate the magic and version, tolerate a truncated final record (crash), and
@@ -268,6 +271,9 @@ Path: `data/keyframes/YYYY-MM-DD/HH/MM.parquet` (every 5 minutes: `MM` in 00, 05
 
 A market with an empty book contributes one row with `side = -1` so that emptiness is
 distinguishable from absence.
+
+On shutdown the recorder writes one final keyframe, filed under the current minute
+rather than the interval slot, so it never overwrites that slot's periodic keyframe.
 
 ## 6. Baked Parquet tables (version 1)
 

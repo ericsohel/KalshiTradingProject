@@ -169,8 +169,13 @@ modules may import anything. A lint check enforces this (see
 - **Subscription options.** Orderbook subscriptions set `use_yes_price=true` so both
   sides arrive on the YES price scale. The flag value is recorded in every segment
   header. (ADR 0006)
-- **Heartbeat.** The server pings `heartbeat` every 10 seconds; the client library
-  answers pongs automatically. Thirty seconds of silence marks the connection dead.
+- **Liveness** (ADR 0019). The server pings `heartbeat` every 10 seconds and the client
+  library answers. The client also pings every 10 seconds and closes the connection if
+  no pong arrives within 20, so a dead peer is detected regardless of market traffic,
+  within about 35 seconds including the library's close timeout.
+  Data silence is not a liveness signal: an idle book connection or a quiet lifecycle
+  channel is healthy. Only the live-only unfiltered `ticker` connection, which always
+  carries traffic, also treats 60 seconds without data as a failed subscription.
 - **Sequence gaps.** Each sequenced channel carries `seq` per `sid`. Every gap writes a
   GAP record and emits a `GapEvent`. On an `orderbook_delta` subscription it also marks
   that group's books stale and sends `update_subscription` with `action=get_snapshot`,
@@ -235,7 +240,7 @@ API bind to localhost and `ipc://` sockets only. See [OPERATIONS.md](OPERATIONS.
 
 | Failure | Detection | Response |
 |---|---|---|
-| WebSocket disconnect | Heartbeat silence, socket close | Reconnect with backoff; re-subscribe; snapshots overwrite books; gap epoch recorded |
+| WebSocket disconnect | Missed pong, socket close | Reconnect with backoff; re-subscribe; snapshots overwrite books; gap epoch recorded |
 | Sequence gap on one `sid` | `seq` discontinuity | Gap record; `get_snapshot`; books in that group stale until snapshot |
 | Server buffer overflow (error 25) | Error frame | Split the group across connections; log; never drop the subscription silently |
 | REST 429 (no `Retry-After`) | Status code | Client-side token bucket sized from `GET /account/limits`; exponential backoff on the rare 429 |
@@ -244,6 +249,7 @@ API bind to localhost and `ipc://` sockets only. See [OPERATIONS.md](OPERATIONS.
 | Bad frame (parser exception) | Decode error off the hot path | Frame is already on disk; skipped for books; counted; sample kept for a regression test |
 | Book mismatch vs REST audit | Audit diff | Audit record; if persistent for a group, force `get_snapshot` |
 | API client too slow | Outbound queue depth | Drop backlog, send `resync` |
+| Host sleep (development on a laptop) | Wall clock advances more than the monotonic clock between status ticks | `clock_jump` connection record written to every taped segment so the gap is attributable; connections reconnect on wake |
 | Kalshi API change | Weekly spec diff CI job, changelog RSS | Issue opened; wire structs regenerated; recorder unaffected because it stores raw bytes |
 
 ## 10. Security model

@@ -28,3 +28,4 @@ choose and why, you have not made a decision; you have made a default.
 | [0016](0016-client-side-rate-limit-mirror.md) | Mirror Kalshi's token buckets client-side | accepted |
 | [0017](0017-tolerant-inbound-taxonomies.md) | Inbound taxonomies decode as strings; directional bits stay closed | accepted |
 | [0018](0018-live-only-ticker-firehose.md) | The unfiltered ticker channel is live-only, not taped | accepted |
+| [0019](0019-transport-liveness.md) | Liveness is measured at the transport, not by data traffic | accepted |

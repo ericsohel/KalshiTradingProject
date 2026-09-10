@@ -253,8 +253,10 @@ def encode_command(command: Command, command_id: int) -> bytes   # {"id","cmd","
 
 class WsSession:
     def __init__(self, url, signer: Signer, clock: Clock, *, conn_id=0,
-                 silence_timeout_ns=30e9, connect_timeout_ns=10e9, send_timeout_ns=10e9,
-                 close_timeout_ns=5e9, max_buffered_frames=4096)
+                 silence_timeout_ns: int | None = None,      # data silence; off by default (ADR 0019)
+                 ping_interval_ns=10e9, ping_timeout_ns=20e9, # transport keepalive
+                 connect_timeout_ns=10e9, send_timeout_ns=10e9, close_timeout_ns=5e9,
+                 max_buffered_frames=4096)
     conn_id: int; frames_dropped: int; is_open: bool
     async def connect(self) -> None                  # KalshiTransportError on failure
     async def send(self, command: Command) -> int    # returns the assigned command id
@@ -265,9 +267,13 @@ class WsSession:
 
 `WsSession` decodes nothing, tracks no sequence numbers, and never reconnects; gap
 handling and reconnect policy belong to the recorder. It signs `timestamp + "GET" +
-"/trade-api/ws/v2"` on the upgrade. The server drives the 10-second heartbeat and the
-library answers its pings, so no client keepalive is configured; inbound silence past
-`silence_timeout_ns`, a peer close, or a reader bug all raise `WsClosedError`, while a
+"/trade-api/ws/v2"` on the upgrade. Liveness is measured at the transport (ADR 0019). The library answers the server's
+heartbeat pings and also sends its own every `ping_interval_ns`; a pong missing for
+`ping_timeout_ns` fails the connection with close code 1011, and after the library's
+close timeout the pending read raises, so a dead peer surfaces as `WsClosedError` within
+about 35 seconds by default. Data silence is checked only when `silence_timeout_ns` is
+set, which the recorder does solely for the unfiltered ticker connection. A peer close,
+a missed pong, a set silence timeout, or a reader bug all raise `WsClosedError`, while a
 deliberate `close()` ends `frames()` cleanly. A session is single-use.
 
 **Backpressure.** A reader task drains the socket into a bounded buffer. When the
@@ -479,6 +485,17 @@ Connection layout: connection 0 is live-only and carries the unfiltered `ticker`
 `2 .. 2 + book_connections - 1` are taped and carry planner groups on `orderbook_delta`
 and `trade` with `use_yes_price`. The layout must fit `max_connections`.
 
+The session builder receives `conn_id` and `silence_timeout_ns`: the live-only ticker
+connection gets `RecorderConfig.ticker_silence_timeout_s`, every other connection gets
+none. A failed universe refresh keeps the current plan and retries after
+`universe_retry_delay_s(failures, interval_s, jitter)`, which is
+`min(interval, 15 s * 2**failures) * (0.5 + jitter/2)`, rather than waiting a full
+interval. On every status tick `is_clock_jump(wall_delta_ns, mono_delta_ns)` compares
+the two clocks; a wall-clock advance more than 5 seconds beyond the monotonic one means
+the host slept, so the recorder logs a warning and writes a `clock_jump` connection
+record into every taped sink. The record lands after the gap, and its deltas give the
+gap's length.
+
 Startup reads `GET /exchange/status` and resizes the rate limiter from
 `GET /account/limits`. Every `universe_refresh_s` the recorder pages the open,
 non-multivariate markets (logging when a listing is cut short by the page cap), selects
@@ -638,7 +655,9 @@ env = "prod"                    # "prod" | "demo"; REST and WS URLs derive from 
 key_id = "..."                  # the API key id, not a secret
 private_key_path = "~/.config/tape/keys/prod-read.pem"   # must be mode 600
 rest_timeout_s = 10
-ws_silence_timeout_s = 30
+ws_ping_interval_s = 10          # 1 to 60; transport keepalive for every connection
+ws_ping_timeout_s = 20           # 1 to 60
+ws_silence_timeout_s = 60        # applies only to the live-only ticker connection
 
 [recorder]
 data_dir = "data"
@@ -676,7 +695,8 @@ Rules:
   globally.
 - **Paths**: a leading `~` expands from the injected `HOME`; relative paths resolve
   against the directory holding the configuration file, not the working directory.
-- **Validation**: positive intervals, `group_size` at most 500, the private key file must
+- **Validation**: positive intervals, ping interval and pong timeout each between 1 and
+  60 seconds (a dead connection goes unnoticed for their sum), `group_size` at most 500, the private key file must
   exist and be readable by its owner alone, and `data_dir` must be writable.
 - **Secrets are paths, never values.** `tape config check` prints the effective settings
   with nothing to redact beyond what is already only a path.

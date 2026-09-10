@@ -7,8 +7,15 @@
 | dev | Owner's Mac | demo for order paths, prod public data for capture | development, first recordings |
 | prod | Oracle Cloud Always Free ARM (2 OCPU, 12 GB, 200 GB), US region | prod | continuous recording, API |
 
-The first production tape starts on the Mac the day a production read key exists;
-the process moves to the cloud host once it has run cleanly for a week.
+The first production tape starts on the Mac the day a production read key exists; the
+process moves to the cloud host once it has run cleanly for a week.
+
+**Running on a Mac.** A sleeping laptop records nothing: the first production smoke
+test lost two five-minute windows to sleep on battery. The Mac must be on AC power,
+with automatic sleep prevented while the display is off (System Settings, Battery,
+Options), and the recorder runs under `caffeinate -i` so the process holds a sleep
+assertion for as long as it runs. Sleep that happens anyway is written into the tape as
+a `clock_jump` record, so the resulting gap is attributable rather than mysterious.
 
 ## 2. Secrets
 

@@ -245,6 +245,8 @@ Data record
                       kind 3: JSON {"sid", "expected_seq", "got_seq"}
                       kind 4: JSON {"event": "open"|"close"|"error", "detail"}
                               or {"event": "writer_overflow", "dropped": N}
+                              or {"event": "clock_jump", "wall_ns_delta": N,
+                                  "mono_ns_delta": N}   # host slept; gap is attributable
                       kind 5: JSON {"ticker", "levels_rest", "levels_local", "mismatched_levels",
                                     "max_abs_diff_e2"} plus "rest_levels" and
                                     "local_levels" only when mismatched, so a mismatch is
@@ -253,6 +255,11 @@ Data record
 
 Readers validate the magic and version, tolerate a truncated final record (crash), and
 expose records as an iterator. Records are never rewritten.
+
+The header's `subscriptions` list reflects the connection at the moment the file was
+opened. A segment opens when a connection begins, before it subscribes, so that list is
+usually empty; the authoritative record of what a segment carries is its `COMMAND`
+records and the `subscribed` responses among its frames, which replay reads in order.
 
 ## 5. Keyframes
 

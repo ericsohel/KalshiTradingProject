@@ -176,7 +176,7 @@ modules may import anything. A lint check enforces this (see
 - **Liveness** (ADR 0019). The server pings `heartbeat` every 10 seconds and the client
   library answers. The client also pings every 10 seconds and closes the connection if
   no pong arrives within 20, so a dead peer is detected regardless of market traffic,
-  within about 35 seconds including the library's close timeout.
+  within about 32 seconds including the 2-second close timeout.
   Data silence is not a liveness signal: an idle book connection or a quiet lifecycle
   channel is healthy. Only the live-only unfiltered `ticker` connection, which always
   carries traffic, also treats 60 seconds without data as a failed subscription.

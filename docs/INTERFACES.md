@@ -255,7 +255,7 @@ class WsSession:
     def __init__(self, url, signer: Signer, clock: Clock, *, conn_id=0,
                  silence_timeout_ns: int | None = None,      # data silence; off by default (ADR 0019)
                  ping_interval_ns=10e9, ping_timeout_ns=20e9, # transport keepalive
-                 connect_timeout_ns=10e9, send_timeout_ns=10e9, close_timeout_ns=5e9,
+                 connect_timeout_ns=10e9, send_timeout_ns=10e9, close_timeout_ns=2e9,
                  max_buffered_frames=4096)
     conn_id: int; frames_dropped: int; is_open: bool
     async def connect(self) -> None                  # KalshiTransportError on failure
@@ -270,8 +270,7 @@ handling and reconnect policy belong to the recorder. It signs `timestamp + "GET
 "/trade-api/ws/v2"` on the upgrade. Liveness is measured at the transport (ADR 0019). The library answers the server's
 heartbeat pings and also sends its own every `ping_interval_ns`; a pong missing for
 `ping_timeout_ns` fails the connection with close code 1011, and after the library's
-close timeout the pending read raises, so a dead peer surfaces as `WsClosedError` within
-about 35 seconds by default. Data silence is checked only when `silence_timeout_ns` is
+close timeout the pending read raises, so a dead peer surfaces as `WsClosedError` within about 32 seconds by default. Data silence is checked only when `silence_timeout_ns` is
 set, which the recorder does solely for the unfiltered ticker connection. A peer close,
 a missed pong, a set silence timeout, or a reader bug all raise `WsClosedError`, while a
 deliberate `close()` ends `frames()` cleanly. A session is single-use.
@@ -406,6 +405,8 @@ class ConnectionSupervisor:
     async def run(self) -> None                  # until stop(); raises past max_consecutive_failures
     async def stop(self) -> None                 # idempotent
     async def set_group(self, group: Group | None) -> None   # the connection's whole market set
+    def open_tap(self, tickers: Iterable[str], *, max_events: int) -> LiveBookTap   # ADR 0021, 8.7
+    tapped_tickers: frozenset[str]              # markets some open tap observes
 def backoff_delay_s(failures, initial_ns, max_ns, jitter) -> float
 ```
 
@@ -444,32 +445,56 @@ class RecordSink(Protocol):          # tape.recorder.writer; SegmentSink satisfi
     def conn_id(self) -> int: ...
     def put(self, record: Record) -> bool: ...
 
-class AuditResult(Struct): ticker; recv_wall_ns; levels_rest; levels_local;
-                           mismatched_levels; max_abs_diff_e2; exact: bool
-class AuditStats(Struct):  rounds; books_sampled; books_exact; books_mismatched;
+type AuditOutcome = Literal["exact", "consistent", "inconsistent", "undecidable"]
+
+class AuditResult(Struct): ticker; outcome: AuditOutcome; window_open_mono_ns; send_mono_ns;
+                           send_wall_ns; recv_mono_ns; recv_wall_ns; window_close_mono_ns;
+                           window_events; match_index: int | None; levels_rest;
+                           levels_local: int | None; mismatched_levels: int | None;
+                           max_abs_diff_e2: int | None; fault: TapFault | None = None
+class AuditStats(Struct):  rounds; books_sampled; books_exact; books_consistent;
+                           books_inconsistent; books_mismatched; books_undecidable;
                            books_skipped_stale; books_missing_local; books_invalid_rest;
                            levels_mismatched
-    exact_ratio -> tuple[int, int]   # (books_exact, books_sampled); (0, 0) means no data; never divided
+    exact_ratio -> tuple[int, int]         # (books_exact, books_sampled)
+    consistency_ratio -> tuple[int, int]   # (exact + consistent, exact + consistent + inconsistent)
+class WindowVerdict(Struct): outcome: AuditOutcome; match_index: int | None; reply_state: BookImage | None
 
+def classify_window(window: TapWindow, rest_book: Book, *, reply_mono_ns: int,
+                    checksum: Callable[[Book], int] = Book.checksum) -> WindowVerdict
 def round_robin_choice(tickers: Sequence[str], count: int, cursor: int) -> tuple[tuple[str, ...], int]
 
 class Auditor:
-    def __init__(self, rest: KalshiRest, books: Callable[[], Mapping[str, Book]], clock: Clock,
-                 *, sink_for: Callable[[str], RecordSink | None], sample_size: int)
+    def __init__(self, rest: KalshiRest, books: Callable[[], Mapping[str, Book]], clock: Clock, *,
+                 sink_for: Callable[[str], RecordSink | None], open_tap: BookTapOpener,
+                 sample_size: int, lead_ns: int, settle_ns: int, tap_max_events: int,
+                 window_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep)
     async def audit_once(self) -> tuple[AuditResult, ...]
     async def run(self, *, interval_s: float, stop: asyncio.Event, sleep=asyncio.sleep) -> None
     stats: AuditStats
 ```
 
-Sampling is round-robin over sorted, non-stale tickers, so every book is audited over
-successive rounds without randomness. REST books are fetched in batches of at most 100
-and converted to YES space with `tape.wire.convert.rest_orderbook_levels`: REST has no
-`use_yes_price` flag, so `no_dollars` are NO-leg prices and are complemented into asks.
-Each comparison uses the local book as it stands when the response arrives, so a book
-that disappeared mid-request counts as `books_missing_local`. An AUDIT record goes to
-the owning connection's sink and carries that connection's id. A malformed or crossed
-REST snapshot is counted in `books_invalid_rest` and skipped; an HTTP or transport error
-skips its batch; neither stops the round.
+Sampling is round-robin over sorted tickers whose local book is fresh, so every book is
+audited over successive rounds without randomness. For each batch of at most 100 markets
+the auditor opens a book tap, waits `lead_ns`, fetches the REST books, waits `settle_ns`,
+and closes the tap (ADR 0021). REST books are converted to YES space with
+`rest_orderbook_levels`, complementing the NO side, because REST has no `use_yes_price`
+flag.
+
+`classify_window` rebuilds the local states from the tap's starting copy and its events.
+The outcome is **exact** when the REST book equals the state as of the reply, **consistent**
+when it equals the starting copy or the state after any event in the window,
+**inconsistent** when it equals none of them, and **undecidable** when the tap cannot vouch
+for every state it spans. Candidates are compared by level count and checksum, and a match
+is always confirmed with `diff`, so a checksum collision can never pass. An undecidable
+result carries the tap's fault reason when there is one.
+
+`books_sampled` counts decidable audits; undecidable ones are counted separately and are
+excluded from both ratios, which stay exact integer pairs. A malformed REST price is counted
+in `books_invalid_rest` and a failing batch is logged and skipped; neither stops the round.
+`run` races every wait against `stop`, the interval between rounds and a round in progress
+alike, so a shutdown never waits out an interval; a batch cut off mid-window writes no
+records, and its tap is still closed.
 
 ### 8.6 `tape.recorder.recorder`
 
@@ -488,6 +513,7 @@ class Recorder:
     async def stop(self) -> None; def request_stop(self) -> None     # idempotent
     def books(self) -> Mapping[str, Book]                            # merged across book connections
     def sink_for(self, ticker: str) -> SegmentSink | None
+    def open_book_tap(self, tickers: Iterable[str], *, max_events: int) -> CompositeBookTap
     def latest_tickers(self) -> Mapping[str, Ticker]                 # live state, never taped
     def status(self) -> RecorderStatus
     periodic_tasks: tuple[PeriodicTask, ...]
@@ -495,7 +521,8 @@ class Recorder:
 
 `tape.recorder.recorder` is an adapter and cannot import `tape.config`, so it takes a
 `RecorderConfig`; `tape.cli.build_recorder(settings, *, http, clock, host)` is the
-composition root that wires real dependencies and the auditor.
+composition root that wires real dependencies and the auditor, including its tap
+opener and the audit lead, settle, and tap-bound settings.
 
 Connection layout: connection 0 is live-only and carries the unfiltered `ticker` channel
 (ADR 0018); connection 1 is taped and carries `market_lifecycle_v2`; connections
@@ -522,6 +549,37 @@ Every `keyframe_interval_s` it writes merged books to
 structured status line. A failing periodic task is logged and does not stop capture; a
 failing supervisor surfaces. Shutdown stops periodic tasks, writes a final keyframe,
 stops every supervisor, and closes every sink so everything is flushed.
+
+### 8.7 `tape.recorder.tap`
+
+```python
+type BookChange = BookSnapshot | BookDelta
+type TapFault = Literal["no_book", "stale", "overflow"]   # FAULT_NO_BOOK, FAULT_STALE, FAULT_OVERFLOW
+
+class BookImage(Struct): bids: tuple[Level, ...]; asks: tuple[Level, ...]
+    @classmethod
+    def of(cls, book: Book) -> BookImage
+    def to_book(self, ticker: str) -> Book
+class TapWindow(Struct): ticker: str; start: BookImage | None; events: tuple[BookChange, ...];
+                         fault: TapFault | None
+    @classmethod
+    def absent(cls, ticker: str) -> TapWindow
+
+class BookTap(Protocol):
+    def close(self) -> Mapping[str, TapWindow]
+class BookTapOpener(Protocol):
+    def __call__(self, tickers: Collection[str], *, max_events: int) -> BookTap
+class LiveBookTap:        # one supervisor's tap: tickers, closed, record(change, *, was_stale), close()
+class CompositeBookTap:   # several taps closed as one, plus absent windows for uncovered markets
+```
+
+A tap copies each market's book when it opens and then receives, in order, every snapshot
+and delta the supervisor applies, until it closes. Opening and closing never await, so no
+frame can be applied between copying a book and watching it. With no tap open, an applied
+change costs one membership check on an empty dictionary. A window's fault is `no_book`
+when no fresh book existed at opening, `stale` when the book went stale or disappeared
+before closing, and `overflow` when more than `max_events` changes arrived; any fault makes
+the audit undecidable rather than risking a false verdict. Closing is idempotent.
 
 The recorder's hot path per frame: read, enqueue raw bytes for the writer,
 `decode_envelope`, `GapTracker.observe`, then off the hot path full decode, book apply,
@@ -684,6 +742,9 @@ group_size = 500                # at most 500 (ADR 0010)
 keyframe_interval_s = 300       # whole minutes dividing an hour
 audit_interval_s = 300
 audit_sample = 200
+audit_lead_ms = 250             # 1 to 5000; audit window opens this long before the request
+audit_settle_ms = 750           # 1 to 5000; and stays open this long after the reply
+audit_tap_max_events = 5000     # 1 to 50000 book changes per market per window
 writer_queue_max = 200000
 universe_refresh_s = 300
 status_interval_s = 60
@@ -714,7 +775,8 @@ Rules:
   against the directory holding the configuration file, not the working directory.
 - **Validation**: positive intervals, ping interval and pong timeout each between 1 and
   60 seconds (a dead connection goes unnoticed for their sum), `group_size` at most 500,
-  `book_connections * group_size` at least `max_l2_markets`, and
+  `book_connections * group_size` at least `max_l2_markets`, audit lead and settle
+  between 1 and 5000 milliseconds, the audit tap bound between 1 and 50000 changes, and
   `2 + book_connections` at most `max_connections` (ADR 0020), the private key file must
   exist and be readable by its owner alone, and `data_dir` must be writable.
 - **Secrets are paths, never values.** `tape config check` prints the effective settings

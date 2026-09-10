@@ -252,10 +252,15 @@ Data record
                               or {"event": "writer_overflow", "dropped": N}
                               or {"event": "clock_jump", "wall_ns_delta": N,
                                   "mono_ns_delta": N}   # host slept; gap is attributable
-                      kind 5: JSON {"ticker", "levels_rest", "levels_local", "mismatched_levels",
-                                    "max_abs_diff_e2"} plus "rest_levels" and
-                                    "local_levels" only when mismatched, so a mismatch is
-                                    diagnosable from the tape alone
+                      kind 5: JSON {"ticker", "levels_rest", "outcome", "send_mono_ns",
+                                    "send_wall_ns", "window_open_mono_ns",
+                                    "window_close_mono_ns", "window_events"} (ADR 0021)
+                                    plus "levels_local", "mismatched_levels", and
+                                    "max_abs_diff_e2" unless undecidable; "match_index"
+                                    when exact or consistent; "fault" when undecidable
+                                    with a reason from the tap; "rest_levels" and
+                                    "local_levels" only when inconsistent, so a real
+                                    finding is diagnosable from the tape alone
 ```
 
 Readers validate the magic and version, tolerate a truncated final record (crash), and

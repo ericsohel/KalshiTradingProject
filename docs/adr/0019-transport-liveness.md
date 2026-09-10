@@ -43,8 +43,10 @@ subscription itself stopped delivering, a failure keepalive cannot see.
 
 ## Consequences
 
-Idle and quiet connections stay connected. A dead peer is detected within about 35 seconds regardless of traffic: the 10-second
-ping interval, the 20-second pong deadline, and the library's 5-second close timeout. The client sends a small ping every 10 seconds per
+Idle and quiet connections stay connected. A dead peer is detected within about 32 seconds regardless of traffic: the 10-second
+ping interval, the 20-second pong deadline, and a 2-second close timeout. The close
+timeout was 5 seconds until a production shutdown showed it was the last wait before
+the recorder could stop; a recorder gains nothing from a long graceful goodbye. The client sends a small ping every 10 seconds per
 connection, which is negligible. The regression test that pins `recv` cancellation
 safety still matters for the one connection that polls for silence.
 

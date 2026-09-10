@@ -10,15 +10,29 @@ arrive in NO-leg prices. The `use_yes_price` subscription flag reports both side
 the YES price scale, and Kalshi has announced that this will become the default and
 then the only behavior.
 
+## Alternatives considered
+
+1. **Mirror the wire: keep YES-bid and NO-bid books.** Zero conversion at capture.
+   Rejected: every consumer converts, the `best_bid < best_ask` invariant is not
+   directly checkable, and the default convention is scheduled to change underneath.
+2. **Convert client-side without the flag.** Works today. Rejected: when Kalshi flips
+   the default, a recorder that does not request the flag explicitly would silently
+   start double-converting.
+
 ## Decision
 
-Subscribe with `use_yes_price=true`. Maintain one consolidated book per market in
-YES space: bids and asks keyed by `PriceE4`. Record the flag value in every segment
-header so replay applies the correct convention to old segments. All derived data,
-the API, and the viewer use YES space only.
+Subscribe with `use_yes_price=true`. Maintain one consolidated book per market in YES
+space: bids and asks keyed by `PriceE4`. Record the flag value in every segment header
+so replay applies the correct convention to any segment. All derived data, the API,
+and the viewer use YES space only.
 
 ## Consequences
 
-One price scale everywhere; `best_bid < best_ask` is a checkable invariant; trade
-direction maps directly to `taker_book_side`. Code that reads legacy segments must
-honor the header flag.
+One price scale everywhere; the crossed-book invariant is checkable; trade direction
+maps directly to `taker_book_side`. Readers of legacy segments must honor the header
+flag; the decoder does this, not the consumer.
+
+## What would reverse it
+
+Nothing; Kalshi is moving in this direction. If the flag is removed, the header
+simply records `true` forever.

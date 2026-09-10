@@ -5,18 +5,31 @@ Status: accepted. Date: 2026-09-09.
 ## Context
 
 The project spans a Python package, a TypeScript application, deployment files, and
-design documents that must stay consistent with each other. The owner wants the
-project public and easy for others to adopt.
+design documents that must stay consistent. The owner wants it public and adoptable.
+
+## Alternatives considered
+
+1. **Separate repositories** for Python and web. Cleaner toolchains. Rejected: a
+   change to an API response touches both; two pull requests for one change invites
+   drift, and the API types are generated from the Python side.
+2. **pip-tools or Poetry.** Widely used. Rejected: `uv` also manages the interpreter
+   version, resolves in seconds, and produces a lockfile that CI installs with
+   `--frozen`; on a solo project, speed of iteration matters.
+3. **Apache-2.0.** Adds an explicit patent grant. Rejected as unnecessary friction for
+   a project with no patents; MIT is the more common expectation.
+4. **AGPL.** Protects against closed forks. Rejected: deters the adoption the project
+   wants, and the tape (the only thing worth protecting) is private by ADR 0007.
 
 ## Decision
 
-One repository. Python lives in `src/tape/` with `uv` managing the interpreter,
-dependencies, and lockfile. The web application lives in `web/` with its own
-lockfile. Deployment assets live in `deploy/`. Design documents and ADRs live in
-`docs/`. The license is MIT.
+One repository. Python in `src/tape/` under `uv`; web in `web/` with its own lockfile;
+deployment in `deploy/`; documents and ADRs in `docs/`. MIT license.
 
 ## Consequences
 
-One place for issues, CI, and history; cross-cutting changes land in one pull
-request. CI runs two toolchains. MIT permits any reuse, including commercial, which
-the owner accepts in exchange for maximum adoption.
+One place for issues, CI, and history; cross-cutting changes land together. CI runs
+two toolchains. MIT permits any reuse, including commercial.
+
+## What would reverse it
+
+The web application growing its own contributors and release cadence.

@@ -1,8 +1,12 @@
 # Architecture decision records
 
-One file per decision that would be expensive to reverse. Format: context, decision,
-consequences. Status is one of proposed, accepted, superseded (by number), deprecated.
-Numbers are never reused.
+One file per decision that would be expensive to reverse. Every record has five parts:
+context, alternatives considered, decision, consequences, and what would reverse it.
+Status is one of proposed, accepted, superseded (by number), deprecated. Numbers are
+never reused.
+
+The alternatives section is not decoration. If you cannot name what you did not
+choose and why, you have not made a decision; you have made a default.
 
 | # | Title | Status |
 |---|---|---|
@@ -17,3 +21,7 @@ Numbers are never reused.
 | [0009](0009-typescript-webgl-viewer-hosting.md) | TypeScript + WebGL2 viewer on Cloudflare Pages; API behind Caddy | accepted |
 | [0010](0010-small-subscription-groups.md) | Subscription groups of at most 500 markets | accepted |
 | [0011](0011-uv-monorepo-mit.md) | uv-managed monorepo with src layout, MIT license | accepted |
+| [0012](0012-python-recorder-with-escape-hatch.md) | Python and asyncio for the recorder, with a measured escape hatch | accepted |
+| [0013](0013-parquet-duckdb-over-database.md) | Parquet files and DuckDB instead of a database server | accepted |
+| [0014](0014-fill-model-band.md) | Three fill models reported as a band, never one number | accepted |
+| [0015](0015-market-making-first-strategy.md) | Passive market making as the first strategy | accepted |

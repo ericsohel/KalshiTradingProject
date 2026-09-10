@@ -325,6 +325,8 @@ class WsSession:
 
         Raises:
             KalshiTransportError: If the handshake fails, is refused, or times out.
+            WsClosedError: If :meth:`close` was called while the handshake was in
+                flight; the connection that opened is closed rather than leaked.
             RuntimeError: If :meth:`connect` was already called. A session is
                 single-use, failed attempts included; the recorder builds a new one per
                 attempt so that a retry cannot inherit stale state.
@@ -349,6 +351,14 @@ class WsSession:
             raise KalshiTransportError(f"websocket handshake to {self._url} timed out") from exc
         except (OSError, WebSocketException) as exc:
             raise KalshiTransportError(f"websocket connect to {self._url} failed: {exc}") from exc
+        if self._closing:
+            # close() ran while the handshake was in flight, when there was no socket to
+            # close yet. Close the one that just opened instead of leaking it.
+            connection, self._connection = self._connection, None
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(_seconds(self._close_timeout_ns)):
+                    await connection.close()
+            raise _closed(f"session {self.conn_id} was closed during the handshake")
         self._last_frame_ns = int(self._clock.mono_ns())
         self._reader = asyncio.create_task(
             self._read_loop(self._connection), name=f"ws-reader-{self.conn_id}"

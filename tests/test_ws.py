@@ -399,3 +399,34 @@ async def test_no_frame_is_lost_when_polls_cancel_recv(signer: Signer, clock: Fr
 
     assert session.frames_dropped == 0
     assert [payload_of(frame)["seq"] for frame in received] == list(range(total))
+
+
+async def test_close_during_the_handshake_closes_the_connection_that_opens(
+    signer: Signer, clock: FrozenClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop that lands mid-handshake must not leave a socket open with nobody to close it.
+
+    ``close()`` runs while there is no connection yet, so the session has to notice when
+    the handshake completes and close what just opened.
+    """
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    class OpenedConnection:
+        async def close(self) -> None:
+            closed.set()
+
+    async def slow_connect(*_args: object, **_kwargs: object) -> OpenedConnection:
+        await release.wait()
+        return OpenedConnection()
+
+    monkeypatch.setattr("tape.client.ws.ws_connect", slow_connect)
+    session = WsSession("wss://example.invalid/trade-api/ws/v2", signer, clock, conn_id=7)
+    connecting = asyncio.create_task(session.connect())
+    await asyncio.sleep(0)
+    await session.close()
+    release.set()
+    with pytest.raises(WsClosedError, match="closed during the handshake"):
+        await asyncio.wait_for(connecting, timeout=5.0)
+    assert closed.is_set()
+    assert not session.is_open

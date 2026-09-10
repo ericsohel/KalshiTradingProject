@@ -1,0 +1,36 @@
+# All Python hooks run through uv so pre-commit, CI, and developers use the exact
+# versions pinned in uv.lock.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+      - id: mypy
+        name: mypy --strict
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+      - id: check-layers
+        name: import layer rule
+        entry: uv run python scripts/check_layers.py
+        language: system
+        pass_filenames: false
+      - id: check-no-float
+        name: no floats in money paths
+        entry: uv run python scripts/check_no_float.py
+        language: system
+        pass_filenames: false
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: [--baseline, .secrets.baseline]
+        exclude: ^(uv\.lock|specs/.*)$

@@ -1,0 +1,29 @@
+name: spec-drift
+
+on:
+  schedule:
+    - cron: "0 12 * * 3"   # Wednesdays, after Kalshi's Tue-Wed SDK releases
+  workflow_dispatch:
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download current specs
+        run: |
+          curl -fsSL https://docs.kalshi.com/openapi.yaml -o /tmp/openapi.yaml
+          curl -fsSL https://docs.kalshi.com/asyncapi.yaml -o /tmp/asyncapi.yaml
+      - name: Compare with pinned specs
+        run: |
+          set +e
+          diff -u specs/openapi.yaml /tmp/openapi.yaml > /tmp/openapi.diff
+          a=$?
+          diff -u specs/asyncapi.yaml /tmp/asyncapi.yaml > /tmp/asyncapi.diff
+          b=$?
+          if [ $a -ne 0 ] || [ $b -ne 0 ]; then
+            echo "Kalshi specs changed. Review the diffs, update specs/ and tape.wire." >&2
+            head -200 /tmp/openapi.diff /tmp/asyncapi.diff
+            exit 1
+          fi
+          echo "Specs unchanged."

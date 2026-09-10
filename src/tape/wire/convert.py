@@ -30,6 +30,7 @@ from tape.fixedpoint import (
     parse_signed_count,
 )
 from tape.timeutil import Ms
+from tape.wire.rest import OrderbookCountFp
 from tape.wire.ws import (
     Envelope,
     MarketLifecycleV2Msg,
@@ -39,7 +40,14 @@ from tape.wire.ws import (
     TradeMsg,
 )
 
-__all__ = ["to_book_delta", "to_book_snapshot", "to_lifecycle", "to_ticker", "to_trade"]
+__all__ = [
+    "rest_orderbook_levels",
+    "to_book_delta",
+    "to_book_snapshot",
+    "to_lifecycle",
+    "to_ticker",
+    "to_trade",
+]
 
 
 def _levels(pairs: Iterable[tuple[str, str]] | None, *, to_yes: bool) -> tuple[Level, ...]:
@@ -59,6 +67,30 @@ def _levels(pairs: Iterable[tuple[str, str]] | None, *, to_yes: bool) -> tuple[L
             continue
         out.append(Level(complement(price) if to_yes else price, count))
     return tuple(out)
+
+
+def rest_orderbook_levels(book: OrderbookCountFp) -> tuple[tuple[Level, ...], tuple[Level, ...]]:
+    """Convert a REST orderbook into YES-space ``(bids, asks)``.
+
+    Unlike the WebSocket orderbook channel, ``GET /markets/orderbooks`` and
+    ``GET /markets/{ticker}/orderbook`` carry no ``use_yes_price`` flag: ``yes_dollars``
+    are YES bids already on the YES price scale, but ``no_dollars`` are NO bids priced
+    on the NO leg, which this always complements onto the YES scale, because a NO bid
+    at price ``q`` is a YES ask at ``1 - q`` (docs/DATA_FORMATS.md 1.3, 2.2). Zero-count
+    levels are dropped, matching the WebSocket conversion in :func:`to_book_snapshot`.
+
+    Args:
+        book: The REST orderbook, still in Kalshi's decimal-string form.
+
+    Returns:
+        ``(bids, asks)`` in YES space, ready to compare against a local ``Book``.
+
+    Raises:
+        FixedPointError: If a price or count string is malformed.
+    """
+    bids = _levels(book.yes_dollars, to_yes=False)
+    asks = _levels(book.no_dollars, to_yes=True)
+    return bids, asks
 
 
 def to_book_snapshot(

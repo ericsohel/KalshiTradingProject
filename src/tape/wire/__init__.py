@@ -7,6 +7,7 @@ on decode so that additive API changes never break capture (docs/DATA_FORMATS.md
 """
 
 from tape.wire.convert import (
+    rest_orderbook_levels,
     to_book_delta,
     to_book_snapshot,
     to_lifecycle,
@@ -41,6 +42,7 @@ __all__ = [
     "UserOrderMsg",
     "decode_envelope",
     "decode_msg",
+    "rest_orderbook_levels",
     "to_book_delta",
     "to_book_snapshot",
     "to_lifecycle",

@@ -19,6 +19,7 @@ from tape.wire import (
     TradeMsg,
     decode_envelope,
     decode_msg,
+    rest_orderbook_levels,
     to_book_delta,
     to_book_snapshot,
     to_lifecycle,
@@ -26,6 +27,7 @@ from tape.wire import (
     to_trade,
 )
 from tape.wire.convert import raw_json_text
+from tape.wire.rest import OrderbookCountFp
 
 SNAPSHOT = {
     "type": "orderbook_snapshot",
@@ -256,3 +258,23 @@ def test_every_conversion_requires_sid(
 def test_raw_json_text_round_trips_bytes() -> None:
     env = decode_envelope(b'{"type": "x", "sid": 1, "msg": {"a": 1}}')
     assert raw_json_text(env.msg) == '{"a": 1}'
+
+
+def test_rest_orderbook_levels_keeps_yes_side_as_is() -> None:
+    book = OrderbookCountFp(yes_dollars=[("0.0800", "300.00")], no_dollars=[])
+    bids, asks = rest_orderbook_levels(book)
+    assert [(lvl.price, lvl.count) for lvl in bids] == [(800, 30_000)]
+    assert asks == ()
+
+
+def test_rest_orderbook_levels_complements_the_no_side() -> None:
+    # A NO bid at 0.4000 is a YES ask at 1 - 0.4000 = 0.6000 (docs/DATA_FORMATS.md 1.3).
+    book = OrderbookCountFp(yes_dollars=[], no_dollars=[("0.4000", "12.00")])
+    bids, asks = rest_orderbook_levels(book)
+    assert bids == ()
+    assert [(lvl.price, lvl.count) for lvl in asks] == [(6000, 1_200)]
+
+
+def test_rest_orderbook_levels_drops_zero_count_levels() -> None:
+    book = OrderbookCountFp(yes_dollars=[("0.1000", "0.00")], no_dollars=[("0.2000", "0.00")])
+    assert rest_orderbook_levels(book) == ((), ())

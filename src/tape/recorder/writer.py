@@ -25,7 +25,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
-from typing import Final, Self
+from typing import Final, Protocol, Self
 
 import msgspec
 
@@ -40,6 +40,7 @@ __all__ = [
     "MAX_SEGMENTS_PER_HOUR",
     "OVERFLOW_EVENT",
     "HeaderFactory",
+    "RecordSink",
     "SegmentSink",
     "SinkStats",
     "segment_path",
@@ -138,6 +139,23 @@ def segment_path(root: Path, conn_id: int, wall_ns: int, counter: int) -> Path:
     moment = wall_ns_to_datetime(wall_ns)
     name = f"conn-{conn_id:02d}-{counter:04d}.tape.zst"
     return root / "raw" / f"{moment:%Y-%m-%d}" / f"{moment:%H}" / name
+
+
+class RecordSink(Protocol):
+    """Where a component writes tape records; :class:`SegmentSink` is the real one.
+
+    Components that only emit records, such as the auditor, depend on this port rather
+    than on the threaded writer, so tests can pass a plain in-memory fake.
+    """
+
+    @property
+    def conn_id(self) -> int:
+        """Connection whose segment the records land in; stamped on each record."""
+        ...
+
+    def put(self, record: Record) -> bool:
+        """Queue one record without blocking; ``False`` means it was refused."""
+        ...
 
 
 class SegmentSink:
@@ -253,6 +271,11 @@ class SegmentSink:
             flushes=self._flushes,
             write_errors=self._write_errors,
         )
+
+    @property
+    def conn_id(self) -> int:
+        """Connection this sink records; its segment files are named after it."""
+        return self._conn_id
 
     @property
     def failure(self) -> Exception | None:

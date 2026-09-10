@@ -313,6 +313,10 @@ above and carry the same integer encodings.
 
 - New optional fields on Kalshi payloads are ignored by decoders (`forbid_unknown_fields=False`)
   and remain available in the raw tape.
+- New *values* in an inbound enumerated field decode as plain strings rather than
+  failing (ADR 0017). Kalshi has already shipped a `fee_type` that its own published
+  enum does not contain. Directional fields (`book_side`, `outcome_side`) are the
+  exception and stay closed, because an unknown direction must not be guessed at.
 - A removed or renamed Kalshi field is a breaking wire change: the weekly spec diff
   opens an issue; decoders are updated; old raw segments remain readable because the
   decoder version is chosen from the segment header's `spec_versions`.

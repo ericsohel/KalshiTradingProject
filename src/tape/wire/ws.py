@@ -175,7 +175,8 @@ class UserOrderMsg(msgspec.Struct, frozen=True, kw_only=True):
     order_id: str
     ticker: str
     exchange_index: int
-    status: Literal["resting", "canceled", "executed"]
+    # Inbound taxonomy: a status Kalshi adds must not break decoding (ADR 0017).
+    status: str
     book_side: BookSide
     yes_price_dollars: str
     fill_count_fp: str

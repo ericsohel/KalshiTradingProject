@@ -79,9 +79,10 @@ the bus at `recorder.bus_endpoint`; without that setting it refuses to start. Th
 run with the same endpoint, and a recorder started before the catalog and status topics existed
 must be restarted once to publish them: until then the market list is empty and `recorder` is
 null, although the bus counters move. The API holds no credentials: `[kalshi] env` only selects
-where public titles, categories, and price grids come from, and the key file is never opened.
-SIGINT or SIGTERM closes live connections with 1001 and stops the process; a second signal
-forces it.
+where public titles, categories, and price grids come from, `key_id` and `private_key_path` may
+be left out of its configuration, and the key file is never opened;
+`uv run tape config check --config tape.toml --for serve` checks what it needs. SIGINT or
+SIGTERM closes live connections with 1001 and stops the process; a second signal forces it.
 
 `GET /api/v1/status` shows `recording`, true while a recorder status arrived within two of its
 intervals; `recorder_status_age_ms`; `recorder`, the latest status (universe size, live
@@ -90,6 +91,33 @@ subscriptions, and per connection frames, gaps, reconnects, stale books, and dro
 `missed` from lost messages, and `books_known`; and `clients`. After a start, books are known
 within `bus_refresh_s`, markets are listed at the next refresh cycle, and metadata fills in as
 Kalshi answers, at most `serve.metadata_requests_per_s` requests a second.
+
+### 4.3 Watching live data locally
+
+The viewer's development server proxies `/api` to `tape serve`, so real books show on a laptop
+with three processes, each in its own terminal, from the repository root:
+
+1. The recorder with a bus. Set `bus_endpoint` under `[recorder]` in `tape.toml` to an absolute
+   `ipc://` path in a directory only you can write, for example
+   `bus_endpoint = "ipc:///Users/you/kalshiProject/run/bus.sock"` after
+   `mkdir -m 700 run`, then (re)start it: `uv run tape record --config tape.toml`.
+2. The API: `uv run tape serve --config tape.toml`. `curl -s http://127.0.0.1:8080/api/v1/status`
+   shows `recording: true` once the recorder has reported, and
+   `curl -s 'http://127.0.0.1:8080/api/v1/markets?limit=5'` lists markets after its next
+   refresh cycle.
+3. The viewer (run `npm --prefix web ci` once first):
+   `TAPE_API=http://127.0.0.1:8080 npm --prefix web run dev`, then open
+   <http://localhost:5173>. `serve.allowed_origins` admits `http://localhost:5173` and
+   `http://127.0.0.1:5173` by default; a page served from any other origin needs that origin
+   added, or the live feed refuses it.
+
+Until the recorder's first catalog reaches the API the page says it is waiting for the market
+list, and it recovers without a reload.
+
+Without the recorder, a synthetic stand-in for `tape serve` serves the same routes and feed on
+port 8787: `npm --prefix web run mock` (add `-- --chaos` for random resyncs, stale books, and
+closes), then `TAPE_API=http://127.0.0.1:8787 npm --prefix web run dev`; any local origin is
+accepted. `web/dev/mock-server.ts` lists the disruptions it can trigger on request.
 
 ## 5. Storage and retention
 

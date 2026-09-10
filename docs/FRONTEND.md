@@ -70,8 +70,10 @@ front end's TypeScript types from that file, so the two cannot drift (ADR 0023).
   `recording` is true when a recorder status arrived within two status intervals;
   `recorder` is the latest recorder status (`universe_size`, `subscribed_markets`, and
   per connection `conn_id, taped, frames, gaps, reconnects, stale_books, sink_dropped`) or
-  `null`; `bus` is `{epoch, last_seq, messages, resets, missed, books_known}`; `clients`
-  counts open live connections.
+  `null`; `bus` is `{epoch, last_seq, messages, resets, missed, books_known}`, where `epoch`
+  names the recorder run the API follows as a decimal string (a wall-clock nanosecond count
+  beyond what a JavaScript number holds exactly, so clients only compare it) and it and
+  `last_seq` are `null` before the first bus message; `clients` counts open live connections.
 
 Errors are `{"error": {"code", "message"}}` with an appropriate status code. Live routes
 set `Cache-Control: no-store`. CORS allows only the configured origins.
@@ -104,7 +106,9 @@ Server to client; `t` names the type.
 | `{"t": "error", "code", "message"}` | A client message the server could not accept, such as malformed JSON or an unknown `op` |
 
 Messages about one market arrive in bus order. Trades and ticker updates are forwarded
-whatever the book's state.
+whatever the book's state. `ts_ms` in `snapshot` and `delta`, like `depth.ts_ms` in 4.1, is
+`null` when the book has no exchange time, for example a book known only from an exchange
+snapshot, which carries none.
 
 **Backpressure.** Each connection has a bounded queue of `client_queue_max` messages.
 When it fills, the server discards what is queued and sends, for each subscribed market,
@@ -147,8 +151,9 @@ Closed historical windows set `Cache-Control: public, max-age=3600`.
 | CORS | API allows only the Pages origin and localhost for development | |
 
 The API is rate-limited per client IP (token bucket in Caddy or in the app) and
-serves at most 200 concurrent live clients; beyond that it answers 503 with a retry
-hint rather than degrading the recorder host.
+serves at most 200 concurrent live clients; beyond that it accepts the WebSocket handshake
+and closes the connection at once with 1013 (try again later), as 4.2 specifies, and the
+viewer reconnects after a pause, rather than degrading the recorder host.
 
 ## 7. Security and privacy
 
@@ -176,8 +181,19 @@ Implementation notes (first slice, the live view):
   `state` (framework-free stores), `render` (WebGL2; reads the `HeatmapSource`
   interface, never the app), and `ui` (React). ESLint enforces that only `ui` imports
   React and that `render` imports nothing from the other layers.
-- `web/src/api/protocol.ts` is hand-written from section 4 until types generated from
-  `schema.json` replace it; nothing else defines API types.
+- API types are generated in two steps: `uv run python scripts/gen_api_schema.py` writes
+  `web/src/api/schema.json` from the msgspec structs, and `npm run api-types` writes
+  `web/src/api/schema.gen.ts` from that with `json-schema-to-typescript`. Both are committed;
+  `--check` and `npm run api-types:check` fail when either is stale, in CI and in
+  `npm run check`. `web/src/api/protocol.ts` derives the names the page uses from the
+  generated file (read-only, with open rejection and resync codes) and the decoders in
+  `decode.ts` produce exactly those types; nothing else defines API types.
+- Before the recorder's first `ctl.catalog` reaches the API, `/markets` is empty and every
+  subscription is rejected with `unknown_ticker`. The page polls the market list every 15 s,
+  shows that it is waiting for the recorder's market list, and resubscribes a market rejected
+  as unknown every `hello.bus_refresh_s`, at most 12 times, so it recovers without a reload.
+- The heatmap draws time after the newest column, up to now, with that column's depth and
+  the book's current state, so a quiet market after a snapshot reads as the book it holds.
 - Deferred: Playwright smoke tests and renderer golden-image tests (both need a GPU in
   CI and fixture data), a measured 60 fps benchmark with 20,000 bubbles, and the
   production Content Security Policy header.

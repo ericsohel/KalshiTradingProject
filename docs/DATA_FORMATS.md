@@ -42,7 +42,10 @@ uses `taker_book_side` (`bid` = taker bought YES, `ask` = taker bought NO).
 
 ### 1.4 Identifiers
 
-Market ticker strings match `^[A-Z0-9-]+$` and are the primary key everywhere.
+Market ticker strings match `^[A-Z0-9][A-Z0-9.-]*$` and are the primary key everywhere: upper-case
+letters, digits, and hyphens, plus the dots of fractional strike values such as
+`KXAAAGASD-26SEP11-4.2700` or `KX10YRDIRHM-26SEP30H-T4.85`. Every recorded ticker observed so far
+starts with a letter.
 `market_id` (UUID) is stored but not used as a key. `sid` (subscription id) and
 `seq` are connection-scoped and meaningful only within one raw segment stream.
 

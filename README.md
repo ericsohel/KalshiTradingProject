@@ -5,9 +5,9 @@ market maker for [Kalshi](https://kalshi.com), with a live WebGL viewer.
 
 > Status: recording. The exchange client (RSA-PSS signing, rate-limit
 > mirror, bounded-buffer WebSocket session), the book, the tape writer, the
-> recorder orchestrator, and its live event bus are built and tested; the
-> viewer, simulator, and market maker are still ahead. The design documents in `docs/` remain the
-> contract the code is built against.
+> recorder orchestrator, its live event bus, the live API (`tape serve`), and the
+> live viewer are built and tested; replay, the simulator, and the market maker are still
+> ahead. The design documents in `docs/` remain the contract the code is built against.
 
 ## What this is
 

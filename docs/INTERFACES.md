@@ -944,8 +944,8 @@ Loading uses the standard library's `tomllib`; there is no configuration depende
 ```toml
 [kalshi]
 env = "prod"                    # "prod" | "demo"; REST and WS URLs derive from it
-key_id = "..."                  # the API key id, not a secret
-private_key_path = "~/.config/tape/keys/prod-read.pem"   # must be mode 600
+key_id = "..."                  # the API key id, not a secret; only tape record needs it
+private_key_path = "~/.config/tape/keys/prod-read.pem"   # must be mode 600; only tape record needs it
 rest_timeout_s = 10
 ws_ping_interval_s = 10          # 1 to 60; transport keepalive for every connection
 ws_ping_timeout_s = 20           # 1 to 60
@@ -972,7 +972,7 @@ bus_send_hwm = 10000            # 1000 to 100000 messages queued per bus subscri
 [serve]
 listen_host = "127.0.0.1"
 listen_port = 8080               # 1 to 65535
-allowed_origins = ["http://localhost:5173"]   # exact scheme://host[:port] for CORS and the WebSocket Origin check
+allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]   # exact scheme://host[:port] for CORS and the WebSocket Origin check
 max_clients = 200                # 1 to 1000 live connections
 max_tickers_per_client = 10      # 1 to 50
 client_queue_max = 5000          # 100 to 100000 messages queued per live client before a client_lag resync
@@ -992,6 +992,7 @@ exclude_mve = true
 ```python
 class Settings(Struct): kalshi: KalshiSettings; recorder: RecorderSettings; serve: ServeSettings
 def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings   # ConfigError on any problem
+def signing_credentials(settings: Settings) -> SigningCredentials          # ConfigError unless key_id and a mode-600 key file are set
 def redacted(settings: Settings) -> dict[str, object]                      # for `tape config check`
 ENDPOINTS: Mapping[Env, KalshiEndpoints]                                    # prod and demo, fixed
 ```
@@ -1014,8 +1015,14 @@ Rules:
   book), `bus_send_hwm` between 1000 and 100000 messages (a reconnect's snapshot burst must
   fit; the queue lives in the recorder's memory), a `bus_endpoint`, when set, that is an
   absolute ipc path within ZeroMQ's length limit (103 bytes on macOS) or a tcp address with a
-  port, and `2 + book_connections` at most `max_connections` (ADR 0020), the private key file
-  must exist and be readable by its owner alone, and `data_dir` must be writable.
+  port, and `2 + book_connections` at most `max_connections` (ADR 0020), and `data_dir` must be
+  writable.
+- **Credentials** are checked only for a command that signs. `key_id` and `private_key_path`
+  may be left out, because `tape serve` holds no credentials (ADR 0023) and never opens the
+  key; `tape record` calls `signing_credentials`, which requires both and a key file that
+  exists and is readable by its owner alone, before it connects. `tape config check` checks
+  what `tape record` needs by default, and with `--for serve` what `tape serve` needs instead:
+  no credentials, and `recorder.bus_endpoint` set.
 - **Serve**: every `[serve]` key has a default, so the section may be left out. `listen_port` is
   1 to 65535; `allowed_origins` names at least one exact `scheme://host[:port]`; `max_clients` is
   1 to 1000 and `max_tickers_per_client` 1 to 50; `client_queue_max` is 100 to 100000, room for a

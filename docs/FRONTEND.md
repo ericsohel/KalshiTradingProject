@@ -165,6 +165,23 @@ test per view; the renderer has golden-image tests against fixture tapes. No `an
 no default exports, no implicit globals. See
 [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md) section 6.
 
+Implementation notes (first slice, the live view):
+
+- Toolchain: Node 24 LTS (`web/.nvmrc`; Node 26 also works), npm with a committed
+  lockfile, Vite, React 18, TypeScript 6.0 (typescript-eslint does not support 7 yet),
+  ESLint flat config, Prettier, Vitest. `npm run check` is the one gate (typecheck, lint,
+  format check, unit tests, production build); CI's `web` job and the pre-commit hooks
+  run the same npm scripts.
+- `web/src` has four layers: `api` (protocol types, decoding, REST and live clients),
+  `state` (framework-free stores), `render` (WebGL2; reads the `HeatmapSource`
+  interface, never the app), and `ui` (React). ESLint enforces that only `ui` imports
+  React and that `render` imports nothing from the other layers.
+- `web/src/api/protocol.ts` is hand-written from section 4 until types generated from
+  `schema.json` replace it; nothing else defines API types.
+- Deferred: Playwright smoke tests and renderer golden-image tests (both need a GPU in
+  CI and fixture data), a measured 60 fps benchmark with 20,000 bubbles, and the
+  production Content Security Policy header.
+
 ## 9. Delivery order
 
 1. Live view with heatmap and trade bubbles for showcase markets, served locally
@@ -172,3 +189,9 @@ no default exports, no implicit globals. See
 2. Status view: live counters first, daily integrity numbers once bake exists.
 3. Replay view with scrubber and annotations.
 4. Depth ladder, hover inspection, keyboard controls, polish.
+
+Step 1 runs locally against `web/dev/mock-server.ts`, a synthetic implementation of 4.1
+and 4.2 with switches for both resync reasons, stale books, and the 1008, 1013, and
+4000 closes (`npm run mock`, then `TAPE_API=http://127.0.0.1:8787 npm run dev`). A
+compact depth ladder shipped early with it; hover inspection and keyboard scrubbing
+remain in step 4.

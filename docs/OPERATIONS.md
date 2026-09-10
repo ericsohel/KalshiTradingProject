@@ -64,6 +64,33 @@ process is listening on the path or a file other than a socket is there. `tape s
 to the same endpoint and can start, stop, or restart at any time: it knows each book again
 within `bus_refresh_s` (ADR 0022). Nothing a consumer does can block or stop the recorder.
 
+### 4.2 The live API
+
+`tape serve` serves the viewer's API (docs/FRONTEND.md 4) from the same `tape.toml`:
+
+```
+uv run tape serve --config tape.toml
+curl -s http://127.0.0.1:8080/api/v1/status
+curl -s 'http://127.0.0.1:8080/api/v1/markets?limit=5'
+```
+
+It listens on `serve.listen_host:serve.listen_port`, `127.0.0.1:8080` by default, and follows
+the bus at `recorder.bus_endpoint`; without that setting it refuses to start. The recorder must
+run with the same endpoint, and a recorder started before the catalog and status topics existed
+must be restarted once to publish them: until then the market list is empty and `recorder` is
+null, although the bus counters move. The API holds no credentials: `[kalshi] env` only selects
+where public titles, categories, and price grids come from, and the key file is never opened.
+SIGINT or SIGTERM closes live connections with 1001 and stops the process; a second signal
+forces it.
+
+`GET /api/v1/status` shows `recording`, true while a recorder status arrived within two of its
+intervals; `recorder_status_age_ms`; `recorder`, the latest status (universe size, live
+subscriptions, and per connection frames, gaps, reconnects, stale books, and dropped records);
+`bus`, the recorder run the API follows (`epoch`, `last_seq`), `messages` received, `resets` and
+`missed` from lost messages, and `books_known`; and `clients`. After a start, books are known
+within `bus_refresh_s`, markets are listed at the next refresh cycle, and metadata fills in as
+Kalshi answers, at most `serve.metadata_requests_per_s` requests a second.
+
 ## 5. Storage and retention
 
 Measured in week one and revisited monthly. A first 65-second production sample
@@ -92,8 +119,8 @@ lifecycle traffic. Policy from day one:
 | Gap share rising | per-connection message rate | Add a connection; shrink group size |
 | Audit mismatches on one group | affected `sid` | Force `get_snapshot`; if persistent, open an issue with the raw frames |
 | Disk filling | `df`, manifest sizes | Run `tape bake --prune`; tighten the L2 universe |
-| API slow | client count, outbound queue depths | Lower `max_clients`; the recorder is unaffected by design |
-| Live view stuck in resync | recorder status `bus.refreshes` and `bus.errors`; both processes name the same `bus_endpoint`; the API's gap count | Refreshes not rising: check the recorder log for `bus refresh failed`. Gaps rising: raise the API's receive high-water mark or `bus_send_hwm`. The tape is unaffected either way |
+| API slow | `clients` in `/api/v1/status`, clients closed for lagging in the API log | Lower `serve.max_clients`; the recorder is unaffected by design |
+| Live view stuck in resync | recorder status `bus.refreshes` and `bus.errors`; both processes name the same `bus_endpoint`; `bus.resets` and `bus.missed` in the API's `/api/v1/status` | Refreshes not rising: check the recorder log for `bus refresh failed`. Resets rising: raise `serve.bus_receive_hwm` or `bus_send_hwm`. The tape is unaffected either way |
 | Spec-drift CI failure | the diff | Update `wire` structs and decoders; raw tape is unaffected |
 
 ## 7. Backups and restore

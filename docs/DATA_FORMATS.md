@@ -337,7 +337,9 @@ The three integrity numbers published on the status page are `uptime.ratio`,
 ## 8. Public API formats
 
 Defined in [FRONTEND.md](FRONTEND.md) section 4. They are derived views over the tables
-above and carry the same integer encodings.
+above and carry the same integer encodings. `scripts/gen_api_schema.py` writes the JSON Schema of
+every REST body and live message to `web/src/api/schema.json` from the structs in
+`tape.api.contract`, and a test fails when the committed file is stale (ADR 0023).
 
 ## 9. Evolution rules
 
@@ -359,7 +361,7 @@ message has two frames:
 
 | frame | content |
 |---|---|
-| topic | ASCII: `md.<ticker>` for `BookSnapshot`, `BookDelta`, `BookRefresh`, `Trade`, and `Ticker`; `ctl.lifecycle` for `Lifecycle`; `ctl.gap` for `GapEvent` |
+| topic | ASCII: `md.<ticker>` for `BookSnapshot`, `BookDelta`, `BookRefresh`, `Trade`, and `Ticker`; `ctl.lifecycle` for `Lifecycle`; `ctl.gap` for `GapEvent`; `ctl.catalog` for `MarketCatalog`; `ctl.status` for `StatusReport` |
 | payload | MessagePack map `{bus_epoch, bus_seq, event}` |
 
 | field | type | note |
@@ -372,6 +374,17 @@ message has two frames:
 time of the last change applied, or null; `receipt`, the connection holding the book and the
 local time the image was taken; `stale`; and `bids` and `asks`, best first. It is taken
 between frames, so it equals the book after every message with a lower `bus_seq`.
+
+`MarketCatalog` opens every refresh cycle: `markets`, one map per recorded market of the latest
+universe decision, in ticker order, `{ticker, series_ticker, event_ticker, volume_24h, close_ts,
+showcase}`, where `volume_24h` is a `count_e2` from the recorder's latest listing and `close_ts`
+is Unix seconds or null. Each catalog replaces the previous one. None is sent before the first
+decision (ADR 0023).
+
+`StatusReport` follows every status log line: `interval_s`, the seconds between reports;
+`universe_size`; `subscribed_markets`; and `connections`, one map per connection by ascending id,
+`{conn_id, taped, frames, gaps, reconnects, stale_books, sink_dropped}`, each counter cumulative
+since the recorder started.
 
 Delivery is lossy per subscriber: one whose queue is full misses messages that others
 receive, and learns it from a gap in `bus_seq`, which it can see only if it subscribes to

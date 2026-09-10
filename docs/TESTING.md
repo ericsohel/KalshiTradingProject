@@ -33,8 +33,11 @@ modules.
 - **Protocol contracts.** For each `Protocol` in [INTERFACES.md](INTERFACES.md), one
   parametrized test suite runs against the real adapter (when credentials exist) and
   against the fake used by other tests. The fake cannot diverge from reality unnoticed.
-- **Public API.** The FastAPI OpenAPI document is committed; a test fails if a change
-  alters it without a version bump, and the TypeScript types are regenerated from it.
+- **Public API.** `web/src/api/schema.json`, the JSON Schema of every REST body and live
+  message, is generated from `tape.api.contract` and committed; a test fails when it differs
+  from the structs, and the TypeScript types are regenerated from it (ADR 0023). The routes, every
+  live message and close code, and a ZeroMQ-to-WebSocket path are tested against Starlette's
+  test client, in-memory sockets, and a real server on localhost.
 
 ## 4. Recorder tests with a fake exchange
 

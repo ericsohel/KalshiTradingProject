@@ -77,7 +77,7 @@ not overlap.
 |---|---|---|---|---|---|
 | Recorder | `tape record` | Kalshi WS + REST | `data/raw/`, `data/keyframes/`, ZeroMQ PUB, metrics | In-memory books for subscribed markets | everything else |
 | Baker | `tape bake` | `data/raw/` | `data/baked/`, `data/manifests/` | none (idempotent per hour) | recorder, API |
-| API | `tape serve` | ZeroMQ SUB, `data/keyframes/`, `data/baked/` | HTTP/WS responses | per-client subscriptions | recorder, baker |
+| API | `tape serve` | ZeroMQ SUB (events, catalog, status), Kalshi's public event and series endpoints; `data/keyframes/` and `data/baked/` after M4 | HTTP/WS responses | live books, per-client subscriptions, metadata cache | recorder, baker |
 | Replayer | `tape replay` | `data/` | reports | none | all |
 | Prober | `tape probe` | Kalshi WS + REST (write::trade key) | `data/probes/` | resting penny orders | recorder, API |
 | Engine | `tape engine` | ZeroMQ SUB or tape, private WS | orders, `data/engine/` | strategy state, positions | recorder, API |
@@ -158,7 +158,9 @@ Dependency rule: `core` modules import only the standard library, `msgspec`, and
 `numpy`. `adapter` modules may import `core` and third-party I/O libraries. Leaf adapters
 (`client`, `segment`, `bus`) each wrap one I/O mechanism and import no other adapter, so,
 for example, the bus can never depend on the recorder or the exchange client. `shell`
-modules may import anything. A lint check enforces this (see
+modules may import anything. The API is imported only by the composition root and never imports
+the recorder, whose catalog, status, and books reach it over the bus (ADR 0023). A lint check
+enforces this (see
 [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md)).
 
 ## 7. Key runtime behaviors

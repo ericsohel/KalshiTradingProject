@@ -92,7 +92,12 @@ Ticker(ticker, ts_ms, receipt, sid, last, bid, ask, bid_size, ask_size, volume, 
 Lifecycle(ticker, receipt, sid, seq, event_type, payload_json)
 GapEvent(receipt, sid, expected_seq, got_seq)
 BookRefresh(ticker, ts_ms, receipt, stale, bids, asks)    # the recorder's image of a live book (ADR 0022)
+CatalogEntry(ticker, series_ticker, event_ticker, volume_24h: CountE2, close_ts: int | None, showcase: bool)
+MarketCatalog(markets: tuple[CatalogEntry, ...])          # ctl.catalog: every recorded market (ADR 0023)
+ConnectionReport(conn_id, taped, frames, gaps, reconnects, stale_books, sink_dropped)
+StatusReport(interval_s, universe_size, subscribed_markets, connections: tuple[ConnectionReport, ...])
 MarketEvent = BookSnapshot | BookDelta | Trade | Ticker | Lifecycle | GapEvent | BookRefresh
+BusEvent = MarketEvent | MarketCatalog | StatusReport      # every event on the bus
 ```
 
 Private events (fills, order updates, acknowledgements, timers) are defined in
@@ -167,7 +172,7 @@ class TokenBucket:              # pure; every method takes the current time
 class RateLimiter(Protocol):
     async def acquire(self, cost: int, *, bucket: Bucket) -> None
     def resize(self, *, read: BucketLimits, write: BucketLimits) -> None
-class BucketRateLimiter(RateLimiter)   # one bucket and one lock per side; FIFO under contention
+class BucketRateLimiter(RateLimiter)   # one bucket and one lock per side; FIFO; sleep= injectable
 class NullRateLimiter(RateLimiter)     # never waits; tests and replay
 ```
 
@@ -201,6 +206,8 @@ class KalshiRest:
     async def series(*, min_updated_ts=None) -> list[Series]
     async def fee_changes(*, show_historical: bool = False) -> list[SeriesFeeChange]
     async def events(*, status=None, with_nested_markets=False, cursor=None) -> Page[EventData]
+    async def event(event_ticker: str) -> GetEventResponse       # {event, markets}
+    async def series_by_ticker(series_ticker: str) -> Series
     async def candlesticks(tickers, *, start_ts, end_ts, period_min) -> list[MarketCandlesticksResponse]
 
     # cursor-following generators; every one is bounded by max_pages
@@ -322,6 +329,7 @@ class MarketSummary(Struct):  ticker; series_ticker; event_ticker; exchange_inde
     @classmethod
     def from_wire(cls, market: Market, *, is_mve: bool = False) -> MarketSummary
 class UniverseDecision(Struct): l2_tickers: frozenset[str]; showcase: frozenset[str];
+                                markets: tuple[MarketSummary, ...];   # of l2_tickers, ticker order
                                 dropped_for_cap: int; reason_counts: Mapping[str, int]
 def select(markets: Sequence[MarketSummary], policy: UniversePolicy, *, now_ts: int) -> UniverseDecision
 ```
@@ -565,7 +573,10 @@ connection holding it, once per `bus_refresh_s`: each cycle fixes its markets, s
 with `refresh_slices` (one slice per market, at most 10 slices per second), and publishes
 one slice, without awaiting, before each pause of `bus_refresh_s / len(slices)`. The cycle
 races the stop request like every loop; if it fails, it is logged and capture continues.
-The status line carries `BusStatus`.
+The status line carries `BusStatus`. Each refresh cycle opens with a `MarketCatalog` of the latest
+universe decision's markets (none before the first decision), and every status tick publishes a
+`StatusReport` of the status it logs (ADR 0023); both go through the same never-raising publisher,
+so neither can affect capture.
 
 ### 8.7 `tape.recorder.tap`
 
@@ -621,15 +632,16 @@ class Subscriber(Protocol):
 
 # envelope
 MARKET_DATA_PREFIX = b"md."; CONTROL_PREFIX = b"ctl."; LIFECYCLE_TOPIC = b"ctl.lifecycle"; GAP_TOPIC = b"ctl.gap"
+CATALOG_TOPIC = b"ctl.catalog"; STATUS_TOPIC = b"ctl.status"
 FIRST_BUS_SEQ = 1
-class BusEnvelope(Struct): bus_epoch: int; bus_seq: int; event: MarketEvent
-def topic_for(event: MarketEvent) -> bytes
+class BusEnvelope(Struct): bus_epoch: int; bus_seq: int; event: BusEvent
+def topic_for(event: BusEvent) -> bytes
 def encode_bus_envelope(envelope: BusEnvelope) -> bytes        # MessagePack
 def decode_bus_envelope(payload: bytes) -> BusEnvelope         # WireError if malformed
 class SequencedPublisher:
     def __init__(self, publisher: Publisher, *, epoch: int)    # ValueError on a negative epoch
     epoch: int; last_seq: int; stats: PublisherStats           # stats.errors adds failures before the transport
-    def publish(self, event: MarketEvent) -> None              # next bus_seq; never raises
+    def publish(self, event: BusEvent) -> None              # next bus_seq; never raises
     def close(self) -> None
 
 # sockets
@@ -658,12 +670,12 @@ class LiveBooks:
 ```
 
 Topics: `md.<ticker>` for snapshots, deltas, refresh images, trades, and ticker updates;
-`ctl.lifecycle` and `ctl.gap`; `ctl.catalog`, the recorded markets with series, event,
-24-hour volume, close time, and showcase flag, once per bus refresh cycle, and
-`ctl.status`, the recorder's status, every status interval (ADR 0023); `ctl.audit` and
-`ctl.heartbeat` are reserved. Private events
-never use the `md.` prefix. Transport: ZeroMQ PUB/SUB over `ipc://` (ADR 0008); message layout
-in [DATA_FORMATS.md](DATA_FORMATS.md) section 10.
+`ctl.lifecycle` and `ctl.gap`; `ctl.catalog`, a `MarketCatalog` of the recorded markets with
+series, event, 24-hour volume, close time, and showcase flag, at the start of every bus refresh
+cycle, and `ctl.status`, a `StatusReport`, every status interval (ADR 0023); `ctl.audit` and
+`ctl.heartbeat` are reserved. Private events never use the `md.` prefix. Transport: ZeroMQ
+PUB/SUB over `ipc://` (ADR 0008); message layout in [DATA_FORMATS.md](DATA_FORMATS.md) section
+10.
 
 Every payload is an envelope `{bus_epoch, bus_seq, event}`: `bus_epoch` is the publisher's
 start time in wall ns and `bus_seq` counts every attempted send from 1, including sends that
@@ -794,23 +806,115 @@ def fit_fill_model(samples: Sequence[ProbeSample]) -> Calibrated
 
 ## 15. `tape.api`
 
-A Starlette application served by uvicorn on localhost (ADR 0023). Routes and the live
-protocol are specified in [FRONTEND.md](FRONTEND.md) 4 and are binding; the names below
-are the intended shape.
+A Starlette application served by uvicorn on localhost (ADR 0023). Routes and the live protocol
+are specified in [FRONTEND.md](FRONTEND.md) 4 and are binding. Only the composition root imports
+the package, and it never imports the recorder: the recorder's catalog, status, and books reach it
+over the bus (`scripts/check_layers.py`).
 
 ```python
-class MarketDirectory:   # pure: catalog + latest ticker updates + resolved metadata -> MarketRow, MarketDetail
-class MetadataResolver:  # adapter: public KalshiRest without a signer, its own token bucket, TTL cache, one request per event
-class LiveHub:           # follows the bus with ZmqSubscriber + LiveBooks and fans messages out to sessions
-class ClientSession:     # one WebSocket: subscription set, bounded queue, lag accounting, rate limits
-def create_app(*, hub: LiveHub, directory: MarketDirectory, resolver: MetadataResolver,
-               settings: ServeSettings, clock: Clock) -> Starlette
+# contract: every REST body and live message, as msgspec structs; schema in web/src/api/schema.json
+MarketsResponse; MarketRow; MarketDetail(MarketRow); PriceRange; Depth
+ServiceStatus; RecorderHealth; ConnectionHealth; BusHealth; ErrorResponse; ErrorBody
+ServerMessage = HelloMessage | SubscribedMessage | SnapshotMessage | DeltaMessage | BookMessage
+              | ResyncMessage | TradeMessage | TickerMessage | ErrorMessage      # tagged by "t"
+ClientMessage = SubscribeRequest                                                 # tagged by "op"
+CLOSE_GOING_AWAY = 1001; CLOSE_POLICY_VIOLATION = 1008; CLOSE_TRY_AGAIN_LATER = 1013; CLOSE_TOO_SLOW = 4000
+
+# directory (pure)
+class MarketMetadata(Struct): title; subtitle; category; price_ranges        # each None until resolved
+UNRESOLVED: MarketMetadata
+class MarketDirectory:
+    def apply_catalog(self, catalog: MarketCatalog) -> None                 # replaces the catalog whole
+    def apply_ticker(self, update: Ticker) -> None
+    def apply_status(self, report: StatusReport, *, received_mono_ns: int) -> None
+    def entry(self, ticker: str) -> CatalogEntry | None
+    def top(self, limit: int) -> tuple[CatalogEntry, ...]                   # volume desc, then ticker
+    def row(self, entry, *, metadata: MarketMetadata, book: Book | None) -> MarketRow
+    def detail(self, entry, *, metadata: MarketMetadata, book: Book | None) -> MarketDetail
+    def service_status(self, *, now_mono_ns: int, bus: BusHealth, clients: int) -> ServiceStatus
+
+# metadata (adapter)
+def metadata_limits(requests_per_s: int) -> BucketLimits
+class ResolverStats(Struct): requests; failures; refused; unparsable; pending; events; series
+class MetadataResolver:
+    def __init__(self, rest: KalshiRest, *, clock: Clock, ttl_s: int, retry_initial_s: int = 30,
+                 retry_max_s: int = 900, max_pending: int = 10_000, max_cached: int = 20_000)
+    def request(self, entries: Iterable[CatalogEntry]) -> None               # never waits
+    def lookup(self, entry: CatalogEntry) -> MarketMetadata                  # from memory, at once
+    async def run(self) -> None                                              # until cancelled
+    stats: ResolverStats
+
+# session
+class LiveSocket(Protocol):
+    async def receive(self) -> str | bytes | None; async def send(self, text: str) -> bool
+    async def close(self, code: int) -> None
+class SessionFeed(Protocol):
+    def subscribe(self, session: ClientSession, tickers: Sequence[str]) -> None
+    def snapshot(self, ticker: str) -> SnapshotMessage | None
+class ClientSession:
+    def __init__(self, socket: LiveSocket, feed: SessionFeed, *, clock: Clock, queue_max: int)
+    def offer(self, messages: Sequence[ServerMessage]) -> None               # never waits
+    def replace_subscriptions(self, tickers: Sequence[str]) -> None
+    def close(self, code: int) -> None                                       # idempotent
+    async def run(self) -> None
+    subscriptions; close_code; lags; queued
+
+# hub
+class ServeConfig(Struct): allowed_origins: frozenset[str]; max_clients; max_tickers;
+                          client_queue_max; bus_refresh_s          # built by tape.cli.serve_config
+class LiveHub(SessionFeed):
+    def __init__(self, subscriber: Subscriber, *, directory: MarketDirectory, config: ServeConfig,
+                 clock: Clock, request_metadata: Callable[[Iterable[CatalogEntry]], None])
+    async def run(self) -> None; def close(self) -> None
+    def receive(self, payload: bytes) -> None                                # one bus message
+    def admit(self, socket: LiveSocket) -> ClientSession | None              # None at max_clients
+    def detach(self, session: ClientSession) -> None
+    def close_sessions(self, code: int) -> None
+    def book(self, ticker: str) -> Book | None; def bus_health(self) -> BusHealth
+    config; directory; clients; malformed
+
+# app
+API_PREFIX = "/api/v1"
+def create_app(*, hub: LiveHub, resolver: MetadataResolver, clock: Clock) -> Starlette
 ```
 
-Every request, response, and WebSocket message is a msgspec struct;
-`scripts/gen_api_schema.py` writes their JSON Schema to `web/src/api/schema.json`. The API
-holds no Kalshi credentials and no route calls Kalshi; only the resolver does, in the
-background, for public metadata.
+`tape.cli` composes it: `serve_config(settings)`, `build_api(settings, *, http, clock, subscriber)
+-> LiveApi(app, hub, resolver)`, `listen_socket(host, port)`, and `serve_api(settings, *, http,
+clock, stop, sock)`, which runs uvicorn, the hub, and the resolver until `stop` and then closes
+every live connection with 1001, lets uvicorn finish, closes the bus subscriber, and cancels the
+resolver. The adapter cannot import `tape.config`, so the hub takes a `ServeConfig`, and the app
+reads the hub's configuration and directory rather than taking them twice.
+
+- **Directory.** Rows exist for the markets of the latest `MarketCatalog`. Ticker updates are kept
+  for every market until the first catalog and for catalog markets after it. `recording` is true
+  while the latest `StatusReport` arrived within two of its own `interval_s`.
+- **Metadata.** One `GET /events/{event_ticker}` per event gives the event title and each market's
+  `yes_sub_title` and price grid (converted with `parse_price`), and one `GET /series/{series_ticker}`
+  per series gives the category. The REST client has no signer and a `BucketRateLimiter` of its
+  own at `metadata_limits(serve.metadata_requests_per_s)`. Requests come only from market lists,
+  market details, and subscriptions. An entry is queued once while pending or in flight; a value is
+  served until it is replaced and refetched after `metadata_ttl_s`; a `KalshiError` or `WireError`
+  is logged, counted, and retried no sooner than 30 s, doubling to 900 s; a grid that does not
+  parse leaves only that market's `price_ranges` null.
+- **Hub.** It subscribes to every topic and applies each message to `LiveBooks` before fanning it
+  out without an await, so each session receives one market's messages in bus order. A book that
+  became unknown sends `resync` with `bus_loss`; one that became known or turned fresh sends
+  `snapshot`; one that turned stale sends `book`; an applied delta sends `delta`; an exchange
+  snapshot applied to a fresh book sends `snapshot`; trades and ticker updates always go to
+  followers. A subscription dedupes tickers, rejects `unknown_ticker` (not in the catalog) and
+  `too_many_tickers`, replies with `subscribed`, and sends snapshots for known books new to the set.
+- **Session.** `hello` is queued before the connection is accepted. An offer that does not fit
+  `client_queue_max` discards the queue and the offer except the offer's own `subscribed` or
+  `error` reply, then queues `resync` (`client_lag`) and a snapshot for each followed market; the
+  third lag within 60 s closes with 4000. A message over 4096 bytes or an eleventh within one
+  second closes with 1008. Malformed JSON, an unknown `op`, or a message that fails its schema
+  gets `error` with `malformed_json`, `unknown_op`, or `invalid_message`. A send that takes over
+  10 s abandons the connection.
+- **App.** Every HTTP response carries `Cache-Control: no-store`; errors use `bad_request`,
+  `unknown_ticker`, `not_found`, `method_not_allowed`, and `internal_error`. CORS allows the
+  configured origins for `GET`. A handshake without an allowed `Origin`, including one with none,
+  is closed before acceptance, which the server answers with 403; beyond `max_clients` it is accepted and closed with
+  1013. uvicorn closes frames over 64 KB with 1009 before the app sees them.
 
 ## 16. Errors
 
@@ -867,14 +971,16 @@ bus_send_hwm = 10000            # 1000 to 100000 messages queued per bus subscri
 
 [serve]
 listen_host = "127.0.0.1"
-listen_port = 8080
-allowed_origins = ["http://localhost:5173"]   # exact origins for CORS and the WebSocket Origin check
-max_clients = 200
-max_tickers_per_client = 10
-client_queue_max = 5000          # messages queued per live client before a client_lag resync
-metadata_requests_per_s = 2      # public Kalshi requests for titles, categories, and price grids
-metadata_ttl_s = 3600
-# The API follows the bus at recorder.bus_endpoint; there is no second setting for it.
+listen_port = 8080               # 1 to 65535
+allowed_origins = ["http://localhost:5173"]   # exact scheme://host[:port] for CORS and the WebSocket Origin check
+max_clients = 200                # 1 to 1000 live connections
+max_tickers_per_client = 10      # 1 to 50
+client_queue_max = 5000          # 100 to 100000 messages queued per live client before a client_lag resync
+bus_receive_hwm = 10000          # 1000 to 100000 bus messages queued in the API before ZeroMQ drops its copies
+metadata_requests_per_s = 2      # 1 to 10 public Kalshi requests for titles, categories, and price grids
+metadata_ttl_s = 3600            # 60 to 86400 seconds resolved metadata is served
+# The API follows the bus at recorder.bus_endpoint; there is no second setting for it, and
+# `tape serve` refuses to start without it.
 
 [recorder.universe]
 min_volume_24h = "1000.00"      # fixed-point string, never a float
@@ -884,7 +990,7 @@ exclude_mve = true
 ```
 
 ```python
-class Settings(Struct): kalshi: KalshiSettings; recorder: RecorderSettings
+class Settings(Struct): kalshi: KalshiSettings; recorder: RecorderSettings; serve: ServeSettings
 def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings   # ConfigError on any problem
 def redacted(settings: Settings) -> dict[str, object]                      # for `tape config check`
 ENDPOINTS: Mapping[Env, KalshiEndpoints]                                    # prod and demo, fixed
@@ -910,6 +1016,11 @@ Rules:
   absolute ipc path within ZeroMQ's length limit (103 bytes on macOS) or a tcp address with a
   port, and `2 + book_connections` at most `max_connections` (ADR 0020), the private key file
   must exist and be readable by its owner alone, and `data_dir` must be writable.
+- **Serve**: every `[serve]` key has a default, so the section may be left out. `listen_port` is
+  1 to 65535; `allowed_origins` names at least one exact `scheme://host[:port]`; `max_clients` is
+  1 to 1000 and `max_tickers_per_client` 1 to 50; `client_queue_max` is 100 to 100000, room for a
+  resync and a snapshot of each followed market; `bus_receive_hwm` has the bounds of
+  `bus_send_hwm`; `metadata_requests_per_s` is 1 to 10 and `metadata_ttl_s` 60 to 86400.
 - **Secrets are paths, never values.** `tape config check` prints the effective settings
   with nothing to redact beyond what is already only a path.
 

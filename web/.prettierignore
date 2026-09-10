@@ -1,0 +1,5 @@
+dist/
+node_modules/
+package-lock.json
+# Generated from the msgspec structs by the Python side (ADR 0023); never hand-formatted.
+src/api/schema.json

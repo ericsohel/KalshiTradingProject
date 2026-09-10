@@ -1,0 +1,266 @@
+# Architecture
+
+This document describes the system as it will be built. Wire-level details live in
+[DATA_FORMATS.md](DATA_FORMATS.md); module contracts live in [INTERFACES.md](INTERFACES.md);
+the reasoning behind non-obvious choices lives in [adr/](adr/).
+
+## 1. Purpose
+
+Record every order-book change on Kalshi into a replayable tape; rebuild any market's
+book at any instant; serve a live and historical viewer to the public; simulate the
+exchange faithfully enough to calibrate a fill model against real fills; and run a
+market-making strategy on one event-sourced engine in replay, shadow, and live modes.
+
+## 2. System context
+
+```
+                     Kalshi (CFTC-regulated exchange)
+        REST https://external-api.kalshi.com/trade-api/v2
+        WS   wss://external-api-ws.kalshi.com/trade-api/ws/v2
+                 |  public market data (signed session)      ^
+                 |  private fills/orders (write::trade key)  |  orders (V2)
+                 v                                           |
+  +-------------------------------------------------------------------------+
+  |  Recorder host (Mac during development, Oracle Cloud ARM in production) |
+  |                                                                         |
+  |   tape record  --raw frames-->  data/raw/    --bake-->  data/baked/     |
+  |        |                        data/keyframes/                         |
+  |        +--ZeroMQ ipc bus--> tape serve (public read-only API)           |
+  |        +--ZeroMQ ipc bus--> tape engine (shadow / live strategy)        |
+  |   tape replay / tape probe / tape audit (batch and calibration jobs)    |
+  +-------------------------------------------------------------------------+
+                 |  HTTPS (Caddy, auto TLS)          ^
+                 v                                   |
+        Public API  <-------------------  web/ (TypeScript + WebGL2 viewer,
+                                           served from Cloudflare Pages)
+```
+
+External dependencies: Kalshi REST and WebSocket APIs (the only data source), a
+Kalshi account with a read-scoped API key (required even for public WebSocket
+channels), and, for the trading engine only, a second key scoped to `write::trade`
+and restricted to a dedicated subaccount.
+
+## 3. Design principles
+
+Each principle is referenced by number from ADRs and code comments.
+
+1. **Record first, interpret later.** Bytes are persisted before any parser runs, with
+   local receive timestamps. A parser bug can never lose data. (ADR 0001)
+2. **Exact arithmetic.** Prices are `int` ten-thousandths of a dollar, counts are `int`
+   hundredths of a contract, money is `int` micro-dollars. Floats never touch these
+   paths. (ADR 0002)
+3. **Functional core, imperative shell.** Pure modules (book, fees, simulator, strategy)
+   perform no I/O and depend on nothing that does. Adapters (client, recorder, store,
+   gateway, API) perform I/O and depend inward. (ADR 0004)
+4. **Determinism.** The engine consumes a totally ordered event stream and reads no
+   clock, socket, or random source. Replaying a recorded day reproduces the same
+   intents; a rolling hash proves it. (ADR 0005)
+5. **Every claim is measured.** Recorder uptime, sequence-gap share, and the mismatch
+   rate between the reconstructed book and independent REST snapshots are computed
+   daily and published. Reports never show a single fill-model number; they show a band.
+6. **The recorder is sacred.** It runs as its own process with its own credentials,
+   its own memory budget, and no inbound network exposure. Nothing downstream may
+   apply backpressure to it; slow consumers are dropped.
+7. **Exchange semantics are modeled, not approximated.** The simulator implements
+   Kalshi's actual order types, post-only cross cancellation, queue rules on amend,
+   rejection after close, fee types with scheduled changes, and token-bucket rate limits.
+8. **Small, typed, explicit interfaces.** Every module boundary is a `Protocol` or a
+   frozen struct. No module reaches into another's internals.
+
+## 4. Processes
+
+All processes are entry points of one Python package (`tape`) and share one
+configuration schema. They are independent OS processes so that failure domains do
+not overlap.
+
+| Process | Command | Reads | Writes | State | May fail without affecting |
+|---|---|---|---|---|---|
+| Recorder | `tape record` | Kalshi WS + REST | `data/raw/`, `data/keyframes/`, ZeroMQ PUB, metrics | In-memory books for subscribed markets | everything else |
+| Baker | `tape bake` | `data/raw/` | `data/baked/`, `data/manifests/` | none (idempotent per hour) | recorder, API |
+| API | `tape serve` | ZeroMQ SUB, `data/keyframes/`, `data/baked/` | HTTP/WS responses | per-client subscriptions | recorder, baker |
+| Replayer | `tape replay` | `data/` | reports | none | all |
+| Prober | `tape probe` | Kalshi WS + REST (write::trade key) | `data/probes/` | resting penny orders | recorder, API |
+| Engine | `tape engine` | ZeroMQ SUB or tape, private WS | orders, `data/engine/` | strategy state, positions | recorder, API |
+
+Only the recorder and the API run continuously in v1. The engine is designed now and
+implemented after the simulator is calibrated (see [ROADMAP.md](ROADMAP.md)).
+
+## 5. Data flow
+
+1. **Universe.** The recorder paginates `GET /markets?status=open&limit=1000` and
+   `GET /series` at start and every five minutes, and subscribes to
+   `market_lifecycle_v2` (no ticker filter) for immediate created/activated/settled
+   notifications. The L2 universe is every active market above a configurable 24-hour
+   volume floor plus an always-on showcase list, capped by count; the ticker channel
+   covers every market regardless.
+2. **Subscriptions.** Markets are partitioned into groups of at most 500 tickers by
+   exchange shard (`exchange_index`) and observed message rate. Each group is one
+   `subscribe` command for `orderbook_delta` and `trade` on one WebSocket connection,
+   yielding one subscription id (`sid`) per channel per group. Sequence numbers are
+   tracked per `sid`, so a gap invalidates at most one group. (ADR 0011)
+3. **Capture.** Every inbound frame is appended, unparsed, to the current raw segment
+   with `recv_mono_ns`, `recv_wall_ns`, and the connection id. Only `type`, `sid`, and
+   `seq` are read on the hot path for gap detection.
+4. **Book maintenance.** Frames are decoded off the hot path into typed structs and
+   applied to in-memory YES-space books. Every five minutes, and at the top of every
+   hour, each active book is written as a keyframe so that replay can seek without
+   reading from midnight.
+5. **Publication.** Decoded events are published on a ZeroMQ PUB socket
+   (`ipc://`) with the market ticker as topic. Consumers (API, engine) subscribe with
+   their own high-water marks; the recorder never blocks on them. (ADR 0008)
+6. **Audit.** Every five minutes the recorder samples active markets and fetches
+   `GET /markets/orderbooks?tickers=...` (100 per call), diffing the response against
+   the local book at response time. Mismatches are written as audit records.
+7. **Bake.** Hourly, the baker converts closed raw segments into Parquet tables with
+   integer fixed-point columns, sorted by `(ticker, ts_ms, seq)`, and writes a manifest
+   with row counts, hashes, gap epochs, and integrity metrics.
+8. **Serve.** The API answers three kinds of request: live fan-out of selected
+   markets over WebSocket, historical book reconstruction at an instant (keyframe plus
+   deltas), and tape slices as Arrow IPC for the viewer's scrubber.
+9. **Replay and simulate.** The replayer merges deltas, trades, lifecycle events, and
+   timers into one ordered stream and drives the engine with a simulated exchange.
+
+## 6. Package layout and dependency rule
+
+```
+src/tape/
+  fixedpoint.py      exact codecs: PriceE4, CountE2, DollarsE6  (core)
+  timeutil.py        typed timestamps and conversions           (core)
+  wire/              msgspec structs for every REST/WS payload   (core)
+  book/              YES-space order book                       (core)
+  fees/              fee model with scheduled changes           (core)
+  sim/               exchange simulator and fill models         (core)
+  engine/            events, intents, strategy protocol, loop   (core)
+  strategies/        concrete strategies (logit market maker)   (core)
+  client/            auth, rate limiter, REST, WS session        (adapter)
+  segment/           raw segment writer/reader, keyframes       (adapter)
+  recorder/          universe, subscriptions, capture, audit    (adapter)
+  bus/               ZeroMQ publisher/subscriber                (adapter)
+  bake/              raw -> Parquet, manifests                  (adapter)
+  store/             catalog and queries over baked data        (adapter)
+  api/               FastAPI app: REST, WS fan-out, Arrow       (adapter)
+  gateway/           live execution and reconciliation          (adapter)
+  probe/             penny-order calibration harness            (adapter)
+  cli.py             typer entry points                         (shell)
+  config.py          settings schema                            (shell)
+```
+
+Dependency rule: `core` modules import only the standard library, `msgspec`, and
+`numpy`. `adapter` modules may import `core` and third-party I/O libraries. `shell`
+modules may import anything. A lint check enforces this (see
+[ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md)).
+
+## 7. Key runtime behaviors
+
+### 7.1 Recorder
+
+- **Connections.** One "control" connection carries `market_lifecycle_v2` and the
+  unfiltered `ticker` channel. N "book" connections carry `orderbook_delta` and
+  `trade` groups. N starts at 4 and grows when a connection's message rate or the
+  server's buffer-overflow error (code 25) indicates saturation. The default account
+  limit is 200 connections; the recorder never exceeds a configured ceiling (default 16).
+- **Authentication.** Every connection signs `timestamp + "GET" + "/trade-api/ws/v2"`
+  with the read-scoped key. Keys never leave the process that loaded them.
+- **Subscription options.** Orderbook subscriptions set `use_yes_price=true` so both
+  sides arrive on the YES price scale. The flag value is recorded in every segment
+  header. (ADR 0006)
+- **Heartbeat.** The server pings `heartbeat` every 10 seconds; the client library
+  answers pongs automatically. Thirty seconds of silence marks the connection dead.
+- **Sequence gaps.** Each sequenced channel carries `seq` per `sid`. On a gap the
+  recorder writes a gap record, issues `update_subscription` with `action=get_snapshot`
+  for that `sid`, and marks affected books stale until the snapshot arrives.
+- **Reconnect.** Exponential backoff with jitter, capped at 30 seconds. A reconnect
+  re-subscribes from the recorder's own subscription table (not from memory of `sid`s,
+  which are connection-scoped) and treats the resulting snapshots as authoritative.
+- **Backpressure.** Frames enter a bounded in-memory queue drained by one writer
+  thread. If the queue is full the recorder logs at error level and keeps the newest
+  frames; it never blocks the socket reader, which would cause server-side overflow.
+- **Universe churn.** Lifecycle `created`/`activated` events add markets to the
+  smallest group on the least-loaded connection via `update_subscription add_markets`;
+  `settled` events remove them after a grace period.
+
+### 7.2 Book
+
+A consolidated YES-space book per market: bids (YES bids) and asks (NO bids reported
+in YES-leg pricing). Levels are `price_e4 -> count_e2`. Invariants: all counts
+non-negative; best bid strictly below best ask; a snapshot replaces all levels; a
+delta adds to one level and removes it at zero. The structure is a pure value type
+with `apply_snapshot`, `apply_delta`, `best_bid`, `best_ask`, `depth(n)`, and
+`to_keyframe`. See [INTERFACES.md](INTERFACES.md).
+
+### 7.3 API fan-out
+
+The API holds one ZeroMQ SUB socket and a map from ticker to connected clients. Each
+client may subscribe to at most 10 tickers. Outbound queues are bounded; a client
+that falls behind by more than a configured number of messages receives a
+`resync` message and a fresh snapshot rather than a backlog. The API is read-only,
+unauthenticated, rate-limited per IP, and exposes no account data.
+
+### 7.4 Engine (design only in v1)
+
+Single-threaded event loop over a totally ordered stream of `Event`s. The strategy
+implements `on_event(event, ctx) -> Sequence[Intent]`. An `ExecutionGateway` turns
+intents into acknowledgements and fills, which return as events. Live, shadow, and
+replay differ only in the gateway and the event source. A blake2b hash over the
+sequence of emitted intents is logged hourly and must match on replay.
+
+## 8. Deployment topology
+
+| Environment | Where | Purpose |
+|---|---|---|
+| Development | Owner's Mac | Everything; recorder may run here initially |
+| Production | Oracle Cloud Always Free ARM instance (US region) | Recorder, baker, API, later engine |
+| Web | Cloudflare Pages | Static viewer; calls the production API over HTTPS |
+| TLS and ingress | Caddy on the production host, hostname from a free dynamic-DNS provider or a purchased domain | HTTPS termination and reverse proxy to `tape serve` |
+| Backups | Cloudflare R2 free tier | Keyframes, manifests, and baked tables; raw segments only if space allows |
+
+The production host exposes exactly one inbound port (443, Caddy). The recorder and
+API bind to localhost and `ipc://` sockets only. See [OPERATIONS.md](OPERATIONS.md).
+
+## 9. Failure modes and responses
+
+| Failure | Detection | Response |
+|---|---|---|
+| WebSocket disconnect | Heartbeat silence, socket close | Reconnect with backoff; re-subscribe; snapshots overwrite books; gap epoch recorded |
+| Sequence gap on one `sid` | `seq` discontinuity | Gap record; `get_snapshot`; books in that group stale until snapshot |
+| Server buffer overflow (error 25) | Error frame | Split the group across connections; log; never drop the subscription silently |
+| REST 429 (no `Retry-After`) | Status code | Client-side token bucket sized from `GET /account/limits`; exponential backoff on the rare 429 |
+| Disk full | Writer exception, free-space metric | Alert; recorder keeps running on a ring of the last N segments; bake stops |
+| Recorder process death | Dead-man ping missed | systemd restart; the gap is visible in the manifest |
+| Bad frame (parser exception) | Decode error off the hot path | Frame is already on disk; skipped for books; counted; sample kept for a regression test |
+| Book mismatch vs REST audit | Audit diff | Audit record; if persistent for a group, force `get_snapshot` |
+| API client too slow | Outbound queue depth | Drop backlog, send `resync` |
+| Kalshi API change | Weekly spec diff CI job, changelog RSS | Issue opened; wire structs regenerated; recorder unaffected because it stores raw bytes |
+
+## 10. Security model
+
+- Two API keys: a read-scoped key for the recorder and, later, a `write::trade` key
+  restricted to a dedicated subaccount for the engine. No `write::transfer` key exists
+  for this project.
+- Private keys are loaded from files outside the repository, never from environment
+  variables that could leak into logs, and never logged.
+- The public API is read-only and exposes only market data derived from public
+  channels. Private channels (`fill`, `user_orders`) are never published on the bus
+  topic space the API subscribes to.
+- The production host runs no other services and accepts SSH by key only.
+- Location attestation: `GET /api_keys` reports `api_key_region_expiration_ts`; a
+  lapsed attestation blocks API trading in Sports, Elections, and Entertainment. The
+  engine checks this before quoting those categories. The recorder is unaffected.
+
+## 11. Non-goals for v1
+
+- Cross-venue data (Polymarket) or execution.
+- Combos, multivariate events, and perpetuals.
+- Publishing the raw tape.
+- Any LLM in the trading loop.
+- Speed-based strategies; the design assumes home or cloud latency and avoids edges
+  that require co-location.
+
+## 12. Open questions
+
+- Message volume per shard is unmeasured; the first week of recording decides
+  connection count and storage policy.
+- Whether Kalshi's `seq` resets on snapshot or continues; the recorder treats any
+  non-monotonic value as a gap and the first week's data will settle the rule.
+- Whether 0.01-contract orders are enabled for every account; the probe stage has a
+  1-contract fallback.

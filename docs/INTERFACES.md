@@ -128,74 +128,152 @@ reported by the `False` return, because their base is unknown.
 
 ## 6. `tape.client`
 
-### 5.1 `tape.client.auth`
+### 6.1 `tape.client.auth`
 
 ```python
-class Signer(Protocol):
-    key_id: str
-    def sign(self, timestamp_ms: int, method: str, path: str) -> str   # base64 RSA-PSS
+HEADER_KEY = "KALSHI-ACCESS-KEY"; HEADER_TIMESTAMP = ...; HEADER_SIGNATURE = ...
+
+class Signer(Protocol):                       # runtime_checkable
+    @property
+    def key_id(self) -> str: ...
+    def sign(self, timestamp_ms: int, method: str, path: str) -> str      # base64 RSA-PSS
     def headers(self, method: str, path: str, *, now_ms: int) -> dict[str, str]
-class RsaPssSigner(Signer):    # loads a PEM from a path; never exposes the key object
+
+class RsaPssSigner:            # loads a PEM once; the key is never exposed or logged
+    def __init__(self, key_id: str, private_key_path: Path, *, password: bytes | None = None)
 ```
 
-### 5.2 `tape.client.ratelimit`
+Signs `timestamp + METHOD + path` with RSA-PSS/SHA-256, MGF1(SHA-256), salt length equal
+to the digest length. `path` must start with `/` and must already have the query string
+removed; `sign` raises `ValueError` otherwise rather than producing a signature the
+exchange would silently reject. A bad key id, unreadable file, malformed PEM, or
+non-RSA key raises `ConfigError`. `__repr__` redacts the key.
+
+### 6.2 `tape.client.ratelimit`
 
 ```python
-class TokenBucket:              # pure; time is passed in
-    def __init__(self, refill_per_s: int, capacity: int) -> None
+Bucket = Literal["read", "write"]
+DEFAULT_TOKEN_COST = 10
+class BucketLimits(Struct): refill_per_s: int; capacity: int
+BASIC_READ = BucketLimits(200, 400); BASIC_WRITE = BucketLimits(100, 100)
+
+class TokenBucket:              # pure; every method takes the current time
+    def __init__(self, limits: BucketLimits, *, now_ns: Ns) -> None
+    def tokens(self, now_ns: Ns) -> int
     def try_take(self, tokens: int, now_ns: Ns) -> bool
-    def wait_ns(self, tokens: int, now_ns: Ns) -> Ns
-class RateLimiter(Protocol):    # async adapter around two buckets (read, write)
-    async def acquire(self, cost: int, *, bucket: Literal["read", "write"]) -> None
+    def wait_ns(self, tokens: int, now_ns: Ns) -> Ns          # rounds up; 0 when available
+
+class RateLimiter(Protocol):
+    async def acquire(self, cost: int, *, bucket: Bucket) -> None
+    def resize(self, *, read: BucketLimits, write: BucketLimits) -> None
+class BucketRateLimiter(RateLimiter)   # one bucket and one lock per side; FIFO under contention
+class NullRateLimiter(RateLimiter)     # never waits; tests and replay
 ```
 
-Buckets are seeded from `GET /account/limits` when a key is present, else from the
-documented Basic tier (200 read / 100 write per second, cost 10).
+Tokens are tracked in billionths so refill is exact integer arithmetic. A request for
+more tokens than a bucket can ever hold raises `ValueError` instead of waiting forever.
+Buckets default to the documented Basic tier and are replaced by `resize()` once
+`GET /account/limits` has been read (ADR 0016).
 
-### 5.3 `tape.client.rest`
+### 6.3 `tape.client.rest`
+
+`tape.wire.rest` holds frozen structs mirroring the pinned OpenAPI document field for
+field, with Kalshi's own names and string encodings; conversion to fixed-point is the
+caller's job. Inbound enumerated fields decode as `str` (ADR 0017). `Page[T]` carries
+`items: tuple[T, ...]` and `cursor: str | None`.
 
 ```python
-class KalshiRest(Protocol):
-    async def exchange_status(self) -> ExchangeStatus
-    async def markets(self, *, status: str | None, cursor: str | None, limit: int, **filters) -> Page[MarketV1]
-    async def iter_markets(self, **filters) -> AsyncIterator[MarketV1]     # follows cursors
-    async def market(self, ticker: str) -> MarketV1
-    async def orderbook(self, ticker: str, *, depth: int = 0) -> OrderbookFp
-    async def orderbooks(self, tickers: Sequence[str]) -> list[MarketOrderbookFp]  # <= 100
-    async def trades(self, *, ticker: str | None, min_ts: int | None, max_ts: int | None, cursor: str | None) -> Page[TradeV1]
-    async def series(self, *, min_updated_ts: int | None) -> list[SeriesV1]
-    async def fee_changes(self, *, show_historical: bool) -> list[SeriesFeeChange]
-    async def events(self, *, status: str | None, with_nested_markets: bool, cursor: str | None) -> Page[EventV1]
-    async def candlesticks(self, tickers: Sequence[str], *, start_ts: int, end_ts: int, period_min: int) -> list[MarketCandles]
-    async def account_limits(self) -> AccountLimits
-    async def api_keys(self) -> ApiKeysResponse
+def build_client(base_url: str, *, timeout_s: float = ...) -> httpx.AsyncClient
+DEFAULT_MAX_PAGES = 1000
+
+class KalshiRest:
+    def __init__(self, base_url: str, client: httpx.AsyncClient,
+                 limiter: RateLimiter, clock: Clock, signer: Signer | None = None)
+
+    # public market data (no signer required)
+    async def exchange_status() -> ExchangeStatus
+    async def markets(*, status=None, limit=100, cursor=None, **filters) -> Page[Market]
+    async def market(ticker: str) -> Market
+    async def orderbook(ticker: str, *, depth: int = 0) -> OrderbookCountFp
+    async def orderbooks(tickers: Sequence[str]) -> list[MarketOrderbookFp]   # <= 100
+    async def trades(*, ticker=None, min_ts=None, max_ts=None, cursor=None) -> Page[Trade]
+    async def series(*, min_updated_ts=None) -> list[Series]
+    async def fee_changes(*, show_historical: bool = False) -> list[SeriesFeeChange]
+    async def events(*, status=None, with_nested_markets=False, cursor=None) -> Page[EventData]
+    async def candlesticks(tickers, *, start_ts, end_ts, period_min) -> list[MarketCandlesticksResponse]
+
+    # cursor-following generators; every one is bounded by max_pages
+    def iter_markets(...) -> AsyncIterator[Market]
+    def iter_trades(...) -> AsyncIterator[Trade]
+    def iter_events(...) -> AsyncIterator[EventData]
+    def iter_fills(...) -> AsyncIterator[Fill]
+    def iter_settlements(...) -> AsyncIterator[Settlement]
+
+    # authenticated
+    async def account_limits() -> GetAccountApiLimitsResponse
+    async def api_keys() -> GetApiKeysResponse
+    async def fills(*, min_ts=None, cursor=None) -> Page[Fill]
+    async def settlements(*, min_ts=None, cursor=None) -> Page[Settlement]
+    async def balance(*, exchange_index: int | None = None) -> GetBalanceResponse
+
     # trading (write::trade key only)
-    async def create_order(self, req: CreateOrderV2Request) -> CreateOrderV2Response
-    async def cancel_order(self, order_id: str, *, market_ticker: str) -> CancelOrderV2Response
-    async def decrease_order(self, order_id: str, *, reduce_by: CountE2, market_ticker: str) -> DecreaseOrderV2Response
-    async def cancel_all(self) -> int
-    async def fills(self, *, min_ts: int | None, cursor: str | None) -> Page[FillV1]
-    async def settlements(self, *, min_ts: int | None, cursor: str | None) -> Page[SettlementV1]
-    async def balance(self, *, exchange_index: int | None) -> Balance
+    async def create_order(req: CreateOrderV2Request) -> CreateOrderV2Response   # 10 tokens
+    async def cancel_order(order_id: str, *, market_ticker: str) -> CancelOrderV2Response  # 2
+    async def decrease_order(order_id, *, reduce_by: CountE2, market_ticker) -> DecreaseOrderV2Response
+    async def cancel_all() -> None                                              # kill switch, 2 tokens
 ```
 
-Errors: `KalshiHttpError(status, code, message, details)`, `RateLimitedError`,
-`KalshiTransportError`. Every method takes an implicit per-request timeout from config.
+The client never builds its own transport; `build_client` is called once by the
+composition root, and tests pass an `httpx.AsyncClient` over `httpx.MockTransport`.
+Requests are signed only when a signer is present, over the path from root including
+`/trade-api/v2` and excluding the query string. Every call takes tokens from the
+limiter first, using the `write` bucket for order mutations and `read` otherwise.
 
-### 5.4 `tape.client.ws`
+Errors: `KalshiHttpError(status, code, message, details)` for non-2xx, with the body's
+`ErrorResponse` parsed when present; `RateLimitedError` for 429; `KalshiTransportError`
+for network and timeout failures; `WireError` for a body that does not match its
+struct. No `httpx` exception escapes.
+
+Batch endpoints raise `ValueError` above 100 tickers rather than truncating, because a
+silent truncation would look like an empty book. `cancel_all` returns nothing: Kalshi
+answers `204` and reports no count, and inventing one would imply information the
+exchange never gave.
+
+### 6.4 `tape.client.ws`
 
 ```python
-class WsSession(Protocol):
-    conn_id: int
-    async def connect(self) -> None
-    async def send(self, command: Command) -> int            # returns command id
-    async def frames(self) -> AsyncIterator[RawFrame]         # RawFrame(bytes, recv_mono_ns, recv_wall_ns)
-    async def close(self) -> None
-class SubscribeCommand / UpdateSubscriptionCommand / UnsubscribeCommand / ListSubscriptionsCommand  # frozen structs
+class RawFrame(Struct): payload: bytes; recv_mono_ns: Ns; recv_wall_ns: Ns
+
+# Frozen command structs; each validates in __post_init__ what the server would reject.
+SubscribeCommand(channels, market_tickers=None, use_yes_price=None, send_initial_snapshot=None)
+UpdateSubscriptionCommand(sid, action: "add_markets"|"delete_markets"|"get_snapshot", market_tickers=None)
+UnsubscribeCommand(sids); ListSubscriptionsCommand()
+Command = SubscribeCommand | UpdateSubscriptionCommand | UnsubscribeCommand | ListSubscriptionsCommand
+def encode_command(command: Command, command_id: int) -> bytes   # {"id","cmd","params"?}
+
+class WsSession:
+    def __init__(self, url, signer: Signer, clock: Clock, *, conn_id=0,
+                 silence_timeout_ns=30e9, connect_timeout_ns=10e9, send_timeout_ns=10e9,
+                 close_timeout_ns=5e9, max_buffered_frames=4096)
+    conn_id: int; frames_dropped: int; is_open: bool
+    async def connect(self) -> None                  # KalshiTransportError on failure
+    async def send(self, command: Command) -> int    # returns the assigned command id
+    def frames(self) -> AsyncIterator[RawFrame]      # receive order; one consumer only
+    async def close(self) -> None                    # idempotent
+    async def __aenter__/__aexit__
 ```
 
-`WsSession` does not decode. It answers pings, raises `WsClosedError` on close, and
-exposes `RawFrame`s in receive order. Reconnect policy lives in the recorder, not here.
+`WsSession` decodes nothing, tracks no sequence numbers, and never reconnects; gap
+handling and reconnect policy belong to the recorder. It signs `timestamp + "GET" +
+"/trade-api/ws/v2"` on the upgrade. The server drives the 10-second heartbeat and the
+library answers its pings, so no client keepalive is configured; inbound silence past
+`silence_timeout_ns`, a peer close, or a reader bug all raise `WsClosedError`, while a
+deliberate `close()` ends `frames()` cleanly. A session is single-use.
+
+**Backpressure.** A reader task drains the socket into a bounded buffer. When the
+consumer falls behind, the *oldest* frame is dropped and `frames_dropped` counts it,
+because blocking the reader would stall the socket and make the server overflow its own
+subscription buffer (error 25), losing far more.
 
 ## 7. `tape.segment` (segment and keyframe I/O)
 

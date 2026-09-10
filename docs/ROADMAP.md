@@ -6,9 +6,9 @@ and cannot be recreated.
 
 | # | Milestone | Deliverable | Definition of done |
 |---|---|---|---|
-| M0 | Design | This document set | Reviewed; ADRs accepted; open questions listed |
-| M1 | Foundations | `fixedpoint`, `timeutil`, `wire`, `book`, `segment`, tooling, CI | Property tests green; layer and no-float checks in CI; coverage thresholds met |
-| M2 | Client | `client.auth`, `client.ratelimit`, `client.rest`, `client.ws` | Contract tests pass against fakes and against the demo environment; public production endpoints verified |
+| M0 | Design | This document set | Done 2026-09-09. ADRs accepted; open questions listed |
+| M1 | Foundations | `fixedpoint`, `timeutil`, `errors`, `events`, `wire`, `book`, `segment`, tooling, CI | Done 2026-09-09. 113 tests, 97% coverage; ruff, mypy strict, layer and no-float checks green in CI |
+| M2 | Client | `client.auth`, `client.ratelimit`, `client.rest`, `client.ws` | Done 2026-09-10. Offline suite green against fakes and a scripted fake exchange server; live public production endpoints verified (`TAPE_TEST_ENV=prod`); demo order paths deferred to M9, which is when a key first exists |
 | M3 | Recorder | `tape record` with universe, subscription planning, capture, gap handling, keyframes, audits, metrics | 7 consecutive days recorded on the Mac with uptime >= 99%, audit exact ratio >= 99.5%, message rate and GB/day measured |
 | M4 | Bake and catalog | `tape bake`, manifests, `Catalog.book_at` | Bake is idempotent (sha256 stable); `book_at` equals the recorder's live book at keyframe instants; first manifest published |
 | M5 | API and status view | `tape serve` (status, markets, book, tape, live), `web/` status page on Cloudflare Pages, Caddy on the production host | Public URL shows daily integrity numbers; production recorder running on Oracle |

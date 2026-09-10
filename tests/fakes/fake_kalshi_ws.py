@@ -5,8 +5,13 @@ difference for the parts we depend on: it records the handshake headers, answers
 ``subscribe`` with one ``subscribed`` per channel carrying an incrementing sid,
 answers ``update_subscription`` with ``ok`` and ``unsubscribe`` with ``unsubscribed``,
 and keeps a per-sid ``seq`` counter. Everything a test needs to provoke is explicit:
-pushing arbitrary frames, pushing an error frame, going silent, and dropping the
-socket without a close handshake.
+pushing arbitrary frames (malformed ones included), pushing an error frame, skipping a
+sequence number, going silent, and dropping the socket without a close handshake.
+
+Order books are opt-in: a market given a book with :meth:`FakeKalshiWs.set_book` gets a
+sequenced ``orderbook_snapshot`` on its ``orderbook_delta`` sid when it is subscribed,
+added, or named by ``get_snapshot``. Markets without a book get none, so tests that never
+set one see exactly the replies they always did.
 
 It is deliberately more than the WebSocket session needs, because the recorder tests
 reuse it. Waiting is event-driven (``wait_for_connection``, ``wait_for_commands``) so
@@ -24,13 +29,29 @@ import msgspec
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
-__all__ = ["UNKNOWN_SID_ERROR_CODE", "FakeConnection", "FakeKalshiWs"]
+__all__ = [
+    "ORDERBOOK_CHANNEL",
+    "UNKNOWN_COMMAND_ERROR_CODE",
+    "UNKNOWN_SID_ERROR_CODE",
+    "UNSUPPORTED_ACTION_ERROR_CODE",
+    "FakeConnection",
+    "FakeKalshiWs",
+]
 
 DEFAULT_WAIT_S: Final = 5.0
 """Every wait in the double is bounded, so a broken client fails the test instead of hanging."""
 
-UNKNOWN_SID_ERROR_CODE: Final = 6
-"""Code this double uses for an unknown sid. Kalshi does not pin it; do not assert on it."""
+UNKNOWN_COMMAND_ERROR_CODE: Final = 5
+"""Error code for an unknown command name (specs/asyncapi.yaml error table)."""
+
+UNKNOWN_SID_ERROR_CODE: Final = 7
+"""Error code for an unknown subscription id (specs/asyncapi.yaml error table)."""
+
+UNSUPPORTED_ACTION_ERROR_CODE: Final = 13
+"""Error code for an unsupported update_subscription action (specs/asyncapi.yaml)."""
+
+ORDERBOOK_CHANNEL: Final = "orderbook_delta"
+"""The only channel this double sends snapshots on, as Kalshi does."""
 
 
 class FakeConnection:
@@ -38,10 +59,18 @@ class FakeConnection:
 
     Args:
         connection: The live server-side connection.
+        books: Snapshot payload fields by market ticker, shared with the server so a
+            book set after the connection opened is still used.
     """
 
-    def __init__(self, connection: ServerConnection) -> None:
+    def __init__(
+        self,
+        connection: ServerConnection,
+        *,
+        books: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
         self._connection = connection
+        self._books: Mapping[str, Mapping[str, Any]] = {} if books is None else books
         self._commands: list[dict[str, Any]] = []
         self._progress = asyncio.Event()
         self._subscriptions: dict[int, dict[str, Any]] = {}
@@ -102,6 +131,20 @@ class FakeConnection:
             frame["seq"] = seq
         frame["msg"] = dict(msg)
         await self.push(msgspec.json.encode(frame))
+
+    async def push_sequenced(self, message_type: str, msg: Mapping[str, Any], *, sid: int) -> int:
+        """Send a data frame carrying the sid's next ``seq``, as the exchange numbers them.
+
+        Returns:
+            The ``seq`` the frame carried.
+        """
+        seq = self._next_seq(sid)
+        await self.push_message(message_type, msg, sid=sid, seq=seq)
+        return seq
+
+    def skip_seq(self, sid: int, count: int = 1) -> None:
+        """Consume ``count`` sequence numbers without sending, so the next frame shows a gap."""
+        self._seq_by_sid[sid] = self._seq_by_sid.get(sid, 0) + count
 
     async def push_error(
         self,
@@ -168,7 +211,9 @@ class FakeConnection:
             case "list_subscriptions":
                 return [self._list_subscriptions(command_id)]
             case unknown:
-                return [self._error(command_id, UNKNOWN_SID_ERROR_CODE, f"unknown cmd {unknown!r}")]
+                return [
+                    self._error(command_id, UNKNOWN_COMMAND_ERROR_CODE, f"unknown cmd {unknown!r}")
+                ]
 
     def _subscribe(self, command_id: Any, params: Mapping[str, Any]) -> list[dict[str, Any]]:
         replies: list[dict[str, Any]] = []
@@ -183,6 +228,8 @@ class FakeConnection:
             replies.append(
                 {"id": command_id, "type": "subscribed", "msg": {"channel": channel, "sid": sid}}
             )
+            if params.get("send_initial_snapshot") is not False:
+                replies.extend(self._snapshots(sid, params.get("market_tickers") or []))
         return replies
 
     def _update_subscription(
@@ -194,29 +241,48 @@ class FakeConnection:
             return [self._error(command_id, UNKNOWN_SID_ERROR_CODE, f"unknown sid {sid}", sid=sid)]
         tickers: list[str] = list(subscription["market_tickers"])
         incoming: list[str] = list(params.get("market_tickers") or [])
+        snapshot_tickers: list[str] = []
         match params.get("action"):
             case "add_markets":
-                tickers = tickers + [t for t in incoming if t not in tickers]
+                snapshot_tickers = [t for t in incoming if t not in tickers]
+                tickers = tickers + snapshot_tickers
             case "delete_markets":
                 tickers = [t for t in tickers if t not in incoming]
             case "get_snapshot":
-                pass
+                snapshot_tickers = [t for t in incoming if t in tickers]
             case unknown:
                 return [
                     self._error(
-                        command_id, UNKNOWN_SID_ERROR_CODE, f"unknown action {unknown!r}", sid=sid
+                        command_id,
+                        UNSUPPORTED_ACTION_ERROR_CODE,
+                        f"unknown action {unknown!r}",
+                        sid=sid,
                     )
                 ]
         subscription["market_tickers"] = tickers
         assert isinstance(sid, int)
+        ok = {
+            "id": command_id,
+            "sid": sid,
+            "seq": self._next_seq(sid),
+            "type": "ok",
+            "msg": {"market_tickers": tickers},
+        }
+        return [ok, *self._snapshots(sid, snapshot_tickers)]
+
+    def _snapshots(self, sid: int, tickers: Sequence[str]) -> list[dict[str, Any]]:
+        """Build a sequenced snapshot for every named market that has a book."""
+        if self._subscriptions[sid]["channel"] != ORDERBOOK_CHANNEL:
+            return []
         return [
             {
-                "id": command_id,
+                "type": "orderbook_snapshot",
                 "sid": sid,
                 "seq": self._next_seq(sid),
-                "type": "ok",
-                "msg": {"market_tickers": tickers},
+                "msg": {"market_ticker": ticker, **self._books[ticker]},
             }
+            for ticker in tickers
+            if ticker in self._books
         ]
 
     def _unsubscribe(self, command_id: Any, params: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -284,6 +350,7 @@ class FakeKalshiWs:
         self._ping_interval_s = ping_interval_s
         self._server: Server | None = None
         self._connections: list[FakeConnection] = []
+        self._books: dict[str, dict[str, Any]] = {}
         self._accepted = asyncio.Event()
         self._url = ""
 
@@ -296,6 +363,28 @@ class FakeKalshiWs:
     def connections(self) -> Sequence[FakeConnection]:
         """Every connection accepted so far, in the order they were accepted."""
         return self._connections
+
+    def set_book(
+        self,
+        ticker: str,
+        *,
+        yes: Sequence[tuple[str, str]] = (),
+        no: Sequence[tuple[str, str]] = (),
+    ) -> None:
+        """Give a market the book its snapshots report, on every connection.
+
+        Args:
+            ticker: Market ticker.
+            yes: ``(price_dollars, count_fp)`` pairs for ``yes_dollars_fp``.
+            no: ``(price_dollars, count_fp)`` pairs for ``no_dollars_fp``. A side with no
+                levels is omitted from the payload, as Kalshi omits it.
+        """
+        book: dict[str, Any] = {}
+        if yes:
+            book["yes_dollars_fp"] = [list(level) for level in yes]
+        if no:
+            book["no_dollars_fp"] = [list(level) for level in no]
+        self._books[ticker] = book
 
     async def start(self) -> None:
         """Bind an ephemeral port on the loopback interface and start serving."""
@@ -345,7 +434,7 @@ class FakeKalshiWs:
         await self.stop()
 
     async def _serve_connection(self, connection: ServerConnection) -> None:
-        fake = FakeConnection(connection)
+        fake = FakeConnection(connection, books=self._books)
         self._connections.append(fake)
         self._accepted.set()
         try:

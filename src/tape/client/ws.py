@@ -124,13 +124,18 @@ class SubscribeCommand(msgspec.Struct, frozen=True, omit_defaults=True):
 class UpdateSubscriptionCommand(msgspec.Struct, frozen=True, omit_defaults=True):
     """``update_subscription``: change or resnapshot one live subscription.
 
+    Every action names its markets. For ``get_snapshot`` the pinned AsyncAPI document
+    describes the reply as a snapshot "for the requested ``market_tickers``" and its only
+    example sends them (``updateSubscriptionGetSnapshotCommand``); what the server does
+    without them is undocumented, so gap recovery must never depend on that form.
+
     Attributes:
         sid: Subscription id the server assigned; connection-scoped.
         action: ``add_markets``, ``delete_markets``, or ``get_snapshot``.
-        market_tickers: Markets to add or delete; omitted for ``get_snapshot``.
+        market_tickers: Markets to add, delete, or resnapshot.
 
     Raises:
-        ValueError: If the markets do not match the action, which the server rejects.
+        ValueError: If ``market_tickers`` is absent or empty.
     """
 
     cmd: ClassVar[str] = "update_subscription"
@@ -140,10 +145,7 @@ class UpdateSubscriptionCommand(msgspec.Struct, frozen=True, omit_defaults=True)
     market_tickers: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.action == "get_snapshot":
-            if self.market_tickers is not None:
-                raise ValueError("get_snapshot takes no market_tickers")
-        elif not self.market_tickers:
+        if not self.market_tickers:
             raise ValueError(f"{self.action} needs at least one market ticker")
 
 

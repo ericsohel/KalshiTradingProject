@@ -129,8 +129,9 @@ def test_commands_serialize_exactly_as_the_spec_shows() -> None:
         b'{"id":3,"cmd":"unsubscribe","params":{"sids":[7]}}'
     )
     assert encode_command(ListSubscriptionsCommand(), 4) == b'{"id":4,"cmd":"list_subscriptions"}'
-    assert encode_command(UpdateSubscriptionCommand(7, "get_snapshot"), 5) == (
-        b'{"id":5,"cmd":"update_subscription","params":{"sid":7,"action":"get_snapshot"}}'
+    assert encode_command(UpdateSubscriptionCommand(7, "get_snapshot", ("KXA-1",)), 5) == (
+        b'{"id":5,"cmd":"update_subscription",'
+        b'"params":{"sid":7,"action":"get_snapshot","market_tickers":["KXA-1"]}}'
     )
 
 
@@ -139,8 +140,12 @@ def test_commands_reject_arguments_the_server_would_refuse() -> None:
         SubscribeCommand(())
     with pytest.raises(ValueError, match="market_tickers"):
         SubscribeCommand(("trade",), ())
-    with pytest.raises(ValueError, match="get_snapshot"):
-        UpdateSubscriptionCommand(1, "get_snapshot", ("KXA-1",))
+    # The spec documents get_snapshot only with market_tickers (asyncapi.yaml,
+    # updateSubscriptionGetSnapshotCommand); the bare form is refused like the others.
+    with pytest.raises(ValueError, match="get_snapshot needs at least one market ticker"):
+        UpdateSubscriptionCommand(1, "get_snapshot")
+    with pytest.raises(ValueError, match="get_snapshot needs at least one market ticker"):
+        UpdateSubscriptionCommand(1, "get_snapshot", ())
     with pytest.raises(ValueError, match="market ticker"):
         UpdateSubscriptionCommand(1, "add_markets")
     with pytest.raises(ValueError, match="sid"):

@@ -61,3 +61,23 @@ min_volume_24h = "1000.00"
 max_l2_markets = 2000
 showcase_series = ["KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDECISION"]
 exclude_mve = true
+
+[serve]
+# `tape serve` follows the recorder's bus at recorder.bus_endpoint, which must then be set, and
+# serves the live API (docs/FRONTEND.md 4) on listen_host:listen_port. In production it stays on
+# localhost behind a TLS proxy.
+listen_host = "127.0.0.1"
+listen_port = 8080
+# Exact origins (scheme://host[:port]) that CORS and the WebSocket Origin check accept.
+allowed_origins = ["http://localhost:5173"]
+# Live connections at once (1 to 1000), markets per connection (1 to 50), and messages queued
+# for one connection before it is resynchronized (100 to 100000).
+max_clients = 200
+max_tickers_per_client = 10
+client_queue_max = 5000
+# Bus messages queued in the API before ZeroMQ drops its copies (1000 to 100000).
+bus_receive_hwm = 10000
+# Titles, categories, and price grids come from Kalshi's public endpoints, without credentials,
+# at most this many requests per second (1 to 10), each result kept this many seconds (60 to 86400).
+metadata_requests_per_s = 2
+metadata_ttl_s = 3600

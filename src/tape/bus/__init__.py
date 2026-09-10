@@ -8,11 +8,13 @@ leaf adapter: it imports core modules and never the recorder or the exchange cli
 """
 
 from tape.bus.envelope import (
+    CATALOG_TOPIC,
     CONTROL_PREFIX,
     FIRST_BUS_SEQ,
     GAP_TOPIC,
     LIFECYCLE_TOPIC,
     MARKET_DATA_PREFIX,
+    STATUS_TOPIC,
     BusEnvelope,
     SequencedPublisher,
     decode_bus_envelope,
@@ -48,6 +50,7 @@ __all__ = [
     "BOOK_FRESH",
     "BOOK_STALE",
     "BOOK_UNKNOWN",
+    "CATALOG_TOPIC",
     "CONTROL_PREFIX",
     "DEFAULT_SEND_HWM",
     "FIRST_BUS_SEQ",
@@ -58,6 +61,7 @@ __all__ = [
     "RESET_EPOCH",
     "RESET_GAP",
     "RESET_START",
+    "STATUS_TOPIC",
     "TCP_SCHEME",
     "BookStatus",
     "BusEnvelope",

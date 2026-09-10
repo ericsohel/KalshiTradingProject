@@ -51,6 +51,7 @@ __all__ = [
     "KalshiEndpoints",
     "KalshiSettings",
     "RecorderSettings",
+    "ServeSettings",
     "Settings",
     "UniverseSettings",
     "load_settings",
@@ -102,6 +103,34 @@ _MAX_BUS_SEND_HWM: Final = 100_000
 memory; at up to a few kilobytes a refresh image, a stalled subscriber at the cap holds
 hundreds of megabytes, and more would put the recorder's memory budget at a consumer's mercy."""
 
+_MAX_PORT: Final = 65_535
+
+_MAX_SERVE_CLIENTS: Final = 1_000
+"""Ceiling on live WebSocket connections. Each may hold ``client_queue_max`` messages in the API's
+memory, on a host it shares with the recorder; the viewer plans for 200 (docs/FRONTEND.md 6)."""
+
+_MAX_TICKERS_PER_CLIENT: Final = 50
+"""Ceiling on the markets one live connection follows. A viewer watches a handful
+(docs/FRONTEND.md 1), and every market adds a resync and a snapshot to each recovery from lag."""
+
+_MIN_CLIENT_QUEUE: Final = 100
+"""Floor on the messages queued for one live connection: room for the resync and the snapshot of
+each of the most markets a connection may follow, which a ``client_lag`` recovery queues at once."""
+
+_MAX_CLIENT_QUEUE: Final = 100_000
+"""Ceiling on the messages queued for one live connection. At a few hundred bytes a message, a
+stalled viewer at the cap holds tens of megabytes before it is resynchronized."""
+
+_MAX_METADATA_REQUESTS_PER_S: Final = 10
+"""Ceiling on public metadata requests per second. They leave the recorder's host for titles
+that only the viewer uses, so they stay a trickle beside capture (ADR 0023)."""
+
+_MIN_METADATA_TTL_S: Final = 60
+"""Floor on how long resolved metadata is served; below a minute the cache would mostly refetch."""
+
+_MAX_METADATA_TTL_S: Final = 86_400
+"""Ceiling on how long resolved metadata is served; a corrected title appears within a day."""
+
 _INTEGER: Final = re.compile(r"[+-]?[0-9]+")
 _TRUE: Final = frozenset({"true", "1", "yes"})
 _FALSE: Final = frozenset({"false", "0", "no"})
@@ -114,7 +143,14 @@ KeepaliveSeconds = Annotated[int, msgspec.Meta(ge=1, le=_MAX_KEEPALIVE_S)]
 AuditAllowanceMs = Annotated[int, msgspec.Meta(ge=1, le=_MAX_AUDIT_ALLOWANCE_MS)]
 AuditTapEvents = Annotated[int, msgspec.Meta(ge=1, le=_MAX_AUDIT_TAP_EVENTS)]
 BusRefreshSeconds = Annotated[int, msgspec.Meta(ge=1, le=_MAX_BUS_REFRESH_S)]
-BusSendHwm = Annotated[int, msgspec.Meta(ge=_MIN_BUS_SEND_HWM, le=_MAX_BUS_SEND_HWM)]
+BusHwm = Annotated[int, msgspec.Meta(ge=_MIN_BUS_SEND_HWM, le=_MAX_BUS_SEND_HWM)]
+ListenPort = Annotated[int, msgspec.Meta(ge=1, le=_MAX_PORT)]
+Origin = Annotated[str, msgspec.Meta(pattern=r"^https?://[^/?#\s]+$")]
+ServeClients = Annotated[int, msgspec.Meta(ge=1, le=_MAX_SERVE_CLIENTS)]
+TickersPerClient = Annotated[int, msgspec.Meta(ge=1, le=_MAX_TICKERS_PER_CLIENT)]
+ClientQueueMax = Annotated[int, msgspec.Meta(ge=_MIN_CLIENT_QUEUE, le=_MAX_CLIENT_QUEUE)]
+MetadataRequestsPerS = Annotated[int, msgspec.Meta(ge=1, le=_MAX_METADATA_REQUESTS_PER_S)]
+MetadataTtlSeconds = Annotated[int, msgspec.Meta(ge=_MIN_METADATA_TTL_S, le=_MAX_METADATA_TTL_S)]
 
 
 class KalshiEndpoints(msgspec.Struct, frozen=True, kw_only=True):
@@ -269,7 +305,7 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
     status_interval_s: PositiveInt = 60
     bus_endpoint: str | None = None
     bus_refresh_s: BusRefreshSeconds = DEFAULT_BUS_REFRESH_S
-    bus_send_hwm: BusSendHwm = DEFAULT_SEND_HWM
+    bus_send_hwm: BusHwm = DEFAULT_SEND_HWM
     universe: UniverseSettings = UniverseSettings()
 
     def __post_init__(self) -> None:
@@ -286,16 +322,54 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
             check_endpoint(self.bus_endpoint)
 
 
+class ServeSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """``[serve]``: where the live API listens, whom it serves, and how it bounds them (ADR 0023).
+
+    The API follows the recorder's bus at ``recorder.bus_endpoint``; there is no second setting
+    for it, so the two processes cannot disagree.
+
+    Attributes:
+        listen_host: Address to bind; localhost, behind a reverse proxy, in production.
+        listen_port: TCP port to bind; 1 to 65535.
+        allowed_origins: Exact origins, such as ``https://tape.pages.dev``, that CORS and the
+            WebSocket ``Origin`` check accept; at least one.
+        max_clients: Live WebSocket connections served at once; 1 to 1000.
+        max_tickers_per_client: Markets one live connection may follow; 1 to 50.
+        client_queue_max: Messages queued for one live connection before it is resynchronized
+            with ``client_lag``; 100 to 100000.
+        bus_receive_hwm: Bus messages queued in the API before ZeroMQ drops the API's copies,
+            which it then sees as a gap; 1000 to 100000.
+        metadata_requests_per_s: Public Kalshi requests per second for titles, categories, and
+            price grids; 1 to 10.
+        metadata_ttl_s: Seconds resolved metadata is served before it is fetched again; 60 to
+            86400.
+    """
+
+    listen_host: Word = "127.0.0.1"
+    listen_port: ListenPort = 8080
+    allowed_origins: Annotated[tuple[Origin, ...], msgspec.Meta(min_length=1)] = (
+        "http://localhost:5173",
+    )
+    max_clients: ServeClients = 200
+    max_tickers_per_client: TickersPerClient = 10
+    client_queue_max: ClientQueueMax = 5000
+    bus_receive_hwm: BusHwm = DEFAULT_SEND_HWM
+    metadata_requests_per_s: MetadataRequestsPerS = 2
+    metadata_ttl_s: MetadataTtlSeconds = 3600
+
+
 class Settings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     """Every setting of a ``tape`` process (docs/INTERFACES.md 17).
 
     Attributes:
         kalshi: The ``[kalshi]`` section.
         recorder: The ``[recorder]`` section.
+        serve: The ``[serve]`` section; every key has a default.
     """
 
     kalshi: KalshiSettings
     recorder: RecorderSettings
+    serve: ServeSettings = ServeSettings()
 
 
 def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings:
@@ -339,6 +413,7 @@ def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings:
         recorder=msgspec.structs.replace(
             recorder, data_dir=_resolve(recorder.data_dir, base, environ, "recorder.data_dir")
         ),
+        serve=parsed.serve,
     )
     _check_private_key(settings.kalshi.private_key_path)
     _check_data_dir(settings.recorder.data_dir)

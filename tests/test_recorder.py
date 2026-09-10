@@ -19,8 +19,10 @@ from tape.book import Book, books_from_keyframe_rows
 from tape.bus import (
     BOOK_FRESH,
     BOOK_UNKNOWN,
+    CATALOG_TOPIC,
     RESET_GAP,
     RESET_START,
+    STATUS_TOPIC,
     LiveBooks,
     Observation,
     Publisher,
@@ -32,7 +34,17 @@ from tape.client.ratelimit import Bucket, BucketLimits
 from tape.client.rest import KalshiRest
 from tape.client.ws import WsSession
 from tape.errors import KalshiHttpError
-from tape.events import BookDelta, BookRefresh, GapEvent, Level, Side
+from tape.events import (
+    BookDelta,
+    BookRefresh,
+    CatalogEntry,
+    ConnectionReport,
+    GapEvent,
+    Level,
+    MarketCatalog,
+    Side,
+    StatusReport,
+)
 from tape.fixedpoint import CountE2, PriceE4
 from tape.recorder.planner import Group
 from tape.recorder.recorder import (
@@ -1020,18 +1032,18 @@ async def test_the_bus_carries_every_event_in_order_and_paced_refresh_images_of_
             "market_lifecycle_v2", {"event_type": "activated", "market_ticker": "KXNEW-1"}, sid=1
         )
         await books.push_sequenced("orderbook_delta", delta_msg("KXA-1", "0.4100", "1.00"), sid=1)
-        await until(lambda: len(publisher.messages) == 5)
+        await until(lambda: len(publisher.messages) == 6)
         # Publishing is added to the ticker connection's consumer, not swapped in for it.
         assert "KXA-1" in harness.recorder.latest_tickers()
 
-        # The first cycle started with no books and waits out its interval; the next spreads
-        # two books over it, one every two seconds.
+        # The first cycle started with no books and waits out its interval; the next opens with
+        # the catalog and spreads two books over it, one every two seconds.
         await harness.parked()
         harness.time.advance(4)
-        await until(lambda: len(publisher.messages) == 6)
+        await until(lambda: len(publisher.messages) == 8)
         await harness.parked()
         harness.time.advance(2)
-        await until(lambda: len(publisher.messages) == 7)
+        await until(lambda: len(publisher.messages) == 9)
 
         # A gap stales KXA-1, silently: the snapshot requested is never answered.
         books.go_silent()
@@ -1040,24 +1052,33 @@ async def test_the_bus_carries_every_event_in_order_and_paced_refresh_images_of_
         await until(lambda: not fresh(harness.recorder.books(), "KXA-1"))
         await harness.parked()
         harness.time.advance(2)
-        await until(lambda: len(publisher.messages) == 9)
+        await until(lambda: len(publisher.messages) == 12)
         status = harness.recorder.status().bus
         live = harness.recorder.books()["KXA-1"]
         await harness.recorder.stop()
 
     envelopes = publisher.envelopes
-    assert [envelope.bus_seq for envelope in envelopes] == list(range(1, 10))
+    assert [envelope.bus_seq for envelope in envelopes] == list(range(1, 13))
     assert {envelope.bus_epoch for envelope in envelopes} == {NOON}
     events = [envelope.event for envelope in envelopes]
-    assert sorted(type(event).__name__ for event in events[:5]) == [
+    # The first cycle's catalog goes out as soon as capture starts, before any frame arrives.
+    assert isinstance(events[0], MarketCatalog)
+    assert sorted(type(event).__name__ for event in events[1:6]) == [
         "BookDelta",
         "BookSnapshot",
         "BookSnapshot",
         "Lifecycle",
         "Ticker",
     ]
-    assert publisher.topics[5:] == [b"md.KXA-1", b"md.KXSHOW-1", b"ctl.gap", b"md.KXA-1"]
-    first, second, gap, stale = events[5:]
+    assert publisher.topics[6:] == [
+        b"ctl.catalog",
+        b"md.KXA-1",
+        b"md.KXSHOW-1",
+        b"ctl.gap",
+        b"ctl.catalog",
+        b"md.KXA-1",
+    ]
+    first, second, gap, stale = (events[7], events[8], events[9], events[11])
     assert isinstance(first, BookRefresh)
     assert isinstance(second, BookRefresh)
     assert isinstance(gap, GapEvent)
@@ -1083,8 +1104,66 @@ async def test_the_bus_carries_every_event_in_order_and_paced_refresh_images_of_
     )
     # Slices are paced by the injected sleep: an idle cycle of 4 s, then 2 s per book.
     assert [s for s in harness.time.requested if s in (2.0, 4.0)] == [4.0, 2.0, 2.0, 2.0]
-    assert status == BusStatus(bus_epoch=NOON, bus_seq=9, sent=9, dropped=0, errors=0, refreshes=3)
+    assert status == BusStatus(
+        bus_epoch=NOON, bus_seq=12, sent=12, dropped=0, errors=0, refreshes=3
+    )
     assert (publisher.closes, supervisors_stopped) == (1, [True])
+
+
+async def test_each_refresh_cycle_opens_with_the_catalog_and_the_status_follows_its_interval(
+    tmp_path: Path,
+) -> None:
+    publisher = RecordingPublisher()
+    async with (
+        FakeKalshiWs() as fake,
+        recording(
+            fake.url, tmp_path, publisher=publisher, bus_refresh_s=4, status_interval_s=6
+        ) as harness,
+    ):
+        harness.start()
+        await harness.subscribed(TICKER_CONN_ID, CONTROL_CONN_ID, 2, 3)
+        await harness.parked()
+        harness.time.advance(4)
+        await until(lambda: publisher.topics.count(CATALOG_TOPIC) == 2)
+        await harness.parked()
+        harness.time.advance(2)
+        await until(lambda: STATUS_TOPIC in publisher.topics)
+        await harness.recorder.stop()
+
+    close_ts = int(datetime(2026, 12, 31, tzinfo=UTC).timestamp())
+
+    def recorded(ticker: str, volume: int, *, showcase: bool = False) -> CatalogEntry:
+        return CatalogEntry(
+            ticker=ticker,
+            series_ticker=ticker.split("-", 1)[0],
+            event_ticker=ticker.rsplit("-", 1)[0],
+            volume_24h=CountE2(volume),
+            close_ts=close_ts,
+            showcase=showcase,
+        )
+
+    catalogs = [e.event for e in publisher.envelopes if isinstance(e.event, MarketCatalog)]
+    # The selected markets, in ticker order; the low-volume and finalized ones are not recorded.
+    assert catalogs == 2 * [
+        MarketCatalog(
+            markets=(
+                recorded("KXA-1", 500_000),
+                recorded("KXA-2", 400_000),
+                recorded("KXA-3", 300_000),
+                recorded("KXSHOW-1", 0, showcase=True),
+            )
+        )
+    ]
+    (report,) = [e.event for e in publisher.envelopes if isinstance(e.event, StatusReport)]
+    assert isinstance(report, StatusReport)
+    assert (report.interval_s, report.universe_size, report.subscribed_markets) == (6, 4, 4)
+    assert [(c.conn_id, c.taped) for c in report.connections] == [
+        (0, False),
+        (1, True),
+        (2, True),
+        (3, True),
+    ]
+    assert all(isinstance(c, ConnectionReport) and c.frames > 0 for c in report.connections)
 
 
 async def test_a_failing_bus_publisher_costs_its_messages_and_never_capture(

@@ -1,8 +1,10 @@
 """Market-data event structs shared by the recorder, bus, API, and engine.
 
-These are the typed, fixed-point form of what Kalshi sends, plus the recorder's own
-periodic image of a live book (:class:`BookRefresh`, ADR 0022). They are frozen, tagged
-for encoding on the bus, and carry both the exchange timestamp and the local receipt.
+These are the typed, fixed-point form of what Kalshi sends, plus what only the recorder
+knows: its periodic image of a live book (:class:`BookRefresh`, ADR 0022), the markets it
+records (:class:`MarketCatalog`), and its health (:class:`StatusReport`, ADR 0023). They are
+frozen and tagged for encoding on the bus; the market events carry both the exchange
+timestamp and the local receipt.
 Private events (fills, order updates, acknowledgements, timers) live in
 ``tape.engine`` because only the engine consumes them.
 """
@@ -22,12 +24,17 @@ __all__ = [
     "BookDelta",
     "BookRefresh",
     "BookSnapshot",
+    "BusEvent",
+    "CatalogEntry",
+    "ConnectionReport",
     "GapEvent",
     "Level",
     "Lifecycle",
+    "MarketCatalog",
     "MarketEvent",
     "Receipt",
     "Side",
+    "StatusReport",
     "Ticker",
     "Trade",
 ]
@@ -156,8 +163,80 @@ class GapEvent(msgspec.Struct, frozen=True, kw_only=True, tag=True):
     got_seq: int
 
 
+class CatalogEntry(msgspec.Struct, frozen=True, kw_only=True):
+    """One recorded market, as the recorder's latest universe decision describes it.
+
+    Attributes:
+        ticker: Market ticker.
+        series_ticker: Series the market belongs to.
+        event_ticker: Event the market belongs to.
+        volume_24h: Contracts traded in the 24 hours before the listing the decision read.
+        close_ts: Unix seconds at which the market closes, or ``None`` when unknown.
+        showcase: Whether the market is recorded because its series is a showcase series.
+    """
+
+    ticker: str
+    series_ticker: str
+    event_ticker: str
+    volume_24h: CountE2
+    close_ts: int | None
+    showcase: bool
+
+
+class MarketCatalog(msgspec.Struct, frozen=True, kw_only=True, tag=True):
+    """Every market the recorder records, published once per bus refresh cycle (ADR 0023).
+
+    Each catalog replaces the previous one whole, so a consumer that has just started, or that
+    lost messages, knows the recorded markets again within one cycle.
+
+    Attributes:
+        markets: One entry per market of the latest universe decision, in ticker order.
+    """
+
+    markets: tuple[CatalogEntry, ...]
+
+
+class ConnectionReport(msgspec.Struct, frozen=True, kw_only=True):
+    """One connection's counters in a :class:`StatusReport`.
+
+    Attributes:
+        conn_id: Connection id.
+        taped: Whether the connection writes to the tape.
+        frames: Frames received since the recorder started.
+        gaps: Sequence gaps observed since start.
+        reconnects: Reconnections since start.
+        stale_books: Books awaiting a snapshot now.
+        sink_dropped: Records that never reached a segment; zero on a live-only connection.
+    """
+
+    conn_id: int
+    taped: bool
+    frames: int
+    gaps: int
+    reconnects: int
+    stale_books: int
+    sink_dropped: int
+
+
+class StatusReport(msgspec.Struct, frozen=True, kw_only=True, tag=True):
+    """The recorder's health, published every status interval (ADR 0023).
+
+    Attributes:
+        interval_s: Seconds between two reports, so a consumer can tell a recorder that stopped
+            reporting from one that reports rarely without sharing its configuration.
+        universe_size: Markets the latest universe decision chose.
+        subscribed_markets: Markets of book connections whose subscriptions are live now.
+        connections: Every connection, by ascending id.
+    """
+
+    interval_s: int
+    universe_size: int
+    subscribed_markets: int
+    connections: tuple[ConnectionReport, ...]
+
+
 MarketEvent = BookSnapshot | BookDelta | Trade | Ticker | Lifecycle | GapEvent | BookRefresh
-"""Union of every event published on the ``md.`` and ``ctl.`` bus topics."""
+"""Union of every event about market data: what the exchange sent, and refresh images."""
 
 MARKET_EVENT_TYPES: Final = (
     BookSnapshot,
@@ -169,3 +248,6 @@ MARKET_EVENT_TYPES: Final = (
     BookRefresh,
 )
 """The members of :data:`MarketEvent`, for ``isinstance`` checks."""
+
+BusEvent = MarketEvent | MarketCatalog | StatusReport
+"""Union of every event published on the bus, on the ``md.`` and ``ctl.`` topics."""

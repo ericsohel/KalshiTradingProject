@@ -12,6 +12,7 @@ the only way to behave well is to model the buckets locally and wait before send
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Final, Literal, Protocol
 
 import msgspec
@@ -154,6 +155,8 @@ class BucketRateLimiter:
         clock: Time source; only this object reads a clock (ADR 0004).
         read: Read bucket limits. Defaults to the Basic tier.
         write: Write bucket limits. Defaults to the Basic tier.
+        sleep: Waits the given seconds while a bucket refills, so that pacing can be tested in
+            virtual time; ``asyncio.sleep`` by default, looked up when the limiter is built.
     """
 
     def __init__(
@@ -162,8 +165,10 @@ class BucketRateLimiter:
         *,
         read: BucketLimits = BASIC_READ,
         write: BucketLimits = BASIC_WRITE,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._clock = clock
+        self._sleep = asyncio.sleep if sleep is None else sleep
         self._buckets: dict[Bucket, TokenBucket] = {
             "read": TokenBucket(read, now_ns=clock.mono_ns()),
             "write": TokenBucket(write, now_ns=clock.mono_ns()),
@@ -183,7 +188,7 @@ class BucketRateLimiter:
         async with self._locks[bucket]:
             while not target.try_take(cost, self._clock.mono_ns()):
                 delay_ns = target.wait_ns(cost, self._clock.mono_ns())
-                await asyncio.sleep(delay_ns / NS_PER_S)
+                await self._sleep(delay_ns / NS_PER_S)
 
     def resize(self, *, read: BucketLimits, write: BucketLimits) -> None:
         """Replace both buckets with freshly filled ones at the new limits."""

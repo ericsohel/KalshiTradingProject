@@ -16,6 +16,7 @@ from tape.config import (
     ENDPOINTS,
     KalshiSettings,
     RecorderSettings,
+    ServeSettings,
     Settings,
     UniverseSettings,
     load_settings,
@@ -129,6 +130,23 @@ def test_only_identity_and_paths_are_required_and_everything_else_has_a_default(
         showcase_series=frozenset(DEFAULT_SHOWCASE_SERIES),
         exclude_mve=True,
     )
+    serve = settings.serve
+    assert serve == ServeSettings()
+    assert (serve.listen_host, serve.listen_port, serve.allowed_origins) == (
+        "127.0.0.1",
+        8080,
+        ("http://localhost:5173",),
+    )
+    assert (serve.max_clients, serve.max_tickers_per_client, serve.client_queue_max) == (
+        200,
+        10,
+        5000,
+    )
+    assert (serve.bus_receive_hwm, serve.metadata_requests_per_s, serve.metadata_ttl_s) == (
+        10_000,
+        2,
+        3600,
+    )
     # Validation reads the file system but never changes it.
     assert not (tmp_path / "data").exists()
 
@@ -144,6 +162,7 @@ def test_the_example_file_is_valid_and_spells_out_the_defaults(tmp_path: Path, h
         env="prod", key_id=settings.kalshi.key_id, private_key_path=settings.kalshi.private_key_path
     )
     assert settings.recorder == RecorderSettings(data_dir=tmp_path / "data")
+    assert settings.serve == ServeSettings()
     assert settings.recorder.universe.showcase_series == (
         "KXBTC15M",
         "KXPAYROLLS",
@@ -320,6 +339,29 @@ def test_an_override_into_a_value_that_is_not_a_table_is_refused(tmp_path: Path)
         (("recorder", "bus_send_hwm"), 999, r">= 1000 - at `\$\.recorder\.bus_send_hwm`"),
         (("recorder", "bus_send_hwm"), 100_001, r"<= 100000 - at `\$\.recorder\.bus_send_hwm`"),
         (("recorder", "surprise"), 1, "unknown field `surprise`"),
+        (("serve", "listen_host"), "", r"at `\$\.serve\.listen_host`"),
+        (("serve", "listen_port"), 0, r">= 1 - at `\$\.serve\.listen_port`"),
+        (("serve", "listen_port"), 65_536, r"<= 65535 - at `\$\.serve\.listen_port`"),
+        (("serve", "allowed_origins"), [], r"length >= 1 - at `\$\.serve\.allowed_origins`"),
+        (("serve", "allowed_origins"), ["*"], r"at `\$\.serve\.allowed_origins\[0\]`"),
+        (
+            ("serve", "allowed_origins"),
+            ["http://localhost:5173", "https://tape.example/"],
+            r"at `\$\.serve\.allowed_origins\[1\]`",
+        ),
+        (("serve", "max_clients"), 0, r">= 1 - at `\$\.serve\.max_clients`"),
+        (("serve", "max_clients"), 1001, r"<= 1000 - at `\$\.serve\.max_clients`"),
+        (("serve", "max_tickers_per_client"), 0, r">= 1 - at `\$\.serve\.max_tickers"),
+        (("serve", "max_tickers_per_client"), 51, r"<= 50 - at `\$\.serve\.max_tickers"),
+        (("serve", "client_queue_max"), 99, r">= 100 - at `\$\.serve\.client_queue_max`"),
+        (("serve", "client_queue_max"), 100_001, r"<= 100000 - at `\$\.serve\.client_queue"),
+        (("serve", "bus_receive_hwm"), 999, r">= 1000 - at `\$\.serve\.bus_receive_hwm`"),
+        (("serve", "bus_receive_hwm"), 100_001, r"<= 100000 - at `\$\.serve\.bus_receive"),
+        (("serve", "metadata_requests_per_s"), 0, r">= 1 - at `\$\.serve\.metadata_requests"),
+        (("serve", "metadata_requests_per_s"), 11, r"<= 10 - at `\$\.serve\.metadata_request"),
+        (("serve", "metadata_ttl_s"), 59, r">= 60 - at `\$\.serve\.metadata_ttl_s`"),
+        (("serve", "metadata_ttl_s"), 86_401, r"<= 86400 - at `\$\.serve\.metadata_ttl_s`"),
+        (("serve", "bus_endpoint"), "ipc:///tmp/bus.sock", "unknown field `bus_endpoint`"),
         (
             ("recorder.universe", "min_volume_24h"),
             "1.005",
@@ -468,3 +510,18 @@ def test_settings_built_in_code_are_validated_too() -> None:
         RecorderSettings(data_dir=Path("data"), keyframe_interval_s=45)
     with pytest.raises(ValueError, match="tcp://host:port"):
         RecorderSettings(data_dir=Path("data"), bus_endpoint="tcp://no-port")
+
+
+def test_the_serve_section_takes_overrides_and_its_origins_are_comma_separated(
+    tmp_path: Path, tables: Tables
+) -> None:
+    settings = load_all(
+        tmp_path,
+        tables,
+        {
+            "TAPE_SERVE__ALLOWED_ORIGINS": "https://tape.example, http://localhost:5173",
+            "TAPE_SERVE__LISTEN_PORT": "9090",
+        },
+    )
+    assert settings.serve.allowed_origins == ("https://tape.example", "http://localhost:5173")
+    assert settings.serve.listen_port == 9090

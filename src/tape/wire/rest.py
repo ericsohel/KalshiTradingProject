@@ -39,6 +39,7 @@ __all__ = [
     "GetAccountApiLimitsResponse",
     "GetApiKeysResponse",
     "GetBalanceResponse",
+    "GetEventResponse",
     "GetEventsResponse",
     "GetFillsResponse",
     "GetHistoricalCutoffResponse",
@@ -48,6 +49,7 @@ __all__ = [
     "GetMarketsResponse",
     "GetSeriesFeeChangesResponse",
     "GetSeriesListResponse",
+    "GetSeriesResponse",
     "GetSettlementsResponse",
     "GetTradesResponse",
     "Market",
@@ -283,6 +285,12 @@ class GetSeriesListResponse(msgspec.Struct, frozen=True, kw_only=True):
     series: list[Series]
 
 
+class GetSeriesResponse(msgspec.Struct, frozen=True, kw_only=True):
+    """``GET /series/{series_ticker}`` response."""
+
+    series: Series
+
+
 class SeriesFeeChange(msgspec.Struct, frozen=True, kw_only=True):
     """A scheduled fee change for a series, from ``GET /series/fee_changes``."""
 
@@ -323,6 +331,17 @@ class GetEventsResponse(msgspec.Struct, frozen=True, kw_only=True):
 
     events: list[EventData]
     cursor: str
+
+
+class GetEventResponse(msgspec.Struct, frozen=True, kw_only=True):
+    """``GET /events/{event_ticker}`` response.
+
+    The spec marks the top-level ``markets`` deprecated in favour of ``event.markets``, but
+    still requires it; ``event.markets`` is filled only when nested markets are requested.
+    """
+
+    event: EventData
+    markets: list[Market]
 
 
 class BidAskDistribution(msgspec.Struct, frozen=True, kw_only=True):

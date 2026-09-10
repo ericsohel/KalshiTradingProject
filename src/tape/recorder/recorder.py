@@ -8,9 +8,10 @@ subscription groups every ``universe_refresh_s`` (sooner, on a capped backoff, w
 refresh is failing), writes keyframes, logs a status line, tapes a ``clock_jump`` record
 when the host slept, and runs auxiliary periodic tasks such as the auditor, which reads books,
 sinks, and book taps through it (:meth:`Recorder.open_book_tap`). With a bus publisher it also
-publishes every event its supervisors decode and, every ``bus_refresh_s``, a refresh image of
-each book it holds, paced in slices across the interval (ADR 0022). Dependencies arrive fully
-built, so the orchestration is tested against a fake exchange in virtual time.
+publishes every event its supervisors decode; every ``bus_refresh_s``, the catalog of the
+markets it records followed by a refresh image of each book it holds, paced in slices across
+the interval (ADR 0022); and its status every ``status_interval_s`` (ADR 0023). Dependencies
+arrive fully built, so the orchestration is tested against a fake exchange in virtual time.
 
 Connection layout (ADR 0018): connection 0 is live-only and carries the unfiltered
 ``ticker`` channel, whose latest value per market is kept in memory and never written;
@@ -54,7 +55,17 @@ from tape.client.ratelimit import BucketLimits, RateLimiter
 from tape.client.rest import KalshiRest
 from tape.client.ws import WsSession
 from tape.errors import FixedPointError, KalshiError, WireError
-from tape.events import BookRefresh, MarketEvent, Receipt, Side, Ticker
+from tape.events import (
+    BookRefresh,
+    CatalogEntry,
+    ConnectionReport,
+    MarketCatalog,
+    MarketEvent,
+    Receipt,
+    Side,
+    StatusReport,
+    Ticker,
+)
 from tape.recorder.planner import Group, Plan, plan
 from tape.recorder.supervisor import (
     ORDERBOOK_CHANNEL,
@@ -959,7 +970,11 @@ class Recorder:
                     # Every later record would be refused; stopping loudly lets the process
                     # be restarted instead of recording nothing while it looks healthy.
                     raise RuntimeError(f"segment sink {conn_id} failed") from sink.failure
-            self._log.info("recorder status", extra=msgspec.to_builtins(self.status()))
+            status = self.status()
+            self._log.info("recorder status", extra=msgspec.to_builtins(status))
+            if self._bus is not None:
+                # Never raises, like every publish; a consumer learns of capture health here.
+                self._bus.publish(_status_report(status, interval_s=self._config.status_interval_s))
 
     def _note_clock_jump(self, *, since_mono_ns: int, since_wall_ns: int) -> tuple[int, int]:
         """Tape a ``clock_jump`` on every taped connection if the host slept since a reading.
@@ -1025,6 +1040,10 @@ class Recorder:
     async def _bus_refresh_loop(self, bus: SequencedPublisher) -> None:
         interval_s = self._config.bus_refresh_s
         while True:
+            # The catalog opens every cycle, so a consumer that has just started knows the
+            # recorded markets within one interval, as it knows the books (ADR 0023).
+            if self._universe is not None:
+                bus.publish(_catalog(self._universe))
             # Markets are fixed per cycle; one that appears mid-cycle waits for the next.
             slices = refresh_slices(sorted(self._held_books()), interval_s=interval_s)
             for tickers in slices:
@@ -1332,6 +1351,44 @@ class Recorder:
             extra={"component": component, "error": repr(exc)},
             exc_info=exc,
         )
+
+
+def _catalog(decision: UniverseDecision) -> MarketCatalog:
+    """The bus catalog of a universe decision: one entry per recorded market, in ticker order."""
+    return MarketCatalog(
+        markets=tuple(
+            CatalogEntry(
+                ticker=market.ticker,
+                series_ticker=market.series_ticker,
+                event_ticker=market.event_ticker,
+                volume_24h=market.volume_24h,
+                close_ts=market.close_ts,
+                showcase=market.ticker in decision.showcase,
+            )
+            for market in decision.markets
+        )
+    )
+
+
+def _status_report(status: RecorderStatus, *, interval_s: int) -> StatusReport:
+    """The part of a status line that the bus carries to live consumers (ADR 0023)."""
+    return StatusReport(
+        interval_s=interval_s,
+        universe_size=status.universe_size,
+        subscribed_markets=status.subscribed_markets,
+        connections=tuple(
+            ConnectionReport(
+                conn_id=connection.conn_id,
+                taped=connection.taped,
+                frames=connection.frames,
+                gaps=connection.gaps,
+                reconnects=connection.reconnects,
+                stale_books=connection.stale_books,
+                sink_dropped=connection.sink_dropped,
+            )
+            for connection in status.connections
+        ),
+    )
 
 
 def _returned(task: asyncio.Task[None]) -> bool:

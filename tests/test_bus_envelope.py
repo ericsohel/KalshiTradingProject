@@ -9,8 +9,10 @@ import msgspec
 import pytest
 
 from tape.bus import (
+    CATALOG_TOPIC,
     GAP_TOPIC,
     LIFECYCLE_TOPIC,
+    STATUS_TOPIC,
     BusEnvelope,
     PublisherStats,
     SequencedPublisher,
@@ -23,12 +25,16 @@ from tape.events import (
     BookDelta,
     BookRefresh,
     BookSnapshot,
+    BusEvent,
+    CatalogEntry,
+    ConnectionReport,
     GapEvent,
     Level,
     Lifecycle,
-    MarketEvent,
+    MarketCatalog,
     Receipt,
     Side,
+    StatusReport,
     Ticker,
     Trade,
 )
@@ -105,7 +111,47 @@ REFRESH: Final = BookRefresh(
     bids=(lvl(4000, 100), lvl(3900, 1)),
     asks=(),
 )
-EVENTS: Final[tuple[MarketEvent, ...]] = (SNAPSHOT, DELTA, TRADE, TICKER, LIFECYCLE, GAP, REFRESH)
+CATALOG: Final = MarketCatalog(
+    markets=(
+        CatalogEntry(
+            ticker="KXA-1",
+            series_ticker="KXA",
+            event_ticker="KXA",
+            volume_24h=CountE2(500_000),
+            close_ts=1_800_000_000,
+            showcase=True,
+        ),
+        CatalogEntry(
+            ticker="KXB-2",
+            series_ticker="KXB",
+            event_ticker="KXB",
+            volume_24h=CountE2(0),
+            close_ts=None,
+            showcase=False,
+        ),
+    )
+)
+STATUS: Final = StatusReport(
+    interval_s=60,
+    universe_size=2,
+    subscribed_markets=1,
+    connections=(
+        ConnectionReport(
+            conn_id=0, taped=False, frames=9, gaps=0, reconnects=1, stale_books=0, sink_dropped=0
+        ),
+    ),
+)
+EVENTS: Final[tuple[BusEvent, ...]] = (
+    SNAPSHOT,
+    DELTA,
+    TRADE,
+    TICKER,
+    LIFECYCLE,
+    GAP,
+    REFRESH,
+    CATALOG,
+    STATUS,
+)
 
 
 @pytest.mark.parametrize(
@@ -118,17 +164,19 @@ EVENTS: Final[tuple[MarketEvent, ...]] = (SNAPSHOT, DELTA, TRADE, TICKER, LIFECY
         (REFRESH, b"md.KXA-1"),
         (LIFECYCLE, LIFECYCLE_TOPIC),
         (GAP, GAP_TOPIC),
+        (CATALOG, CATALOG_TOPIC),
+        (STATUS, STATUS_TOPIC),
     ],
     ids=lambda value: type(value).__name__ if not isinstance(value, bytes) else value.decode(),
 )
 def test_market_data_goes_to_its_ticker_s_topic_and_control_events_to_their_own(
-    event: MarketEvent, topic: bytes
+    event: BusEvent, topic: bytes
 ) -> None:
     assert topic_for(event) == topic
 
 
 @pytest.mark.parametrize("event", EVENTS, ids=lambda event: type(event).__name__)
-def test_an_envelope_round_trips_every_event_type(event: MarketEvent) -> None:
+def test_an_envelope_round_trips_every_event_type(event: BusEvent) -> None:
     envelope = BusEnvelope(bus_epoch=EPOCH, bus_seq=7, event=event)
     decoded = decode_bus_envelope(encode_bus_envelope(envelope))
     assert decoded == envelope

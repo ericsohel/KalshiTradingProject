@@ -28,9 +28,29 @@ repos:
         entry: uv run python scripts/check_no_float.py
         language: system
         pass_filenames: false
+      # Web hooks run through npm so pre-commit, CI, and developers use the exact
+      # versions pinned in web/package-lock.json (run `npm ci` in web/ first).
+      - id: web-typecheck
+        name: web typecheck
+        entry: npm --prefix web run typecheck
+        language: system
+        files: ^web/
+        pass_filenames: false
+      - id: web-lint
+        name: web eslint
+        entry: npm --prefix web run lint
+        language: system
+        files: ^web/
+        pass_filenames: false
+      - id: web-format
+        name: web prettier --check
+        entry: npm --prefix web run format:check
+        language: system
+        files: ^web/
+        pass_filenames: false
   - repo: https://github.com/Yelp/detect-secrets
     rev: v1.5.0
     hooks:
       - id: detect-secrets
         args: [--baseline, .secrets.baseline]
-        exclude: ^(uv\.lock|specs/.*)$
+        exclude: ^(uv\.lock|web/package-lock\.json|specs/.*)$

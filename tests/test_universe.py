@@ -325,6 +325,8 @@ def test_select_never_exceeds_the_budget_and_accounts_for_every_market(
     assert len(decision.l2_tickers) <= max(rules.max_l2_markets, len(decision.showcase))
     assert sum(decision.reason_counts.values()) + len(decision.l2_tickers) == len(markets)
     assert decision.dropped_for_cap == decision.reason_counts[REASON_OVER_CAP]
+    assert [market.ticker for market in decision.markets] == sorted(decision.l2_tickers)
+    assert all(market in markets for market in decision.markets)
     for ticker in decision.l2_tickers:
         market = by_ticker[ticker]
         assert is_eligible(market, rules)
@@ -371,4 +373,5 @@ def test_duplicate_ticker_resolution_does_not_depend_on_page_order() -> None:
     backward = select([fresh, stale], rules, now_ts=NOW)
     assert forward == backward
     assert forward.l2_tickers == frozenset({"KXDUP-1"})
+    assert forward.markets == (fresh,)
     assert forward.reason_counts[REASON_DUPLICATE] == 1

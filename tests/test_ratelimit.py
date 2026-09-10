@@ -180,3 +180,18 @@ async def test_null_limiter_never_waits_but_still_validates() -> None:
     limiter.resize(read=BASIC_READ, write=BASIC_WRITE)
     with pytest.raises(ValueError, match="positive"):
         await limiter.acquire(0, bucket="read")
+
+
+async def test_limiter_waits_for_a_refill_through_the_injected_sleep() -> None:
+    clock = FrozenClock()
+    slept: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock.advance(round(seconds * NS_PER_S))
+
+    limiter = BucketRateLimiter(clock, read=SMALL, write=SMALL, sleep=sleep)
+    await limiter.acquire(20, bucket="read")
+    assert slept == []
+    await limiter.acquire(5, bucket="read")
+    assert slept == [0.5]

@@ -296,3 +296,14 @@ async def test_build_recorder_refuses_a_key_that_is_not_rsa(tmp_path: Path) -> N
     async with httpx.AsyncClient() as http:
         with pytest.raises(ConfigError, match="not a usable PEM private key"):
             build_recorder(settings, http=http, clock=FrozenClock(), host="box")
+
+
+def test_serve_refuses_a_configuration_without_a_bus_endpoint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], root_logger: logging.Logger
+) -> None:
+    config = write_settings(tmp_path)
+    assert main(["serve", "--config", str(config)]) == 1
+    error = capsys.readouterr().err
+    assert error.startswith("tape: configuration error: ")
+    assert "recorder.bus_endpoint is not set" in error
+    assert root_logger.handlers

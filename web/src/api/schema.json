@@ -1,0 +1,991 @@
+{
+  "$defs": {
+    "BookMessage": {
+      "description": "A book's freshness changed without a snapshot.\n\nAttributes:\n    ticker: Market ticker.\n    book: The new state; a stale book receives no deltas until its next snapshot.",
+      "properties": {
+        "book": {
+          "enum": [
+            "fresh",
+            "stale"
+          ]
+        },
+        "t": {
+          "enum": [
+            "book"
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "ticker",
+        "book"
+      ],
+      "title": "BookMessage",
+      "type": "object"
+    },
+    "BusHealth": {
+      "description": "How the server follows the recorder's bus.\n\nAttributes:\n    epoch: The recorder run the latest message came from, or ``null`` before any.\n    last_seq: Number of the latest message, or ``null`` before any.\n    messages: Messages received.\n    resets: Times every book was dropped: at the first message, a recorder restart, or loss.\n    missed: Messages known to be lost.\n    books_known: Books the server holds now.",
+      "properties": {
+        "books_known": {
+          "type": "integer"
+        },
+        "epoch": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_seq": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "messages": {
+          "type": "integer"
+        },
+        "missed": {
+          "type": "integer"
+        },
+        "resets": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "epoch",
+        "last_seq",
+        "messages",
+        "resets",
+        "missed",
+        "books_known"
+      ],
+      "title": "BusHealth",
+      "type": "object"
+    },
+    "ClientMessage": {
+      "$ref": "#/$defs/SubscribeRequest"
+    },
+    "ConnectionHealth": {
+      "description": "One recorder connection's counters.\n\nAttributes:\n    conn_id: Connection id.\n    taped: Whether the connection writes to the tape.\n    frames: Frames received since the recorder started.\n    gaps: Sequence gaps observed since start.\n    reconnects: Reconnections since start.\n    stale_books: Books awaiting a snapshot now.\n    sink_dropped: Records that never reached the tape.",
+      "properties": {
+        "conn_id": {
+          "type": "integer"
+        },
+        "frames": {
+          "type": "integer"
+        },
+        "gaps": {
+          "type": "integer"
+        },
+        "reconnects": {
+          "type": "integer"
+        },
+        "sink_dropped": {
+          "type": "integer"
+        },
+        "stale_books": {
+          "type": "integer"
+        },
+        "taped": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "conn_id",
+        "taped",
+        "frames",
+        "gaps",
+        "reconnects",
+        "stale_books",
+        "sink_dropped"
+      ],
+      "title": "ConnectionHealth",
+      "type": "object"
+    },
+    "DeltaMessage": {
+      "description": "A signed change at one level, applied to the latest snapshot.\n\nAttributes:\n    ticker: Market ticker.\n    ts_ms: Exchange time of the change, or ``null`` when unknown.\n    side: The side of the level.\n    price_e4: The level's price.\n    delta_e2: Signed change in the level's resting count; the level is removed at zero.",
+      "properties": {
+        "delta_e2": {
+          "type": "integer"
+        },
+        "price_e4": {
+          "type": "integer"
+        },
+        "side": {
+          "enum": [
+            "ask",
+            "bid"
+          ]
+        },
+        "t": {
+          "enum": [
+            "delta"
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        },
+        "ts_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "t",
+        "ticker",
+        "ts_ms",
+        "side",
+        "price_e4",
+        "delta_e2"
+      ],
+      "title": "DeltaMessage",
+      "type": "object"
+    },
+    "Depth": {
+      "description": "The top of a book the server holds.\n\nAttributes:\n    ts_ms: Exchange time of the last change applied to the book, or ``null`` when unknown.\n    bids: Up to :data:`DEPTH_LEVELS` YES bids, highest first.\n    asks: Up to :data:`DEPTH_LEVELS` YES asks, lowest first.",
+      "properties": {
+        "asks": {
+          "items": {
+            "items": false,
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "bids": {
+          "items": {
+            "items": false,
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "ts_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "ts_ms",
+        "bids",
+        "asks"
+      ],
+      "title": "Depth",
+      "type": "object"
+    },
+    "ErrorBody": {
+      "description": "What went wrong.\n\nAttributes:\n    code: A stable, machine-readable code such as ``unknown_ticker``.\n    message: A human-readable explanation.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "ErrorBody",
+      "type": "object"
+    },
+    "ErrorMessage": {
+      "description": "A client message the server could not accept; the connection stays open.\n\nAttributes:\n    code: ``malformed_json``, ``unknown_op``, or ``invalid_message``.\n    message: A human-readable explanation.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "t": {
+          "enum": [
+            "error"
+          ]
+        }
+      },
+      "required": [
+        "t",
+        "code",
+        "message"
+      ],
+      "title": "ErrorMessage",
+      "type": "object"
+    },
+    "ErrorResponse": {
+      "description": "The body of every REST error.\n\nAttributes:\n    error: The error.",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ErrorBody"
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "title": "ErrorResponse",
+      "type": "object"
+    },
+    "HelloMessage": {
+      "description": "The first message on every connection.\n\nAttributes:\n    protocol: :data:`PROTOCOL_VERSION`.\n    max_tickers: Most markets one subscription may name.\n    bus_refresh_s: Longest wait for a snapshot after ``resync`` with ``bus_loss``.",
+      "properties": {
+        "bus_refresh_s": {
+          "type": "integer"
+        },
+        "max_tickers": {
+          "type": "integer"
+        },
+        "protocol": {
+          "type": "integer"
+        },
+        "t": {
+          "enum": [
+            "hello"
+          ]
+        }
+      },
+      "required": [
+        "t",
+        "protocol",
+        "max_tickers",
+        "bus_refresh_s"
+      ],
+      "title": "HelloMessage",
+      "type": "object"
+    },
+    "MarketDetail": {
+      "description": "One recorded market with its price grid and depth, from ``GET /markets/{ticker}``.\n\nAttributes:\n    price_ranges: The market's price grid, or ``null`` until resolved.\n    depth: The best levels per side, or ``null`` unless the book is known.",
+      "properties": {
+        "ask_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bid_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "book": {
+          "enum": [
+            "fresh",
+            "stale",
+            "unknown"
+          ]
+        },
+        "category": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "close_ts": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "depth": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/Depth"
+            }
+          ]
+        },
+        "event_ticker": {
+          "type": "string"
+        },
+        "last_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "price_ranges": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PriceRange"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "series_ticker": {
+          "type": "string"
+        },
+        "showcase": {
+          "type": "boolean"
+        },
+        "subtitle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "volume_24h_e2": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ticker",
+        "event_ticker",
+        "series_ticker",
+        "title",
+        "subtitle",
+        "category",
+        "showcase",
+        "volume_24h_e2",
+        "close_ts",
+        "bid_e4",
+        "ask_e4",
+        "last_e4",
+        "book",
+        "price_ranges",
+        "depth"
+      ],
+      "title": "MarketDetail",
+      "type": "object"
+    },
+    "MarketRow": {
+      "description": "One recorded market, as ``GET /markets`` lists it.\n\nAttributes:\n    ticker: Market ticker.\n    event_ticker: Event the market belongs to.\n    series_ticker: Series the market belongs to.\n    title: The event's title, or ``null`` until resolved.\n    subtitle: The market's YES subtitle, or ``null`` until resolved.\n    category: The series category, or ``null`` until resolved.\n    showcase: Whether the market is recorded because its series is a showcase series.\n    volume_24h_e2: Contracts traded in the 24 hours before the recorder's latest listing.\n    close_ts: Unix seconds at which the market closes, or ``null`` when unknown.\n    bid_e4: Best YES bid from the latest ticker update, or ``null``.\n    ask_e4: Best YES ask from the latest ticker update, or ``null``.\n    last_e4: Last trade price from the latest ticker update, or ``null``.\n    book: How far the server's copy of the book can be trusted.",
+      "properties": {
+        "ask_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bid_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "book": {
+          "enum": [
+            "fresh",
+            "stale",
+            "unknown"
+          ]
+        },
+        "category": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "close_ts": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "event_ticker": {
+          "type": "string"
+        },
+        "last_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "series_ticker": {
+          "type": "string"
+        },
+        "showcase": {
+          "type": "boolean"
+        },
+        "subtitle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "volume_24h_e2": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ticker",
+        "event_ticker",
+        "series_ticker",
+        "title",
+        "subtitle",
+        "category",
+        "showcase",
+        "volume_24h_e2",
+        "close_ts",
+        "bid_e4",
+        "ask_e4",
+        "last_e4",
+        "book"
+      ],
+      "title": "MarketRow",
+      "type": "object"
+    },
+    "MarketsResponse": {
+      "description": "``GET /markets``: recorded markets by 24-hour volume, highest first, then by ticker.\n\nAttributes:\n    markets: At most ``limit`` rows.",
+      "properties": {
+        "markets": {
+          "items": {
+            "$ref": "#/$defs/MarketRow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "markets"
+      ],
+      "title": "MarketsResponse",
+      "type": "object"
+    },
+    "PriceRange": {
+      "description": "One band of a market's price grid.\n\nAttributes:\n    start_e4: Lowest price of the band.\n    end_e4: Highest price of the band.\n    step_e4: Tick size within the band.",
+      "properties": {
+        "end_e4": {
+          "type": "integer"
+        },
+        "start_e4": {
+          "type": "integer"
+        },
+        "step_e4": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_e4",
+        "end_e4",
+        "step_e4"
+      ],
+      "title": "PriceRange",
+      "type": "object"
+    },
+    "RecorderHealth": {
+      "description": "The recorder's latest status report.\n\nAttributes:\n    universe_size: Markets the recorder chose to record.\n    subscribed_markets: Markets whose order-book subscriptions are live.\n    connections: Every connection, by ascending id.",
+      "properties": {
+        "connections": {
+          "items": {
+            "$ref": "#/$defs/ConnectionHealth"
+          },
+          "type": "array"
+        },
+        "subscribed_markets": {
+          "type": "integer"
+        },
+        "universe_size": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "universe_size",
+        "subscribed_markets",
+        "connections"
+      ],
+      "title": "RecorderHealth",
+      "type": "object"
+    },
+    "Rejection": {
+      "description": "A ticker a subscription could not include.\n\nAttributes:\n    ticker: The ticker as the client sent it.\n    code: ``unknown_ticker`` when the market is not recorded, ``too_many_tickers`` beyond\n        ``max_tickers``.",
+      "properties": {
+        "code": {
+          "enum": [
+            "too_many_tickers",
+            "unknown_ticker"
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ticker",
+        "code"
+      ],
+      "title": "Rejection",
+      "type": "object"
+    },
+    "ResyncMessage": {
+      "description": "Discard this market's book; a snapshot follows once the server's book is known.\n\nAttributes:\n    ticker: Market ticker.\n    reason: ``client_lag`` when this connection fell behind, and the snapshot follows at\n        once; ``bus_loss`` when the server lost its book, and the snapshot follows within\n        ``bus_refresh_s``.",
+      "properties": {
+        "reason": {
+          "enum": [
+            "bus_loss",
+            "client_lag"
+          ]
+        },
+        "t": {
+          "enum": [
+            "resync"
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "ticker",
+        "reason"
+      ],
+      "title": "ResyncMessage",
+      "type": "object"
+    },
+    "ServerMessage": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HelloMessage"
+        },
+        {
+          "$ref": "#/$defs/SubscribedMessage"
+        },
+        {
+          "$ref": "#/$defs/SnapshotMessage"
+        },
+        {
+          "$ref": "#/$defs/DeltaMessage"
+        },
+        {
+          "$ref": "#/$defs/BookMessage"
+        },
+        {
+          "$ref": "#/$defs/ResyncMessage"
+        },
+        {
+          "$ref": "#/$defs/TradeMessage"
+        },
+        {
+          "$ref": "#/$defs/TickerMessage"
+        },
+        {
+          "$ref": "#/$defs/ErrorMessage"
+        }
+      ],
+      "discriminator": {
+        "mapping": {
+          "book": "#/$defs/BookMessage",
+          "delta": "#/$defs/DeltaMessage",
+          "error": "#/$defs/ErrorMessage",
+          "hello": "#/$defs/HelloMessage",
+          "resync": "#/$defs/ResyncMessage",
+          "snapshot": "#/$defs/SnapshotMessage",
+          "subscribed": "#/$defs/SubscribedMessage",
+          "ticker": "#/$defs/TickerMessage",
+          "trade": "#/$defs/TradeMessage"
+        },
+        "propertyName": "t"
+      }
+    },
+    "ServiceStatus": {
+      "description": "``GET /status``.\n\nAttributes:\n    recording: Whether a recorder status report arrived within two of its intervals.\n    recorder_status_age_ms: Milliseconds since that report arrived, or ``null`` before any.\n    recorder: The latest report, or ``null`` before any.\n    bus: The server's view of the bus.\n    clients: Open live connections.",
+      "properties": {
+        "bus": {
+          "$ref": "#/$defs/BusHealth"
+        },
+        "clients": {
+          "type": "integer"
+        },
+        "recorder": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/RecorderHealth"
+            }
+          ]
+        },
+        "recorder_status_age_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recording": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recording",
+        "recorder_status_age_ms",
+        "recorder",
+        "bus",
+        "clients"
+      ],
+      "title": "ServiceStatus",
+      "type": "object"
+    },
+    "SnapshotMessage": {
+      "description": "A market's whole book, replacing whatever the client holds.\n\nAttributes:\n    ticker: Market ticker.\n    book: Whether the book is fresh or stale.\n    ts_ms: Exchange time of the last change applied to the book, or ``null`` when unknown.\n    bids: Every YES bid, highest first.\n    asks: Every YES ask, lowest first.",
+      "properties": {
+        "asks": {
+          "items": {
+            "items": false,
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "bids": {
+          "items": {
+            "items": false,
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "book": {
+          "enum": [
+            "fresh",
+            "stale"
+          ]
+        },
+        "t": {
+          "enum": [
+            "snapshot"
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        },
+        "ts_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "t",
+        "ticker",
+        "book",
+        "ts_ms",
+        "bids",
+        "asks"
+      ],
+      "title": "SnapshotMessage",
+      "type": "object"
+    },
+    "SubscribeRequest": {
+      "description": "Replace the subscription set; an empty list unsubscribes from everything.\n\nAttributes:\n    tickers: The markets to follow.",
+      "properties": {
+        "op": {
+          "enum": [
+            "subscribe"
+          ]
+        },
+        "tickers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "op",
+        "tickers"
+      ],
+      "title": "SubscribeRequest",
+      "type": "object"
+    },
+    "SubscribedMessage": {
+      "description": "The reply to each ``subscribe``.\n\nAttributes:\n    tickers: The new subscription set, in the order the client named the markets.\n    rejected: The tickers left out, and why.",
+      "properties": {
+        "rejected": {
+          "items": {
+            "$ref": "#/$defs/Rejection"
+          },
+          "type": "array"
+        },
+        "t": {
+          "enum": [
+            "subscribed"
+          ]
+        },
+        "tickers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "t",
+        "tickers",
+        "rejected"
+      ],
+      "title": "SubscribedMessage",
+      "type": "object"
+    },
+    "TickerMessage": {
+      "description": "Top of book and cumulative volume.\n\nAttributes:\n    ticker: Market ticker.\n    ts_ms: Exchange time of the update.\n    bid_e4: Best YES bid, or ``null``.\n    ask_e4: Best YES ask, or ``null``.\n    last_e4: Last trade price, or ``null``.\n    volume_e2: Contracts traded since the market opened.",
+      "properties": {
+        "ask_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bid_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_e4": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "t": {
+          "enum": [
+            "ticker"
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        },
+        "ts_ms": {
+          "type": "integer"
+        },
+        "volume_e2": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "ticker",
+        "ts_ms",
+        "bid_e4",
+        "ask_e4",
+        "last_e4",
+        "volume_e2"
+      ],
+      "title": "TickerMessage",
+      "type": "object"
+    },
+    "TradeMessage": {
+      "description": "A public trade.\n\nAttributes:\n    ticker: Market ticker.\n    ts_ms: Exchange time of the trade.\n    price_e4: YES price of the trade.\n    count_e2: Contracts traded.\n    taker_side: ``bid`` when the taker bought YES.",
+      "properties": {
+        "count_e2": {
+          "type": "integer"
+        },
+        "price_e4": {
+          "type": "integer"
+        },
+        "t": {
+          "enum": [
+            "trade"
+          ]
+        },
+        "taker_side": {
+          "enum": [
+            "ask",
+            "bid"
+          ]
+        },
+        "ticker": {
+          "type": "string"
+        },
+        "ts_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "t",
+        "ticker",
+        "ts_ms",
+        "price_e4",
+        "count_e2",
+        "taker_side"
+      ],
+      "title": "TradeMessage",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/MarketsResponse"
+    },
+    {
+      "$ref": "#/$defs/MarketDetail"
+    },
+    {
+      "$ref": "#/$defs/ServiceStatus"
+    },
+    {
+      "$ref": "#/$defs/ErrorResponse"
+    },
+    {
+      "$ref": "#/$defs/ServerMessage"
+    },
+    {
+      "$ref": "#/$defs/ClientMessage"
+    }
+  ],
+  "description": "Every REST response body and live feed message of tape serve (docs/FRONTEND.md 4). Generated from tape.api.contract by scripts/gen_api_schema.py; do not edit.",
+  "title": "tape live API"
+}

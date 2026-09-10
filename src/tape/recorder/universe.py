@@ -8,8 +8,9 @@ supplied by the caller and the same input always produces the same decision.
 
 Invariants: a rejected market never appears in the decision; a showcase market that
 passed the filters is always captured, even when that puts the count over
-``max_l2_markets``, because a showcase series is a reason the tape exists; and the
-reason counts plus the size of ``l2_tickers`` account for every market handed in.
+``max_l2_markets``, because a showcase series is a reason the tape exists; the
+reason counts plus the size of ``l2_tickers`` account for every market handed in; and
+the decision's summaries describe exactly the markets in ``l2_tickers``.
 """
 
 from __future__ import annotations
@@ -181,6 +182,9 @@ class UniverseDecision(msgspec.Struct, frozen=True, kw_only=True):
         l2_tickers: Every market to capture on ``orderbook_delta`` and ``trade``.
         showcase: The subset admitted because their series is a showcase series; always
             contained in ``l2_tickers``.
+        markets: The summary of every market in ``l2_tickers``, in ticker order; for a ticker
+            listed twice, the copy selection kept. The recorder publishes them as its catalog
+            (ADR 0023).
         dropped_for_cap: Markets that passed every filter but did not fit the budget.
             When the showcase alone fills the budget this is every other qualifying
             market, and ``len(l2_tickers)`` is then above ``max_l2_markets``.
@@ -191,6 +195,7 @@ class UniverseDecision(msgspec.Struct, frozen=True, kw_only=True):
 
     l2_tickers: frozenset[str]
     showcase: frozenset[str]
+    markets: tuple[MarketSummary, ...]
     dropped_for_cap: int
     reason_counts: Mapping[str, int]
 
@@ -306,9 +311,12 @@ def select(
     budget = max(0, policy.max_l2_markets - len(showcase))
     admitted = qualified[:budget]
     counts[REASON_OVER_CAP] = len(qualified) - len(admitted)
+    l2_tickers = showcase | frozenset(market.ticker for market in admitted)
     return UniverseDecision(
-        l2_tickers=showcase | frozenset(market.ticker for market in admitted),
+        l2_tickers=l2_tickers,
         showcase=showcase,
+        # ``eligible`` is in ticker order and holds one copy per ticker.
+        markets=tuple(market for market in eligible if market.ticker in l2_tickers),
         dropped_for_cap=counts[REASON_OVER_CAP],
         reason_counts=counts,
     )

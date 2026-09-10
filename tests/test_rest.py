@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Final
 
@@ -933,3 +933,80 @@ async def test_unknown_market_status_still_decodes() -> None:
         market = await rest.market("KX-1")
     assert market.status == "some_new_status"
     assert market.ticker == _market_json()["ticker"]
+
+
+async def test_one_event_and_one_series_are_fetched_by_ticker_without_signing() -> None:
+    router = Router()
+    router.add(
+        "GET",
+        "/events/E-1",
+        httpx.Response(
+            200,
+            json={
+                "event": {
+                    "event_ticker": "E-1",
+                    "series_ticker": "S",
+                    "sub_title": "s",
+                    "title": "Highest temperature in NYC today?",
+                    "collateral_return_type": "binary",
+                    "mutually_exclusive": True,
+                    "settlement_sources": None,
+                },
+                "markets": [_market_json(yes_sub_title="84° to 85°")],
+            },
+        ),
+    )
+    router.add(
+        "GET",
+        "/series/S",
+        httpx.Response(
+            200,
+            json={
+                "series": {
+                    "ticker": "S",
+                    "frequency": "daily",
+                    "title": "T",
+                    "category": "Climate and Weather",
+                    "tags": None,
+                    "settlement_sources": None,
+                    "contract_url": "u",
+                    "contract_terms_url": "u2",
+                    "fee_type": "quadratic",
+                    "fee_multiplier": 1.0,
+                    "additional_prohibitions": None,
+                }
+            },
+        ),
+    )
+    limiter = FakeRateLimiter()
+    async with make_client(router) as client:
+        rest = KalshiRest(BASE_URL, client, limiter, FrozenClock())
+        event = await rest.event("E-1")
+        series = await rest.series_by_ticker("S")
+
+    assert event.event.title == "Highest temperature in NYC today?"
+    assert event.event.markets is None
+    assert [market.yes_sub_title for market in event.markets] == ["84° to 85°"]
+    assert event.markets[0].price_ranges[0].step == "0.01"
+    assert series.category == "Climate and Weather"
+    assert limiter.calls == [(DEFAULT_TOKEN_COST, "read"), (DEFAULT_TOKEN_COST, "read")]
+    assert all(HEADER_KEY not in request.headers for request in router.requests)
+
+
+@pytest.mark.parametrize(
+    ("path", "fetch"),
+    [
+        ("/events/NOPE", lambda rest: rest.event("NOPE")),
+        ("/series/NOPE", lambda rest: rest.series_by_ticker("NOPE")),
+    ],
+)
+async def test_an_unknown_event_or_series_is_an_http_error(
+    path: str, fetch: Callable[[KalshiRest], Awaitable[object]]
+) -> None:
+    router = Router()
+    router.add("GET", path, httpx.Response(404, json={"code": "not_found", "message": "missing"}))
+    async with make_client(router) as client:
+        rest = KalshiRest(BASE_URL, client, FakeRateLimiter(), FrozenClock())
+        with pytest.raises(KalshiHttpError) as raised:
+            await fetch(rest)
+    assert (raised.value.status, raised.value.code) == (404, "not_found")

@@ -3,8 +3,9 @@
 Core modules may import only the standard library, ``msgspec``, ``numpy``, and other
 core modules. Adapters may import core modules and any third-party library; leaf adapters,
 each wrapping one I/O mechanism, import no other adapter, so the bus can never reach into
-the recorder or the exchange client. Shell modules may import anything. Exit status 1 on any
-violation.
+the recorder or the exchange client. The API is a process of its own: only shell modules may
+import it, and it never imports the recorder, whose state reaches it only over the bus
+(ADR 0023). Shell modules may import anything. Exit status 1 on any violation.
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ CORE = {
 }
 ADAPTER = {"client", "segment", "recorder", "bus", "bake", "store", "api", "gateway", "probe"}
 LEAF_ADAPTER = {"client", "segment", "bus"}
+SHELL_ONLY_ADAPTER = {"api"}
+"""Adapters that only the composition root may import."""
+FORBIDDEN_ADAPTER_IMPORTS = {"api": {"recorder"}}
+"""Adapters that a given adapter must never import, whatever else it may."""
 SHELL = {"cli", "config", "__init__", "__main__"}
 CORE_THIRD_PARTY = {"msgspec", "numpy"}
 
@@ -100,6 +105,10 @@ def check_file(path: Path) -> list[str]:
                 continue
             if layer_of(sub) == "shell":
                 problems.append(f"{rel}: adapter imports shell module '{sub}'")
+            elif sub in SHELL_ONLY_ADAPTER:
+                problems.append(f"{rel}: adapter imports '{sub}', which only shell modules may")
+            elif sub in FORBIDDEN_ADAPTER_IMPORTS.get(top, set()):
+                problems.append(f"{rel}: adapter '{top}' must not import adapter '{sub}'")
             elif top in LEAF_ADAPTER and layer_of(sub) == "adapter":
                 problems.append(f"{rel}: leaf adapter imports adapter module '{sub}'")
     return problems

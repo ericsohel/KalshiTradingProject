@@ -32,7 +32,7 @@ import msgspec
 from tape.book import Book
 from tape.bus.envelope import FIRST_BUS_SEQ, BusEnvelope
 from tape.errors import BookInvariantError
-from tape.events import BookDelta, BookRefresh, BookSnapshot, MarketEvent
+from tape.events import BookDelta, BookRefresh, BookSnapshot, BusEvent
 
 __all__ = [
     "BOOK_FRESH",
@@ -239,7 +239,7 @@ class LiveBooks:
             return RESET_GAP, max(seq - previous_seq - 1, 0)
         return None, 0
 
-    def _apply(self, event: MarketEvent, changes: list[StatusChange]) -> bool:
+    def _apply(self, event: BusEvent, changes: list[StatusChange]) -> bool:
         """Apply a book event to the copy it concerns, recording any status change."""
         if not isinstance(event, BookRefresh | BookSnapshot | BookDelta):
             return False

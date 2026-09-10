@@ -51,3 +51,29 @@ def test_a_leaf_adapter_importing_another_adapter_is_a_violation(
         "bus/module.py: leaf adapter imports adapter module 'recorder'"
     ]
     assert layers.check_file(tmp_path / "recorder" / "module.py") == []
+
+
+def test_the_api_is_imported_only_by_the_shell_and_never_imports_the_recorder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layers = _load("check_layers")
+    monkeypatch.setattr(layers, "SRC", tmp_path)
+    for package, source in (
+        ("api", "from tape.bus import LiveBooks\nfrom tape.recorder.recorder import Recorder\n"),
+        ("recorder", "from tape.api.hub import LiveHub\n"),
+        ("probe", "from tape.api import create_app\n"),
+    ):
+        (tmp_path / package).mkdir()
+        (tmp_path / package / "module.py").write_text(source)
+    (tmp_path / "cli.py").write_text("from tape.api import create_app\n")
+
+    assert layers.check_file(tmp_path / "api" / "module.py") == [
+        "api/module.py: adapter 'api' must not import adapter 'recorder'"
+    ]
+    assert layers.check_file(tmp_path / "recorder" / "module.py") == [
+        "recorder/module.py: adapter imports 'api', which only shell modules may"
+    ]
+    assert layers.check_file(tmp_path / "probe" / "module.py") == [
+        "probe/module.py: adapter imports 'api', which only shell modules may"
+    ]
+    assert layers.check_file(tmp_path / "cli.py") == []

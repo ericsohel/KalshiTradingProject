@@ -23,6 +23,10 @@ dependencies = [
   "cryptography>=43",
   # The recorder's lossy, non-blocking event bus over ipc (ADR 0008, ADR 0022).
   "pyzmq>=26",
+  # The live API's routes and WebSocket; small, and msgspec stays the only model layer (ADR 0023).
+  "starlette>=1.6",
+  # ASGI server for `tape serve`, run programmatically on localhost (ADR 0023).
+  "uvicorn>=0.52",
 ]
 
 [project.scripts]

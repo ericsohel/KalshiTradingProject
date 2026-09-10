@@ -36,6 +36,7 @@ from tape.wire.rest import (
     GetAccountApiLimitsResponse,
     GetApiKeysResponse,
     GetBalanceResponse,
+    GetEventResponse,
     GetEventsResponse,
     GetFillsResponse,
     GetMarketOrderbookResponse,
@@ -44,6 +45,7 @@ from tape.wire.rest import (
     GetMarketsResponse,
     GetSeriesFeeChangesResponse,
     GetSeriesListResponse,
+    GetSeriesResponse,
     GetSettlementsResponse,
     GetTradesResponse,
     Market,
@@ -482,6 +484,23 @@ class KalshiRest:
         response = await self._request("GET", "/series", bucket="read", params=params)
         return list(_decode(response, GetSeriesListResponse).series)
 
+    async def series_by_ticker(self, series_ticker: str) -> Series:
+        """Fetch one series by ticker, for example for its category.
+
+        Args:
+            series_ticker: Series ticker, for example ``"KXHIGHNY"``.
+
+        Returns:
+            The series.
+
+        Raises:
+            KalshiHttpError: Non-2xx response, including 404 for an unknown series.
+            RateLimitedError: The exchange answered 429.
+            KalshiTransportError: A network-level failure.
+        """
+        response = await self._request("GET", f"/series/{series_ticker}", bucket="read")
+        return _decode(response, GetSeriesResponse).series
+
     async def fee_changes(self, *, show_historical: bool = False) -> list[SeriesFeeChange]:
         """List scheduled (and optionally past) series-level fee changes.
 
@@ -562,6 +581,24 @@ class KalshiRest:
 
         async for item in self._iter_pages(_page, max_pages=max_pages):
             yield item
+
+    async def event(self, event_ticker: str) -> GetEventResponse:
+        """Fetch one event and its markets.
+
+        Args:
+            event_ticker: Event ticker, for example ``"KXHIGHNY-26SEP10"``.
+
+        Returns:
+            The event and, at the top level, every market in it; nested markets are not
+            requested, so ``event.markets`` is absent.
+
+        Raises:
+            KalshiHttpError: Non-2xx response, including 404 for an unknown event.
+            RateLimitedError: The exchange answered 429.
+            KalshiTransportError: A network-level failure.
+        """
+        response = await self._request("GET", f"/events/{event_ticker}", bucket="read")
+        return _decode(response, GetEventResponse)
 
     async def candlesticks(
         self, tickers: Sequence[str], *, start_ts: int, end_ts: int, period_min: int

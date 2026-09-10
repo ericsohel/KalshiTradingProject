@@ -3,10 +3,11 @@
 Responsibility: define what travels on the bus (docs/DATA_FORMATS.md 10, ADR 0022) and number
 it. Every payload is a :class:`BusEnvelope`: ``bus_epoch`` is the publisher's start time in
 wall nanoseconds, ``bus_seq`` counts from 1 every message the publisher attempts, and
-``event`` is one :data:`tape.events.MarketEvent`. :class:`SequencedPublisher` assigns both and
+``event`` is one :data:`tape.events.BusEvent`. :class:`SequencedPublisher` assigns both and
 hands the encoded envelope to a :class:`tape.bus.ports.Publisher`. Topics are ``md.<ticker>``
 for snapshots, deltas, refresh images, trades, and ticker updates, ``ctl.lifecycle`` for
-lifecycle events, and ``ctl.gap`` for sequence gaps.
+lifecycle events, ``ctl.gap`` for sequence gaps, ``ctl.catalog`` for the recorder's catalog of
+recorded markets, and ``ctl.status`` for its status reports (ADR 0023).
 
 Payloads are MessagePack, encoded by msgspec from the same tagged structs the recorder uses.
 The bus is local and read only by Python consumers built on those structs, so a binary form
@@ -28,14 +29,16 @@ import msgspec
 
 from tape.bus.ports import Publisher, PublisherStats
 from tape.errors import WireError
-from tape.events import GapEvent, Lifecycle, MarketEvent
+from tape.events import BusEvent, GapEvent, Lifecycle, MarketCatalog, StatusReport
 
 __all__ = [
+    "CATALOG_TOPIC",
     "CONTROL_PREFIX",
     "FIRST_BUS_SEQ",
     "GAP_TOPIC",
     "LIFECYCLE_TOPIC",
     "MARKET_DATA_PREFIX",
+    "STATUS_TOPIC",
     "BusEnvelope",
     "SequencedPublisher",
     "decode_bus_envelope",
@@ -51,6 +54,8 @@ CONTROL_PREFIX: Final = b"ctl."
 
 LIFECYCLE_TOPIC: Final = b"ctl.lifecycle"
 GAP_TOPIC: Final = b"ctl.gap"
+CATALOG_TOPIC: Final = b"ctl.catalog"
+STATUS_TOPIC: Final = b"ctl.status"
 
 FIRST_BUS_SEQ: Final = 1
 """The ``bus_seq`` of an epoch's first message."""
@@ -71,26 +76,30 @@ class BusEnvelope(msgspec.Struct, frozen=True, kw_only=True):
 
     bus_epoch: Annotated[int, msgspec.Meta(ge=0)]
     bus_seq: Annotated[int, msgspec.Meta(ge=FIRST_BUS_SEQ)]
-    event: MarketEvent
+    event: BusEvent
 
 
 _envelope_decoder: Final = msgspec.msgpack.Decoder(BusEnvelope)
 
 
-def topic_for(event: MarketEvent) -> bytes:
+def topic_for(event: BusEvent) -> bytes:
     """Return the topic an event is published on.
 
     Args:
         event: Any bus event.
 
     Returns:
-        ``ctl.lifecycle`` for a lifecycle event, ``ctl.gap`` for a gap, and ``md.<ticker>``
-        for everything else.
+        ``ctl.lifecycle`` for a lifecycle event, ``ctl.gap`` for a gap, ``ctl.catalog`` for a
+        catalog, ``ctl.status`` for a status report, and ``md.<ticker>`` for everything else.
     """
     if isinstance(event, Lifecycle):
         return LIFECYCLE_TOPIC
     if isinstance(event, GapEvent):
         return GAP_TOPIC
+    if isinstance(event, MarketCatalog):
+        return CATALOG_TOPIC
+    if isinstance(event, StatusReport):
+        return STATUS_TOPIC
     return MARKET_DATA_PREFIX + event.ticker.encode()
 
 
@@ -169,7 +178,7 @@ class SequencedPublisher:
         stats = self._publisher.stats
         return msgspec.structs.replace(stats, errors=stats.errors + self._failures)
 
-    def publish(self, event: MarketEvent) -> None:
+    def publish(self, event: BusEvent) -> None:
         """Publish one event under the next ``bus_seq``, or count it as failed.
 
         Args:

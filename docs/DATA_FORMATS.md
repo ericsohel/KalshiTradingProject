@@ -145,7 +145,8 @@ pong. Limits: 200 connections per user by default, 500,000 markets per session,
 ```
 
 Responses: `{"id", "type": "subscribed", "msg": {"channel", "sid"}}` (one per channel),
-`{"id", "sid", "seq", "type": "ok", "msg": {"market_tickers": [...]}}` after an update,
+`{"id", "sid", "seq", "type": "ok", "msg": {"market_tickers": [...]}}` after an update, or after a `subscribe` the server merged into an existing
+subscription (ADR 0020),
 `{"id", "type": "unsubscribed", "sid", "seq"}`, and
 `{"id"?, "sid"?, "seq"?, "type": "error", "msg": {"code": int, "msg": str}}`.
 
@@ -160,7 +161,11 @@ Every data message is `{"type": <channel message type>, "sid": int, "seq"?: int,
 `market_lifecycle_v2`, and `event_lifecycle`; absent on `ticker`, `fill`, and `user_order`.
 Observed on the demo exchange: `seq` starts at 1 for each `sid`, snapshots and deltas
 share one sequence, and one `subscribe` naming two channels yields two `subscribed`
-responses carrying the same command `id` and distinct `sid`s.
+responses carrying the same command `id` and distinct `sid`s. Observed on production:
+a second `subscribe` naming a channel the connection already carries creates no new
+subscription; the server merges its markets into the existing `sid` and replies `ok`
+with the complete `market_tickers` list for each channel (ADR 0020). This is not in the
+published specification.
 
 ### 3.4 Channel payloads used
 

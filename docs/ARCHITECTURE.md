@@ -94,11 +94,15 @@ implemented after the simulator is calibrated (see [ROADMAP.md](ROADMAP.md)).
    volume floor plus an always-on showcase list, capped by count. The unfiltered ticker
    channel covers every market on a live-only connection whose frames are held in memory
    and published but never taped (ADR 0018).
-2. **Subscriptions.** Markets are partitioned into groups of at most 500 tickers by
-   exchange shard (`exchange_index`) and observed message rate. Each group is one
-   `subscribe` command for `orderbook_delta` and `trade` on one WebSocket connection,
-   yielding one subscription id (`sid`) per channel per group. Sequence numbers are
-   tracked per `sid`, so a gap invalidates at most one group. (ADR 0011)
+2. **Subscriptions** (ADR 0020). Kalshi keeps one subscription per channel per
+   connection: a second `subscribe` for a channel the connection already carries is
+   merged into the existing `sid` and answered with `ok`. So each book connection carries
+   exactly one market set, at most `group_size` markets, subscribed once for
+   `orderbook_delta` and `trade` and changed afterwards with `update_subscription`. The
+   planner assigns markets to connections and keeps each market on its connection across
+   replans, because moving one costs a resnapshot. Markets on different exchange shards
+   may share a connection. Sequence numbers are tracked per `sid`, so a gap invalidates
+   at most one connection's markets.
 3. **Capture.** Every inbound frame is appended, unparsed, to the current raw segment
    with `recv_mono_ns`, `recv_wall_ns`, and the connection id. Only `type`, `sid`, and
    `seq` are read on the hot path for gap detection.
@@ -177,9 +181,8 @@ modules may import anything. A lint check enforces this (see
   channel is healthy. Only the live-only unfiltered `ticker` connection, which always
   carries traffic, also treats 60 seconds without data as a failed subscription.
 - **Sequence gaps.** Each sequenced channel carries `seq` per `sid`. Every gap writes a
-  GAP record and emits a `GapEvent`. On an `orderbook_delta` subscription it also marks
-  that group's books stale and sends `update_subscription` with `action=get_snapshot`,
-  naming the group's markets; stale books ignore deltas until the snapshot arrives. A gap
+  GAP record and emits a `GapEvent`. On an `orderbook_delta` subscription it also marks every book on that connection stale and sends `update_subscription` with `action=get_snapshot`,
+  naming all of the connection's markets; stale books ignore deltas until the snapshot arrives. A gap
   on `trade` or `market_lifecycle_v2` cannot be repaired and does not corrupt a book, so
   it is recorded and nothing more. A repeated or decreasing `seq` is counted, logged, and
   answered with a resnapshot, because applying a replayed delta would silently corrupt
@@ -194,9 +197,11 @@ modules may import anything. A lint check enforces this (see
   lose far more. When the queue has room again, the writer records a `writer_overflow`
   connection event with the number dropped, so the hole is visible in the tape itself
   and not only in a metric.
-- **Universe churn.** Lifecycle `created`/`activated` events add markets to the
-  smallest group on the least-loaded connection via `update_subscription add_markets`;
-  `settled` events remove them after a grace period.
+- **Universe churn.** Each universe refresh replans with the previous plan, so new
+  markets join the connection with room and existing markets stay put; the supervisor
+  applies the difference with `update_subscription` `add_markets` and `delete_markets`.
+  An `ok` reply to a `subscribe` is handled as a merge, and a subscribe that gets no
+  reply within its deadline fails the connection rather than staying pending.
 
 ### 7.2 Book
 
@@ -242,7 +247,7 @@ API bind to localhost and `ipc://` sockets only. See [OPERATIONS.md](OPERATIONS.
 |---|---|---|
 | WebSocket disconnect | Missed pong, socket close | Reconnect with backoff; re-subscribe; snapshots overwrite books; gap epoch recorded |
 | Sequence gap on one `sid` | `seq` discontinuity | Gap record; `get_snapshot`; books in that group stale until snapshot |
-| Server buffer overflow (error 25) | Error frame | Split the group across connections; log; never drop the subscription silently |
+| Server buffer overflow (error 25) | Error frame | Move markets to a less loaded connection; log; never drop the subscription silently |
 | REST 429 (no `Retry-After`) | Status code | Client-side token bucket sized from `GET /account/limits`; exponential backoff on the rare 429 |
 | Disk full | Writer exception, free-space metric | Alert; recorder keeps running on a ring of the last N segments; bake stops |
 | Recorder process death | Dead-man ping missed | systemd restart; the gap is visible in the manifest |

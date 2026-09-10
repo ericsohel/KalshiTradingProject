@@ -337,28 +337,28 @@ dash-separated segment.
 ### 8.2 `tape.recorder.planner`
 
 ```python
-class Group(Struct): group_id: str; exchange_index: int; conn_id: int; tickers: frozenset[str]
+class Group(Struct): group_id: str; conn_id: int; tickers: frozenset[str]
 class Plan(Struct): groups: tuple[Group, ...]; tickers: frozenset[str]; by_id: Mapping[str, Group]
 AddGroup(group) | RemoveGroup(group_id) | AddMarkets(group_id, tickers) | RemoveMarkets(group_id, tickers)
 
-def plan(tickers, *, shard_of: Mapping[str, int], max_per_group: int,
-         max_connections: int, previous: Plan | None = None) -> Plan
+def plan(tickers: Iterable[str], *, max_per_group: int, max_connections: int,
+         previous: Plan | None = None) -> Plan
 def diff(current: Plan, desired: Plan) -> tuple[PlanChange, ...]
 def to_commands(changes, *, channels: Sequence[str], use_yes_price: bool,
                 sid_of: Mapping[str, tuple[int, ...]]) -> tuple[Command, ...]
 ```
 
-Groups never mix exchange shards and never exceed `max_per_group`. Replanning with
-`previous` keeps every ticker in its group unless that group is over capacity or the
-ticker's shard changed, because moving a ticker costs a resnapshot. `diff` orders
-removals before additions, and a kept group whose entire membership is replaced is
-unsubscribed and resubscribed rather than emptied mid-flight. Applying `diff(a, b)` to
-`a` yields exactly `b` (property-tested).
-
-`sid_of` maps a group to **every** subscription id it owns, because Kalshi assigns one
-`sid` per channel, not per subscribe command. `update_subscription` accepts exactly one
-`sid`, so a membership change emits one command per `sid`; `unsubscribe` accepts many,
-so removing a group is one command. A group with no `sid` yet can only be subscribed.
+Invariants (ADR 0020): at most one group per connection, and that group is the
+connection's whole market set; at most `max_per_group` markets per group; markets on
+different exchange shards may share a group, because shards matter for collateral and
+order routing, not market data. With `previous`, a market stays on its connection unless
+that connection is over capacity or no longer exists, because moving a market costs a
+resnapshot. Tickers beyond `max_per_group * max_connections` are left out rather than
+overfilling a connection; configuration validation keeps a valid setup from reaching that
+case. `diff` orders removals before additions, and applying `diff(a, b)` to `a` yields
+exactly `b` (property-tested). `to_commands` maps a group to every `sid` it owns: a
+membership change emits one `update_subscription` per `sid`, and removing a group is one
+`unsubscribe`.
 
 ### 8.3 `tape.recorder.gaps`
 
@@ -391,30 +391,47 @@ def segment_path(root, conn_id, wall_ns, counter) -> Path   # raw/YYYY-MM-DD/HH/
 
 class SupervisorConfig(Struct):
     conn_id: int
-    book_channels: tuple[str, ...] = ("orderbook_delta", "trade")   # one sid per channel per group
-    firehose_channels: tuple[str, ...] = ()      # unfiltered, e.g. ("ticker",) on the live-only connection
+    book_channels: tuple[str, ...] = ("orderbook_delta", "trade")   # one sid per channel
+    firehose_channels: tuple[str, ...] = ()      # unfiltered, e.g. ("ticker",); never also a book channel
     use_yes_price: bool = True
     persist: bool = True                         # False = live-only (ADR 0018)
     backoff_initial_ns: int; backoff_max_ns: int; max_consecutive_failures: int | None = None
+    subscribe_timeout_ns: int = 10e9             # a subscribe left unanswered fails the connection
 
 class ConnectionSupervisor:
-    def __init__(self, config: SupervisorConfig, session_factory: Callable[[], WsSession],
-                 clock: Clock, *, sink: SegmentSink | None, on_event: Callable[[MarketEvent], None] | None,
-                 sleep: Callable[[float], Awaitable[None]], jitter: Callable[[], float])
+    def __init__(self, config: SupervisorConfig, *, session_factory: Callable[[], WsSession],
+                 clock: Clock, sleep: Callable[[float], Awaitable[None]], jitter: Callable[[], float],
+                 sink: SegmentSink | None = None, on_event: Callable[[MarketEvent], None] | None = None,
+                 deadline_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep)
     async def run(self) -> None                  # until stop(); raises past max_consecutive_failures
     async def stop(self) -> None                 # idempotent
-    async def set_groups(self, groups: Sequence[Group]) -> None   # diffed and applied live, replayed on reconnect
-    books: Mapping[str, Book]; groups; subscriptions; last_errors; stats: SupervisorStats
+    async def set_group(self, group: Group | None) -> None   # the connection's whole market set
 def backoff_delay_s(failures, initial_ns, max_ns, jitter) -> float
 ```
+
+The supervisor also exposes read-only views of its books, its group, its live subscriptions,
+recent server errors, and counters.
 
 Sessions are single-use, so every connection attempt builds a new one from the factory.
 Sleep and jitter are injected so reconnect behavior is deterministic under test. On
 disconnect the supervisor writes a close record, marks every book stale, rotates the
 segment, waits `min(max, initial * 2**failures) * (0.5 + jitter/2)`, then reconnects and
-resubscribes every group from its own table, never from old `sid`s. Error codes 25, 26,
-and 27 are counted and exposed in `last_errors` for the recorder to act on. Gap,
-duplicate, and backpressure behavior is described in docs/ARCHITECTURE.md 7.1.
+resubscribes from its own group, never from old `sid`s. Error codes 25, 26, and 27 are
+counted and exposed for the recorder to act on.
+
+A book connection subscribes each book channel once; later membership changes use
+`update_subscription`. Because Kalshi merges a repeated `subscribe` into the existing
+subscription (ADR 0020), an `ok` reply to a pending subscribe is handled as a merge: the
+supervisor keeps a per-connection map from `sid` to channel, adopts the reply's
+`market_tickers` as the membership, resolves the pending command, and requests snapshots
+for any wanted market that lacks a fresh book, since which markets Kalshi snapshots on a
+merge is undocumented. A subscribe that is not answered for every channel within
+`subscribe_timeout_ns` fails the connection instead of staying pending; that deadline runs
+on the injected `deadline_sleep`, separate from the backoff `sleep`. Book frames are routed
+by membership in the connection's market set. A gap on a book `sid` stales every book on the
+connection and requests snapshots for all of its markets. Known limitation: if the server
+refuses a subscribe for only one of the book channels, that channel stays unsubscribed.
+Duplicate and backpressure behavior is described in docs/ARCHITECTURE.md 7.1.
 
 `on_event` receives every trade, ticker, lifecycle event, and gap, and every snapshot
 and delta that was actually applied to a book.
@@ -482,8 +499,8 @@ composition root that wires real dependencies and the auditor.
 
 Connection layout: connection 0 is live-only and carries the unfiltered `ticker` channel
 (ADR 0018); connection 1 is taped and carries `market_lifecycle_v2`; connections
-`2 .. 2 + book_connections - 1` are taped and carry planner groups on `orderbook_delta`
-and `trade` with `use_yes_price`. The layout must fit `max_connections`.
+`2 .. 2 + book_connections - 1` are taped, and each carries exactly one planner group, its
+whole market set, on `orderbook_delta` and `trade` with `use_yes_price` (ADR 0020). The layout must fit `max_connections`.
 
 The session builder receives `conn_id` and `silence_timeout_ns`: the live-only ticker
 connection gets `RecorderConfig.ticker_silence_timeout_s`, every other connection gets
@@ -498,8 +515,8 @@ gap's length.
 
 Startup reads `GET /exchange/status` and resizes the rate limiter from
 `GET /account/limits`. Every `universe_refresh_s` the recorder pages the open,
-non-multivariate markets (logging when a listing is cut short by the page cap), selects
-the universe, replans with the previous plan, and applies each connection's groups.
+non-multivariate markets (logging when a listing is cut short by the page cap), selects the universe, replans with the previous plan, and gives each book connection its
+group through `set_group`.
 Every `keyframe_interval_s` it writes merged books to
 `data_dir/keyframes/YYYY-MM-DD/HH/MM.parquet`. Every `status_interval_s` it logs one
 structured status line. A failing periodic task is logged and does not stop capture; a
@@ -662,7 +679,7 @@ ws_silence_timeout_s = 60        # applies only to the live-only ticker connecti
 [recorder]
 data_dir = "data"
 max_connections = 16            # ticker + control + book_connections must fit
-book_connections = 2
+book_connections = 4
 group_size = 500                # at most 500 (ADR 0010)
 keyframe_interval_s = 300       # whole minutes dividing an hour
 audit_interval_s = 300
@@ -696,7 +713,9 @@ Rules:
 - **Paths**: a leading `~` expands from the injected `HOME`; relative paths resolve
   against the directory holding the configuration file, not the working directory.
 - **Validation**: positive intervals, ping interval and pong timeout each between 1 and
-  60 seconds (a dead connection goes unnoticed for their sum), `group_size` at most 500, the private key file must
+  60 seconds (a dead connection goes unnoticed for their sum), `group_size` at most 500,
+  `book_connections * group_size` at least `max_l2_markets`, and
+  `2 + book_connections` at most `max_connections` (ADR 0020), the private key file must
   exist and be readable by its owner alone, and `data_dir` must be writable.
 - **Secrets are paths, never values.** `tape config check` prints the effective settings
   with nothing to redact beyond what is already only a path.

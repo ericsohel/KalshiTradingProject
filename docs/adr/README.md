@@ -19,7 +19,7 @@ choose and why, you have not made a decision; you have made a default.
 | [0007](0007-private-tape-public-code.md) | Raw tape private; code, method, and results public | accepted |
 | [0008](0008-zeromq-ipc-bus.md) | ZeroMQ PUB/SUB over ipc between recorder and consumers | accepted |
 | [0009](0009-typescript-webgl-viewer-hosting.md) | TypeScript + WebGL2 viewer on Cloudflare Pages; API behind Caddy | accepted |
-| [0010](0010-small-subscription-groups.md) | Subscription groups of at most 500 markets | accepted |
+| [0010](0010-small-subscription-groups.md) | Subscription groups of at most 500 markets | superseded by 0020 |
 | [0011](0011-uv-monorepo-mit.md) | uv-managed monorepo with src layout, MIT license | accepted |
 | [0012](0012-python-recorder-with-escape-hatch.md) | Python and asyncio for the recorder, with a measured escape hatch | accepted |
 | [0013](0013-parquet-duckdb-over-database.md) | Parquet files and DuckDB instead of a database server | accepted |
@@ -29,3 +29,5 @@ choose and why, you have not made a decision; you have made a default.
 | [0017](0017-tolerant-inbound-taxonomies.md) | Inbound taxonomies decode as strings; directional bits stay closed | accepted |
 | [0018](0018-live-only-ticker-firehose.md) | The unfiltered ticker channel is live-only, not taped | accepted |
 | [0019](0019-transport-liveness.md) | Liveness is measured at the transport, not by data traffic | accepted |
+| [0020](0020-one-subscription-per-connection.md) | One market set per channel per connection | accepted |
+| [0021](0021-audit-window-consistency.md) | An audit passes when the snapshot matches any book state in its request window | accepted |

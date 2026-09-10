@@ -66,7 +66,7 @@ These are tests that run against reality every day and are published:
 |---|---|---|
 | Uptime | seconds with an open control connection / seconds in the day | >= 99.5% |
 | Gap share | market-seconds with a book marked stale / total subscribed market-seconds | < 0.5% |
-| Audit exact ratio | sampled books whose reconstructed levels equal the REST snapshot / sampled books | >= 99.5%, mismatches explained by in-flight deltas |
+| Audit consistency ratio | sampled books that equal the REST snapshot at the reply, or at some state within the request window (ADR 0021) / sampled books | >= 99.5%; every inconsistent audit investigated |
 | Impossible-trade rate | trades that could not have executed at the reconstructed best price at `ts_ms` / trades | < 0.1% |
 | Candle agreement | 1-minute candles rebuilt from recorded trades that match Kalshi's `volume_fp` and OHLC | >= 99.5% |
 

@@ -1,6 +1,6 @@
 # 0010. Subscription groups of at most 500 markets
 
-Status: accepted. Date: 2026-09-09.
+Status: superseded by ADR 0020. Date: 2026-09-09.
 
 ## Context
 

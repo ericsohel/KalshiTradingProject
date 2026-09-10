@@ -658,7 +658,10 @@ class LiveBooks:
 ```
 
 Topics: `md.<ticker>` for snapshots, deltas, refresh images, trades, and ticker updates;
-`ctl.lifecycle` and `ctl.gap`; `ctl.audit` and `ctl.heartbeat` are reserved. Private events
+`ctl.lifecycle` and `ctl.gap`; `ctl.catalog`, the recorded markets with series, event,
+24-hour volume, close time, and showcase flag, once per bus refresh cycle, and
+`ctl.status`, the recorder's status, every status interval (ADR 0023); `ctl.audit` and
+`ctl.heartbeat` are reserved. Private events
 never use the `md.` prefix. Transport: ZeroMQ PUB/SUB over `ipc://` (ADR 0008); message layout
 in [DATA_FORMATS.md](DATA_FORMATS.md) section 10.
 
@@ -791,8 +794,23 @@ def fit_fill_model(samples: Sequence[ProbeSample]) -> Calibrated
 
 ## 15. `tape.api`
 
-FastAPI application. Routes in [FRONTEND.md](FRONTEND.md). Dependencies injected at
-startup: `Catalog`, `Subscriber`, settings. No route touches Kalshi directly.
+A Starlette application served by uvicorn on localhost (ADR 0023). Routes and the live
+protocol are specified in [FRONTEND.md](FRONTEND.md) 4 and are binding; the names below
+are the intended shape.
+
+```python
+class MarketDirectory:   # pure: catalog + latest ticker updates + resolved metadata -> MarketRow, MarketDetail
+class MetadataResolver:  # adapter: public KalshiRest without a signer, its own token bucket, TTL cache, one request per event
+class LiveHub:           # follows the bus with ZmqSubscriber + LiveBooks and fans messages out to sessions
+class ClientSession:     # one WebSocket: subscription set, bounded queue, lag accounting, rate limits
+def create_app(*, hub: LiveHub, directory: MarketDirectory, resolver: MetadataResolver,
+               settings: ServeSettings, clock: Clock) -> Starlette
+```
+
+Every request, response, and WebSocket message is a msgspec struct;
+`scripts/gen_api_schema.py` writes their JSON Schema to `web/src/api/schema.json`. The API
+holds no Kalshi credentials and no route calls Kalshi; only the resolver does, in the
+background, for public metadata.
 
 ## 16. Errors
 
@@ -846,6 +864,17 @@ status_interval_s = 60
 bus_endpoint = "ipc:///run/tape/bus.sock"   # absent by default: no bus; ipc:///absolute/path or tcp://host:port
 bus_refresh_s = 10              # 1 to 60; seconds between refresh images of each book
 bus_send_hwm = 10000            # 1000 to 100000 messages queued per bus subscriber
+
+[serve]
+listen_host = "127.0.0.1"
+listen_port = 8080
+allowed_origins = ["http://localhost:5173"]   # exact origins for CORS and the WebSocket Origin check
+max_clients = 200
+max_tickers_per_client = 10
+client_queue_max = 5000          # messages queued per live client before a client_lag resync
+metadata_requests_per_s = 2      # public Kalshi requests for titles, categories, and price grids
+metadata_ttl_s = 3600
+# The API follows the bus at recorder.bus_endpoint; there is no second setting for it.
 
 [recorder.universe]
 min_volume_24h = "1000.00"      # fixed-point string, never a float

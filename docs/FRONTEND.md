@@ -25,7 +25,7 @@ handful of concurrent live markets per viewer.
 ## 3. Architecture
 
 ```
-Cloudflare Pages (static: index.html, JS, WASM)  --HTTPS-->  Caddy  --> tape serve (FastAPI)
+Cloudflare Pages (static: index.html, JS, WASM)  --HTTPS-->  Caddy  --> tape serve (Starlette)
                                                                      |--> ZeroMQ SUB (live events from the recorder)
                                                                      |--> Catalog (keyframes + baked Parquet)
 ```
@@ -33,8 +33,8 @@ Cloudflare Pages (static: index.html, JS, WASM)  --HTTPS-->  Caddy  --> tape ser
 - **web/** is a Vite + TypeScript (strict) project. UI chrome is React 18; the renderer
   is a framework-free module (`web/src/render/`) that owns a WebGL2 context and knows
   nothing about React.
-- **Data path.** Live: one WebSocket per viewer carrying msgspec-JSON events for up to
-  10 tickers. Replay: `fetch` of Arrow IPC streams decoded with `apache-arrow` and
+- **Data path.** Live: one WebSocket per viewer carrying the JSON messages of 4.2 for up
+  to 10 tickers. Replay: `fetch` of Arrow IPC streams decoded with `apache-arrow` and
   uploaded to GPU textures in chunks. Status: plain JSON.
 - **State.** A `TapeStore` per market holds a ring buffer of `(t, price, count)` columns
   and a current book. The renderer reads from the store; React reads derived
@@ -43,24 +43,83 @@ Cloudflare Pages (static: index.html, JS, WASM)  --HTTPS-->  Caddy  --> tape ser
 ## 4. API contract (`tape serve`)
 
 All routes are under `/api/v1`, read-only, JSON unless stated, and versioned by path.
-Integers follow [DATA_FORMATS.md](DATA_FORMATS.md) (`price_e4`, `count_e2`, `ts_ms`).
+Integers follow [DATA_FORMATS.md](DATA_FORMATS.md) (`price_e4`, `count_e2`, `ts_ms`); every
+price is a YES price, and `null` means none is known. Every type below is a msgspec struct
+in `tape.api`; `web/src/api/schema.json` is generated from those structs and the
+front end's TypeScript types from that file, so the two cannot drift (ADR 0023).
+
+### 4.1 Live routes
 
 | Route | Response |
 |---|---|
-| `GET /markets?limit=50` | `[{ticker, title, event_ticker, category, exchange_index, bid_e4, ask_e4, last_e4, volume_24h_e2, close_ts, showcase: bool}]` sorted by 24h volume |
-| `GET /markets/{ticker}` | metadata plus current book depth (top 20 each side) |
+| `GET /markets?limit=50` | `{"markets": [MarketRow]}`; `limit` 1 to 200; sorted by `volume_24h_e2` descending, then by ticker |
+| `GET /markets/{ticker}` | `MarketDetail`; 404 with code `unknown_ticker` when the market is not recorded |
+| `GET /status` | `ServiceStatus` |
+| `WS /live` | the feed in 4.2 |
+
+- **`MarketRow`**: `{ticker, event_ticker, series_ticker, title, subtitle, category,
+  showcase, volume_24h_e2, close_ts, bid_e4, ask_e4, last_e4, book}`. `title` is the event
+  title, `subtitle` the market's YES subtitle, and `category` the series category, each
+  `null` until resolved; `close_ts` is Unix seconds or `null`; the prices come from the
+  latest ticker update; `book` is `"unknown"`, `"fresh"`, or `"stale"`.
+- **`MarketDetail`**: the `MarketRow` fields plus `price_ranges`, a list of
+  `{start_e4, end_e4, step_e4}` or `null` until resolved, and `depth`,
+  `{ts_ms, bids: [[price_e4, count_e2]], asks: [...]}` with the best 20 levels per side,
+  best first, or `null` unless the book is known.
+- **`ServiceStatus`**: `{recording, recorder_status_age_ms, recorder, bus, clients}`.
+  `recording` is true when a recorder status arrived within two status intervals;
+  `recorder` is the latest recorder status (`universe_size`, `subscribed_markets`, and
+  per connection `conn_id, taped, frames, gaps, reconnects, stale_books, sink_dropped`) or
+  `null`; `bus` is `{epoch, last_seq, messages, resets, missed, books_known}`; `clients`
+  counts open live connections.
+
+Errors are `{"error": {"code", "message"}}` with an appropriate status code. Live routes
+set `Cache-Control: no-store`. CORS allows only the configured origins.
+
+### 4.2 Live feed (`WS /live`)
+
+One JSON object per text frame. The handshake is refused with 403 when the `Origin`
+header is not an allowed origin, and closed with 1013 when `max_clients` connections are
+open.
+
+Client to server. A client message is at most 4 KB, and a client sends at most 10 per
+second; either violation closes the connection with 1008.
+
+| Message | Meaning |
+|---|---|
+| `{"op": "subscribe", "tickers": ["KX...", ...]}` | Replace the subscription set. An empty list unsubscribes from everything |
+
+Server to client; `t` names the type.
+
+| Message | When |
+|---|---|
+| `{"t": "hello", "protocol": 1, "max_tickers": 10, "bus_refresh_s": 10}` | First message on every connection |
+| `{"t": "subscribed", "tickers": [...], "rejected": [{"ticker", "code"}]}` | Reply to each subscribe; `code` is `unknown_ticker` or `too_many_tickers` |
+| `{"t": "snapshot", "ticker", "book": "fresh"\|"stale", "ts_ms", "bids": [[price_e4, count_e2]], "asks": [...]}` | The whole book, best first: on subscribing to a known book, when a book becomes known, and after a resync |
+| `{"t": "delta", "ticker", "ts_ms", "side": "bid"\|"ask", "price_e4", "delta_e2"}` | A signed change at one level, applied to the latest snapshot |
+| `{"t": "book", "ticker", "book": "fresh"\|"stale"}` | The book's freshness changed without a snapshot; a stale book receives no deltas until its next snapshot |
+| `{"t": "resync", "ticker", "reason": "client_lag"\|"bus_loss"}` | Discard this market's book. A snapshot follows as soon as the server's book is known: at once after `client_lag`, within `bus_refresh_s` after `bus_loss` |
+| `{"t": "trade", "ticker", "ts_ms", "price_e4", "count_e2", "taker_side": "bid"\|"ask"}` | A public trade; `bid` means the taker bought YES |
+| `{"t": "ticker", "ticker", "ts_ms", "bid_e4", "ask_e4", "last_e4", "volume_e2"}` | Top of book and cumulative volume |
+| `{"t": "error", "code", "message"}` | A client message the server could not accept, such as malformed JSON or an unknown `op` |
+
+Messages about one market arrive in bus order. Trades and ticker updates are forwarded
+whatever the book's state.
+
+**Backpressure.** Each connection has a bounded queue of `client_queue_max` messages.
+When it fills, the server discards what is queued and sends, for each subscribed market,
+`resync` with reason `client_lag`, followed by a snapshot when the book is known. A
+connection that lags three times within 60 seconds is closed with 4000 (too slow).
+
+### 4.3 Historical routes (after M4)
+
+| Route | Response |
+|---|---|
 | `GET /markets/{ticker}/book?at=<wall_ns>` | `{as_of_ns, stale, bids: [[price_e4,count_e2]], asks: [...]}` reconstructed from the nearest prior keyframe plus deltas |
-| `GET /markets/{ticker}/tape?from=<ns>&to=<ns>&kind=deltas|trades` | `application/vnd.apache.arrow.stream`; capped at 5,000,000 rows per request, with `X-Tape-Truncated: true` when capped |
-| `GET /status` | latest manifest summary plus live counters `{recording: bool, connections, msgs_per_s: {...}, subscribed_markets, last_frame_age_ms}` |
+| `GET /markets/{ticker}/tape?from=<ns>&to=<ns>&kind=deltas\|trades` | `application/vnd.apache.arrow.stream`; capped at 5,000,000 rows per request, with `X-Tape-Truncated: true` when capped |
 | `GET /status/days?from=&to=` | per-day integrity numbers |
-| `WS /live` | client sends `{"subscribe": ["TICKER", ...]}` (max 10); server sends `{"t":"snapshot",...}` then `{"t":"delta"|"trade"|"ticker",...}`; on lag `{"t":"resync"}` followed by a fresh snapshot |
 
-A `resync` is followed by the market's snapshot as soon as the API's own book for it
-is known again, which after a bus loss or an API restart takes at most one bus refresh
-interval (ADR 0022).
-
-Errors are `{error: {code, message}}` with appropriate status codes. Every response
-sets `Cache-Control` (`no-store` for live, `public, max-age=3600` for closed windows).
+Closed historical windows set `Cache-Control: public, max-age=3600`.
 
 ## 5. Rendering design
 

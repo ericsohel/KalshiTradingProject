@@ -147,7 +147,7 @@ src/tape/
   bus/               ZeroMQ publisher/subscriber                (adapter)
   bake/              raw -> Parquet, manifests                  (adapter)
   store/             catalog and queries over baked data        (adapter)
-  api/               FastAPI app: REST, WS fan-out, Arrow       (adapter)
+  api/               Starlette app: REST, WS fan-out, Arrow     (adapter)
   gateway/           live execution and reconciliation          (adapter)
   probe/             penny-order calibration harness            (adapter)
   cli.py             argparse entry points (stdlib)                         (shell)

@@ -115,8 +115,9 @@ is not merged, regardless of whether it works.
   Prettier for formatting. Both run in pre-commit and CI.
 - Named exports only; no `any`; no non-null assertions without a comment.
 - The renderer module has no React imports and no DOM access beyond its canvas.
-- Every API response type is generated from the FastAPI OpenAPI document
-  (`openapi-typescript`) so the front end cannot drift from the back end.
+- Every API type, REST and WebSocket alike, is generated: `scripts/gen_api_schema.py`
+  emits JSON Schema from the msgspec structs, `json-schema-to-typescript` turns it into
+  TypeScript, and CI fails when either generated file drifts (ADR 0023).
 - Vitest for pure modules, Playwright for one smoke test per view, golden-image tests
   for the renderer with a tolerance threshold.
 

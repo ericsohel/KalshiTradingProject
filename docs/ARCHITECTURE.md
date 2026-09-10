@@ -262,7 +262,10 @@ API bind to localhost and `ipc://` sockets only. See [OPERATIONS.md](OPERATIONS.
 
 - Message volume per shard is unmeasured; the first week of recording decides
   connection count and storage policy.
-- Whether Kalshi's `seq` resets on snapshot or continues; the recorder treats any
-  non-monotonic value as a gap and the first week's data will settle the rule.
+- Resolved 2026-09-10 against the demo exchange: `seq` starts at 1 per `sid` and the
+  initial `orderbook_snapshot` messages are part of the same sequence as the deltas
+  that follow (five snapshots and 1,240 deltas arrived as `seq` 1 to 1,245 with no
+  gaps). Whether a `get_snapshot` resync continues or restarts the sequence is still
+  unobserved; the recorder treats any non-monotonic value as suspicious.
 - Whether 0.01-contract orders are enabled for every account; the probe stage has a
   1-contract fallback.

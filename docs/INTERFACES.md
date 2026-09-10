@@ -302,24 +302,86 @@ def read_keyframe(path: Path) -> list[KeyframeRow]                    # TapeCorr
 
 ## 8. `tape.recorder`
 
+Pure planning and detection logic, tested without a network, plus the adapters that
+drive a live connection.
+
+### 8.1 `tape.recorder.universe`
+
 ```python
-class UniverseSelector(Protocol):
-    def select(self, markets: Sequence[MarketV1], *, policy: UniversePolicy) -> UniverseDecision
-        # UniverseDecision(l2_tickers: frozenset[str], showcase: frozenset[str])
-class SubscriptionPlanner:           # pure
-    def plan(self, tickers: frozenset[str], *, max_per_group: int, connections: int, shard_of: Mapping[str, int]) -> Plan
-    def diff(self, current: Plan, desired: Plan) -> list[PlanChange]   # add/remove per group
-class GapTracker:                     # pure; per (conn_id, sid)
-    def observe(self, sid: int, seq: int | None) -> GapVerdict           # Ok | Gap(expected, got) | Reset
-class ConnectionSupervisor:           # adapter; one per WS connection
-    # owns WsSession, SegmentWriter feed, GapTracker, and the books of its groups
-class Auditor:                        # adapter; samples markets, fetches REST books, diffs
-class Recorder:                       # composition root for `tape record`
+class UniversePolicy(Struct): min_volume_24h: CountE2; max_l2_markets: int;
+                              showcase_series: frozenset[str]; exclude_mve: bool = True;
+                              max_seconds_to_close: int | None = None
+class MarketSummary(Struct):  ticker; series_ticker; event_ticker; exchange_index; status;
+                              volume_24h: CountE2; close_ts: int | None; is_mve: bool
+    @classmethod
+    def from_wire(cls, market: Market, *, is_mve: bool = False) -> MarketSummary
+class UniverseDecision(Struct): l2_tickers: frozenset[str]; showcase: frozenset[str];
+                                dropped_for_cap: int; reason_counts: Mapping[str, int]
+def select(markets: Sequence[MarketSummary], policy: UniversePolicy, *, now_ts: int) -> UniverseDecision
 ```
 
-The recorder's hot path per frame: read → enqueue raw bytes for the writer →
-`decode_envelope` → `GapTracker.observe` → (off hot path) full decode → book apply →
-bus publish. The writer queue is enqueued first so nothing downstream can lose a frame.
+Eligibility first (status `"active"`, multivariate legs, already closed, close horizon),
+then every showcase-series market unconditionally, then the remaining budget by
+descending 24-hour volume with ties broken by ticker. Showcase markets are never dropped
+for the cap; overflow is reported in `dropped_for_cap`. A ticker repeated in one listing
+is counted once, and the copy kept is chosen by content rather than arrival order. The
+pinned spec carries no series field on a market, so `series_ticker` is the ticker's first
+dash-separated segment.
+
+### 8.2 `tape.recorder.planner`
+
+```python
+class Group(Struct): group_id: str; exchange_index: int; conn_id: int; tickers: frozenset[str]
+class Plan(Struct): groups: tuple[Group, ...]; tickers: frozenset[str]; by_id: Mapping[str, Group]
+AddGroup(group) | RemoveGroup(group_id) | AddMarkets(group_id, tickers) | RemoveMarkets(group_id, tickers)
+
+def plan(tickers, *, shard_of: Mapping[str, int], max_per_group: int,
+         max_connections: int, previous: Plan | None = None) -> Plan
+def diff(current: Plan, desired: Plan) -> tuple[PlanChange, ...]
+def to_commands(changes, *, channels: Sequence[str], use_yes_price: bool,
+                sid_of: Mapping[str, tuple[int, ...]]) -> tuple[Command, ...]
+```
+
+Groups never mix exchange shards and never exceed `max_per_group`. Replanning with
+`previous` keeps every ticker in its group unless that group is over capacity or the
+ticker's shard changed, because moving a ticker costs a resnapshot. `diff` orders
+removals before additions, and a kept group whose entire membership is replaced is
+unsubscribed and resubscribed rather than emptied mid-flight. Applying `diff(a, b)` to
+`a` yields exactly `b` (property-tested).
+
+`sid_of` maps a group to **every** subscription id it owns, because Kalshi assigns one
+`sid` per channel, not per subscribe command. `update_subscription` accepts exactly one
+`sid`, so a membership change emits one command per `sid`; `unsubscribe` accepts many,
+so removing a group is one command. A group with no `sid` yet can only be subscribed.
+
+### 8.3 `tape.recorder.gaps`
+
+```python
+Ok | FirstMessage | Gap(expected, got) | Duplicate(expected, got)
+class GapTracker:
+    def observe(self, sid: int, seq: int | None) -> GapVerdict
+    def reset(self, sid: int) -> None; def forget(self, sid: int) -> None
+    def sids(self) -> Iterator[int]
+    def messages(self, sid: int) -> int; def gaps(self, sid: int) -> int; def duplicates(self, sid: int) -> int
+```
+
+The first `seq` on a `sid` sets the baseline. `last + 1` is `Ok`, larger is a `Gap`,
+equal or smaller is a `Duplicate` (suspicious, never fatal). `seq is None`, on unsequenced
+channels such as `ticker` and `fill`, is `Ok` and leaves the baseline alone. After a gap
+the baseline moves to the observed value, so one hole is reported once.
+
+### 8.4 Adapters (next)
+
+```python
+class ConnectionSupervisor:   # one per WS connection: WsSession, segment writer feed, GapTracker, books
+class Auditor:                # samples markets, fetches REST books, diffs against local books
+class Recorder:               # composition root for `tape record`
+```
+
+The recorder's hot path per frame: read, enqueue raw bytes for the writer,
+`decode_envelope`, `GapTracker.observe`, then off the hot path full decode, book apply,
+and bus publish. The writer queue is enqueued first so nothing downstream can lose a
+frame.
 
 ## 9. `tape.bus`
 

@@ -155,6 +155,9 @@ limit). All others are logged and surfaced.
 Every data message is `{"type": <channel message type>, "sid": int, "seq"?: int, "msg": {...}}`.
 `seq` is present on `orderbook_snapshot`, `orderbook_delta`, `trade`,
 `market_lifecycle_v2`, and `event_lifecycle`; absent on `ticker`, `fill`, and `user_order`.
+Observed on the demo exchange: `seq` starts at 1 for each `sid`, snapshots and deltas
+share one sequence, and one `subscribe` naming two channels yields two `subscribed`
+responses carrying the same command `id` and distinct `sid`s.
 
 ### 3.4 Channel payloads used
 

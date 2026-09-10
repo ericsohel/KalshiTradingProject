@@ -11,8 +11,9 @@ Invariants: command ids start at 1, increase strictly, and are assigned in send 
 frames reach ``frames()`` in receive order; the buffer between the socket reader and the
 consumer is bounded, and on overflow the oldest frame is dropped so that the socket is
 always drained (a blocked reader would trip the server's own buffer overflow, error 25);
-every wait on the socket has a deadline, and a connection that says nothing for
-``silence_timeout_ns`` is declared dead.
+and every wait on the socket is bounded: the library keepalive fails a connection whose
+peer stops answering pings, which ends any pending receive (ADR 0019), and a session given
+a ``silence_timeout_ns`` also declares its connection dead after that long without a frame.
 """
 
 from __future__ import annotations
@@ -35,8 +36,9 @@ __all__ = [
     "DEFAULT_CLOSE_TIMEOUT_NS",
     "DEFAULT_CONNECT_TIMEOUT_NS",
     "DEFAULT_MAX_BUFFERED_FRAMES",
+    "DEFAULT_PING_INTERVAL_NS",
+    "DEFAULT_PING_TIMEOUT_NS",
     "DEFAULT_SEND_TIMEOUT_NS",
-    "DEFAULT_SILENCE_TIMEOUT_NS",
     "WS_SIGN_METHOD",
     "WS_SIGN_PATH",
     "Command",
@@ -59,8 +61,10 @@ WS_SIGN_PATH: Final = "/trade-api/ws/v2"
 DEFAULT_CONNECT_TIMEOUT_NS: Final = 10 * NS_PER_S
 DEFAULT_SEND_TIMEOUT_NS: Final = 10 * NS_PER_S
 DEFAULT_CLOSE_TIMEOUT_NS: Final = 5 * NS_PER_S
-DEFAULT_SILENCE_TIMEOUT_NS: Final = 30 * NS_PER_S
-"""Three times the server's 10-second heartbeat interval (docs/ARCHITECTURE.md 7.1)."""
+DEFAULT_PING_INTERVAL_NS: Final = 10 * NS_PER_S
+"""Client keepalive ping interval, matching the server's own heartbeat (ADR 0019)."""
+DEFAULT_PING_TIMEOUT_NS: Final = 20 * NS_PER_S
+"""Wait for a keepalive pong before the connection is failed (ADR 0019)."""
 
 DEFAULT_MAX_BUFFERED_FRAMES: Final = 4096
 """Frames held between the socket reader and a slow consumer before the oldest is dropped."""
@@ -221,6 +225,13 @@ def _closed(detail: str, cause: BaseException | None = None) -> WsClosedError:
     return error
 
 
+def _close_detail(conn_id: int, exc: ConnectionClosed) -> str:
+    """Say which side ended a connection; a missed keepalive pong is this side failing it."""
+    if exc.rcvd is None and exc.sent is not None:
+        return f"connection {conn_id} failed by this client: {exc}"
+    return f"connection {conn_id} closed by peer: {exc}"
+
+
 def _seconds(duration_ns: int) -> float:
     """Convert a nanosecond duration to the seconds asyncio wants."""
     return duration_ns / NS_PER_S
@@ -239,10 +250,13 @@ class WsSession:
     because a blocked reader stalls the socket, which makes the server overflow its own
     buffer and drop far more (docs/ARCHITECTURE.md 7.1).
 
-    Liveness: Kalshi pings every 10 seconds and ``websockets`` answers those pongs
-    itself, so no client keepalive is configured here. The library does not surface
-    ping frames, so the silence window is measured over inbound frames only; the
-    30-second default is three heartbeats, and a false positive costs one reconnect.
+    Liveness (ADR 0019): the session runs the ``websockets`` keepalive, pinging every
+    ``ping_interval_ns`` and failing the connection when no pong arrives within
+    ``ping_timeout_ns``; that close raises :class:`WsClosedError` like any other. Kalshi's
+    own heartbeat pings are answered by the library and never surface as frames, so data
+    traffic says nothing about whether the peer is alive, and an idle connection is
+    healthy. ``silence_timeout_ns`` is only for a connection that always carries traffic,
+    where silence on a live transport means its subscription stopped delivering.
 
     Args:
         url: Endpoint to connect to, for example
@@ -252,14 +266,17 @@ class WsSession:
         clock: The only time source this session reads (ADR 0004). It stamps receipts,
             the handshake timestamp, and the silence check.
         conn_id: Identifier for this connection, copied onto records the recorder writes.
-        silence_timeout_ns: Inbound silence after which the connection is declared dead.
+        silence_timeout_ns: Inbound silence after which the connection is declared dead;
+            ``None``, the default, never declares silence.
+        ping_interval_ns: Interval between keepalive pings.
+        ping_timeout_ns: Wait for each keepalive pong before failing the connection.
         connect_timeout_ns: Deadline for the TCP, TLS, and upgrade handshake.
         send_timeout_ns: Deadline for writing one command.
         close_timeout_ns: Deadline for the closing handshake before the socket is dropped.
         max_buffered_frames: Frames held for a slow consumer before the oldest is dropped.
 
     Raises:
-        ValueError: If a timeout or buffer bound is not positive.
+        ValueError: If a timeout, interval, or buffer bound is not positive.
     """
 
     def __init__(
@@ -269,19 +286,25 @@ class WsSession:
         clock: Clock,
         *,
         conn_id: int = 0,
-        silence_timeout_ns: int = DEFAULT_SILENCE_TIMEOUT_NS,
+        silence_timeout_ns: int | None = None,
+        ping_interval_ns: int = DEFAULT_PING_INTERVAL_NS,
+        ping_timeout_ns: int = DEFAULT_PING_TIMEOUT_NS,
         connect_timeout_ns: int = DEFAULT_CONNECT_TIMEOUT_NS,
         send_timeout_ns: int = DEFAULT_SEND_TIMEOUT_NS,
         close_timeout_ns: int = DEFAULT_CLOSE_TIMEOUT_NS,
         max_buffered_frames: int = DEFAULT_MAX_BUFFERED_FRAMES,
     ) -> None:
-        for name, value in (
-            ("silence_timeout_ns", silence_timeout_ns),
+        bounds = [
+            ("ping_interval_ns", ping_interval_ns),
+            ("ping_timeout_ns", ping_timeout_ns),
             ("connect_timeout_ns", connect_timeout_ns),
             ("send_timeout_ns", send_timeout_ns),
             ("close_timeout_ns", close_timeout_ns),
             ("max_buffered_frames", max_buffered_frames),
-        ):
+        ]
+        if silence_timeout_ns is not None:
+            bounds.append(("silence_timeout_ns", silence_timeout_ns))
+        for name, value in bounds:
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
         self.conn_id = conn_id
@@ -289,6 +312,8 @@ class WsSession:
         self._signer = signer
         self._clock = clock
         self._silence_timeout_ns = silence_timeout_ns
+        self._ping_interval_ns = ping_interval_ns
+        self._ping_timeout_ns = ping_timeout_ns
         self._connect_timeout_ns = connect_timeout_ns
         self._send_timeout_ns = send_timeout_ns
         self._close_timeout_ns = close_timeout_ns
@@ -340,9 +365,16 @@ class WsSession:
             self._connection = await ws_connect(
                 self._url,
                 additional_headers=headers,
-                # The server drives the heartbeat and the library answers its pings;
-                # a second, client-driven keepalive would only duplicate that.
-                ping_interval=None,
+                # The keepalive as websockets 17.1 implements it (asyncio/connection.py,
+                # Connection.keepalive): connect() starts it after the handshake; every
+                # ping_interval it pings and waits ping_timeout for the pong; on a miss it
+                # calls protocol.fail(1011, "keepalive ping timeout"). A failing client
+                # waits close_timeout for the peer to drop TCP, then aborts, and
+                # connection_lost() makes the pending recv() raise ConnectionClosedError,
+                # which the reader reports as WsClosedError. A dead peer is therefore
+                # detected within ping_interval + ping_timeout + close_timeout.
+                ping_interval=_seconds(self._ping_interval_ns),
+                ping_timeout=_seconds(self._ping_timeout_ns),
                 open_timeout=_seconds(self._connect_timeout_ns),
                 close_timeout=_seconds(self._close_timeout_ns),
                 max_queue=_SOCKET_QUEUE_FRAMES,
@@ -411,15 +443,16 @@ class WsSession:
             Each inbound frame, undecoded.
 
         Raises:
-            WsClosedError: If the peer closed the connection, the connection failed, or
-                nothing arrived within the silence timeout.
+            WsClosedError: If the peer closed the connection, a keepalive pong was
+                missed, the connection failed, or nothing arrived within the silence
+                timeout.
             RuntimeError: If :meth:`connect` has not been called.
         """
         if not self._started:
             raise RuntimeError(f"session {self.conn_id} is not connected")
         while not self._drained:
             # Bounded by construction: the reader queues the sentinel on every exit
-            # path, and it declares silence within the silence timeout.
+            # path, and the keepalive ends a connection whose peer stops answering.
             item = await self._queue.get()
             if isinstance(item, _EndOfStream):
                 self._drained = True
@@ -463,27 +496,10 @@ class WsSession:
         return self._connection
 
     async def _read_loop(self, connection: ClientConnection) -> None:
-        """Drain the socket into the bounded buffer until it closes or goes silent."""
-        # Each poll cancels the pending ``recv``. That is safe: ``websockets`` restores
-        # its assembler state on cancellation, so no frame is consumed and lost. The
-        # behavior is not part of the library's documented contract, so
-        # ``test_no_frame_is_lost_when_polls_cancel_recv`` pins it and will fail loudly
-        # if an upgrade changes it.
-        poll_s = _seconds(min(self._silence_timeout_ns, _MAX_POLL_NS))
+        """Drain the socket into the bounded buffer until it closes, fails, or goes silent."""
         try:
             while True:
-                try:
-                    async with asyncio.timeout(poll_s):
-                        payload = await connection.recv(decode=False)
-                except TimeoutError:
-                    silent_ns = int(self._clock.mono_ns()) - self._last_frame_ns
-                    if silent_ns >= self._silence_timeout_ns:
-                        self._failure = _closed(
-                            f"connection {self.conn_id} silent for {silent_ns} ns, over the "
-                            f"{self._silence_timeout_ns} ns limit"
-                        )
-                        return
-                    continue
+                payload = await self._receive(connection)
                 self._last_frame_ns = int(self._clock.mono_ns())
                 self._offer(
                     RawFrame(
@@ -492,8 +508,10 @@ class WsSession:
                         recv_wall_ns=self._clock.wall_ns(),
                     )
                 )
+        except WsClosedError as exc:
+            self._failure = exc
         except ConnectionClosed as exc:
-            self._failure = _closed(f"connection {self.conn_id} closed by peer", exc)
+            self._failure = _closed(_close_detail(self.conn_id, exc), exc)
         except Exception as exc:
             # A bug in the reader must surface as a dead connection, never as a stream
             # that quietly stops: the recorder reconnects, and no frames go missing
@@ -501,6 +519,36 @@ class WsSession:
             self._failure = _closed(f"connection {self.conn_id} reader failed: {exc!r}", exc)
         finally:
             self._queue.put_nowait(_END_OF_STREAM)
+
+    async def _receive(self, connection: ClientConnection) -> bytes:
+        """Wait for the next frame, declaring silence if a silence timeout is set.
+
+        Raises:
+            ConnectionClosed: If the connection closed, including by a missed keepalive pong.
+            WsClosedError: If nothing arrived within the silence timeout.
+        """
+        silence_timeout_ns = self._silence_timeout_ns
+        if silence_timeout_ns is None:
+            # No deadline of its own: the keepalive fails a connection whose peer stops
+            # answering, which ends this recv, and close() cancels the reader.
+            return await connection.recv(decode=False)
+        # Each poll cancels the pending ``recv``. That is safe: ``websockets`` restores
+        # its assembler state on cancellation, so no frame is consumed and lost. The
+        # behavior is not part of the library's documented contract, so
+        # ``test_no_frame_is_lost_when_polls_cancel_recv`` pins it and will fail loudly
+        # if an upgrade changes it.
+        poll_s = _seconds(min(silence_timeout_ns, _MAX_POLL_NS))
+        while True:
+            try:
+                async with asyncio.timeout(poll_s):
+                    return await connection.recv(decode=False)
+            except TimeoutError:
+                silent_ns = int(self._clock.mono_ns()) - self._last_frame_ns
+                if silent_ns >= silence_timeout_ns:
+                    raise _closed(
+                        f"connection {self.conn_id} silent for {silent_ns} ns, over the "
+                        f"{silence_timeout_ns} ns limit"
+                    ) from None
 
     def _offer(self, frame: RawFrame) -> None:
         """Buffer a frame, dropping the oldest rather than ever blocking the socket."""

@@ -6,7 +6,8 @@ difference for the parts we depend on: it records the handshake headers, answers
 answers ``update_subscription`` with ``ok`` and ``unsubscribe`` with ``unsubscribed``,
 and keeps a per-sid ``seq`` counter. Everything a test needs to provoke is explicit:
 pushing arbitrary frames (malformed ones included), pushing an error frame, skipping a
-sequence number, going silent, and dropping the socket without a close handshake.
+sequence number, going silent, no longer reading the socket (so pings go unanswered), and
+dropping the socket without a close handshake.
 
 Order books are opt-in: a market given a book with :meth:`FakeKalshiWs.set_book` gets a
 sequenced ``orderbook_snapshot`` on its ``orderbook_delta`` sid when it is subscribed,
@@ -77,6 +78,7 @@ class FakeConnection:
         self._seq_by_sid: dict[int, int] = {}
         self._next_sid = 1
         self._silent = False
+        self._reading = True
         request = connection.request
         self._handshake_headers: dict[str, str] = (
             {} if request is None else dict(request.headers.raw_items())
@@ -110,6 +112,24 @@ class FakeConnection:
     def resume(self) -> None:
         """Answer commands again after :meth:`go_silent`."""
         self._silent = False
+
+    def stop_reading(self) -> None:
+        """Stop reading the socket, as a hung peer whose kernel keeps the TCP connection open.
+
+        Nothing the client sends is processed until :meth:`resume_reading`: commands go
+        unhandled and keepalive pings unanswered. ``websockets`` answers every ping it
+        reads and has no switch to withhold pongs, so pausing the transport is the only
+        way to miss one; the library's flow control resumes reading only after pausing it
+        itself, so this pause holds. Pushes still work.
+        """
+        self._reading = False
+        self._connection.transport.pause_reading()
+
+    def resume_reading(self) -> None:
+        """Read the socket again after :meth:`stop_reading`. Idempotent."""
+        if not self._reading:
+            self._reading = True
+            self._connection.transport.resume_reading()
 
     async def push(self, payload: bytes | str) -> None:
         """Send one frame exactly as given, without touching it."""
@@ -402,6 +422,10 @@ class FakeKalshiWs:
         """Close every connection and stop serving. Idempotent."""
         server, self._server = self._server, None
         if server is not None:
+            # A connection that is not reading would never see the closing handshake
+            # and would hold shutdown for the whole close timeout.
+            for connection in self._connections:
+                connection.resume_reading()
             server.close()
             await server.wait_closed()
 

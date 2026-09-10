@@ -27,7 +27,7 @@ from tape.client.ws import (
     encode_command,
 )
 from tape.errors import KalshiTransportError, WsClosedError
-from tape.timeutil import NS_PER_MS, Clock, FrozenClock, SystemClock
+from tape.timeutil import NS_PER_MS, NS_PER_S, Clock, FrozenClock, SystemClock
 from tape.wire import decode_envelope
 from tests.fakes import FakeKalshiWs
 
@@ -279,6 +279,65 @@ async def test_a_still_connection_stays_open_while_the_clock_does_not_move(
         await session.close()
 
 
+async def test_without_a_silence_timeout_an_idle_connection_is_never_declared_silent(
+    signer: Signer, clock: FrozenClock
+) -> None:
+    """The book and lifecycle connections run like this: quiet is healthy (ADR 0019)."""
+    async with FakeKalshiWs() as fake:
+        session = session_for(fake, signer, clock, silence_timeout_ns=None)
+        await session.connect()
+        connection = await fake.wait_for_connection()
+        # Far past the 30-second limit that used to kill idle connections, on the clock the
+        # session stamps frames with.
+        clock.advance(3_600 * NS_PER_S)
+        await asyncio.sleep(0.02)
+        assert session.is_open is True
+        await connection.push_message("trade", {"n": 0}, sid=1, seq=1)
+        (frame,) = await take(session, 1)
+        assert frame.recv_mono_ns == 1_000 + 3_600 * NS_PER_S
+        # The reader waits on the socket with no deadline; close() must still end it.
+        await asyncio.wait_for(session.close(), timeout=1.0)
+        assert await take(session, 1) == []
+
+
+async def test_answered_keepalive_pings_keep_an_idle_connection_open(
+    signer: Signer, clock: FrozenClock
+) -> None:
+    async with FakeKalshiWs() as fake:
+        session = session_for(
+            fake, signer, clock, ping_interval_ns=10 * NS_PER_MS, ping_timeout_ns=50 * NS_PER_MS
+        )
+        await session.connect()
+        connection = await fake.wait_for_connection()
+        await asyncio.sleep(0.15)  # many ping intervals, each answered by the double
+        assert session.is_open is True
+        await connection.push_message("trade", {"n": 0}, sid=1, seq=1)
+        assert len(await take(session, 1)) == 1
+        await session.close()
+
+
+async def test_a_missed_keepalive_pong_closes_the_connection_with_ws_closed(
+    signer: Signer, clock: FrozenClock
+) -> None:
+    async with FakeKalshiWs() as fake:
+        session = session_for(
+            fake,
+            signer,
+            clock,
+            ping_interval_ns=10 * NS_PER_MS,
+            ping_timeout_ns=50 * NS_PER_MS,
+            # A client that fails a connection waits this long for the peer to drop TCP.
+            close_timeout_ns=50 * NS_PER_MS,
+        )
+        await session.connect()
+        connection = await fake.wait_for_connection()
+        connection.stop_reading()
+        with pytest.raises(WsClosedError, match=r"failed by this client.*keepalive ping timeout"):
+            await take(session, 1)
+        assert session.is_open is False
+        await session.close()
+
+
 async def test_slow_consumer_drops_the_oldest_frames(signer: Signer, clock: FrozenClock) -> None:
     async with (
         FakeKalshiWs() as fake,
@@ -349,6 +408,8 @@ async def test_unreachable_endpoint_raises_transport_error(
     "kwargs",
     [
         {"silence_timeout_ns": 0},
+        {"ping_interval_ns": 0},
+        {"ping_timeout_ns": -1},
         {"connect_timeout_ns": -1},
         {"send_timeout_ns": 0},
         {"close_timeout_ns": 0},

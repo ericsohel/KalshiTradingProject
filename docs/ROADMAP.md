@@ -4,6 +4,12 @@ Milestones are ordered by dependency, not by calendar. Each has a definition of 
 that is checked, not asserted. The recorder comes first because its data compounds
 and cannot be recreated.
 
+Work order departs from the numbering where dependencies allow. Once M3's recorder
+is running, the live parts of M5 (the bus, `tape serve` with `/live` and `/markets`)
+and M6 come before M4: they depend only on the recorder, and they make the project
+visible while the tape accumulates. The status view's daily integrity numbers and the
+replay viewer still wait for M4.
+
 | # | Milestone | Deliverable | Definition of done |
 |---|---|---|---|
 | M0 | Design | This document set | Done 2026-09-09. ADRs accepted; open questions listed |

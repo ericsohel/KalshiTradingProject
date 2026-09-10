@@ -600,6 +600,15 @@ Topics: `md.<ticker>` for market data events (msgspec-encoded `Event` union),
 `ctl.lifecycle`, `ctl.gap`, `ctl.audit`, `ctl.heartbeat`. Private events never use the
 `md.` prefix. Transport: ZeroMQ PUB/SUB over `ipc://` (ADR 0008).
 
+Every payload is an envelope `{bus_epoch, bus_seq, event}`: `bus_epoch` is the
+publisher's start time in wall ns and `bus_seq` counts every attempted send from 1, so
+a subscriber detects loss as a gap. Every `bus_refresh_s` (default 10) the recorder
+also publishes, paced across the interval, a refresh image of each book it holds
+(`BookRefresh(ticker, receipt, stale, bids, asks)`), consistent with every message of
+lower `bus_seq`. A subscriber recovers from a gap, a new epoch, or its own start by
+treating each book as unknown until its next refresh image (ADR 0022). Publishing
+never blocks or raises; drops are counted in the recorder's status.
+
 ## 10. `tape.bake` and `tape.store`
 
 ```python

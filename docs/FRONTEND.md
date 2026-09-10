@@ -55,6 +55,10 @@ Integers follow [DATA_FORMATS.md](DATA_FORMATS.md) (`price_e4`, `count_e2`, `ts_
 | `GET /status/days?from=&to=` | per-day integrity numbers |
 | `WS /live` | client sends `{"subscribe": ["TICKER", ...]}` (max 10); server sends `{"t":"snapshot",...}` then `{"t":"delta"|"trade"|"ticker",...}`; on lag `{"t":"resync"}` followed by a fresh snapshot |
 
+A `resync` is followed by the market's snapshot as soon as the API's own book for it
+is known again, which after a bus loss or an API restart takes at most one bus refresh
+interval (ADR 0022).
+
 Errors are `{error: {code, message}}` with appropriate status codes. Every response
 sets `Cache-Control` (`no-store` for live, `public, max-age=3600` for closed windows).
 
@@ -104,7 +108,8 @@ no default exports, no implicit globals. See
 
 ## 9. Delivery order
 
-1. Status view (proves the API, hosting, and CI).
-2. Live view with heatmap and trade bubbles for showcase markets.
+1. Live view with heatmap and trade bubbles for showcase markets, served locally
+   first (proves the bus, the API's live path, and the renderer).
+2. Status view: live counters first, daily integrity numbers once bake exists.
 3. Replay view with scrubber and annotations.
 4. Depth ladder, hover inspection, keyboard controls, polish.

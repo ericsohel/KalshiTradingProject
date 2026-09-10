@@ -31,3 +31,4 @@ choose and why, you have not made a decision; you have made a default.
 | [0019](0019-transport-liveness.md) | Liveness is measured at the transport, not by data traffic | accepted |
 | [0020](0020-one-subscription-per-connection.md) | One market set per channel per connection | accepted |
 | [0021](0021-audit-window-consistency.md) | An audit passes when the snapshot matches any book state in its request window | accepted |
+| [0022](0022-sequenced-bus-with-book-refresh.md) | Live consumers recover from a sequenced bus and periodic book refreshes | accepted |

@@ -217,7 +217,9 @@ with `apply_snapshot`, `apply_delta`, `best_bid`, `best_ask`, `depth(n)`, and
 The API holds one ZeroMQ SUB socket and a map from ticker to connected clients. Each
 client may subscribe to at most 10 tickers. Outbound queues are bounded; a client
 that falls behind by more than a configured number of messages receives a
-`resync` message and a fresh snapshot rather than a backlog. The API is read-only,
+`resync` message and a fresh snapshot rather than a backlog. The API's own books
+recover from bus loss, and from starting after the recorder, through the sequenced
+envelope and periodic refresh images (ADR 0022). The API is read-only,
 unauthenticated, rate-limited per IP, and exposes no account data.
 
 ### 7.4 Engine (design only in v1)

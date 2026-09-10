@@ -5,6 +5,7 @@
 *.pem
 *.key
 secrets/
+tape.toml
 
 # Recorded data. The tape is private by design (see docs/adr/0007).
 data/

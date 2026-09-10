@@ -1,0 +1,38 @@
+# Example configuration for `tape`. Copy it to tape.toml (ignored by git), set key_id,
+# then run `uv run tape config check --config tape.toml` before `tape record`.
+#
+# Every setting can be overridden from the environment as TAPE_<SECTION>__<KEY>, for
+# example TAPE_RECORDER__GROUP_SIZE=200 or TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES=A,B.
+# Relative paths resolve against this file's directory; a leading ~ is your home.
+# Secrets are never values here, only paths (docs/OPERATIONS.md 2).
+
+[kalshi]
+# "prod" or "demo". The REST and WebSocket endpoints follow from it and cannot be set
+# directly. Demo and production keys are separate: use the key made for this env.
+env = "prod"
+key_id = "REPLACE-WITH-YOUR-READ-KEY-ID"
+# The PEM Kalshi gave you, readable by you alone: chmod 600.
+private_key_path = "~/.config/tape/keys/prod-read.pem"
+rest_timeout_s = 10
+ws_silence_timeout_s = 30
+
+[recorder]
+data_dir = "data"
+# One live-only ticker connection + one control connection + book_connections.
+max_connections = 16
+book_connections = 2
+group_size = 500
+# Whole minutes that divide an hour.
+keyframe_interval_s = 300
+audit_interval_s = 300
+audit_sample = 200
+writer_queue_max = 200000
+universe_refresh_s = 300
+status_interval_s = 60
+
+[recorder.universe]
+# A fixed-point string, never a float.
+min_volume_24h = "1000.00"
+max_l2_markets = 2000
+showcase_series = ["KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDECISION"]
+exclude_mve = true

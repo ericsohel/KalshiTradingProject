@@ -98,7 +98,10 @@ is not merged, regardless of whether it works.
    - [ ] Logs have context and no secrets.
    - [ ] Docs, CHANGELOG, and configuration reference are updated.
 4. **ADRs.** Any decision that would be expensive to reverse (format, dependency,
-   protocol, hosting) gets an ADR in `docs/adr/` before the code lands.
+   protocol, hosting) gets an ADR in `docs/adr/` before the code lands. Every ADR
+   lists the alternatives considered, the cost of the chosen option, and the
+   conditions that would reverse it. A milestone does not start until its
+   decisions are recorded this way.
 5. **Versioning.** Semantic versioning for the package; the tape and Parquet format
    versions are independent integers recorded in headers and manifests.
 6. **Dependencies.** Pinned by `uv.lock`; reviewed monthly; each direct dependency

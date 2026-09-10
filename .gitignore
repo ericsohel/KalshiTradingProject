@@ -35,3 +35,6 @@ web/.vite/
 .idea/
 .vscode/
 .DS_Store
+
+# Local, non-public notes (never committed)
+private/

@@ -41,6 +41,14 @@ from tape.recorder.supervisor import (
     SupervisorConfig,
     backoff_delay_s,
 )
+from tape.recorder.tap import (
+    FAULT_OVERFLOW,
+    FAULT_STALE,
+    BookChange,
+    BookImage,
+    LiveBookTap,
+    TapWindow,
+)
 from tape.recorder.writer import SegmentSink
 from tape.segment import Record, RecordKind, SegmentHeader, SegmentReader, SubscriptionInfo
 from tape.timeutil import NS_PER_MS, NS_PER_S, FrozenClock
@@ -310,6 +318,100 @@ async def test_snapshot_then_deltas_yield_the_correct_book(
             BookDelta,
         ]
         assert connection.commands[0]["params"]["use_yes_price"] is use_yes_price
+
+
+async def test_a_tap_sees_the_book_as_it_opened_and_every_change_applied_after(
+    tmp_path: Path,
+) -> None:
+    async with FakeKalshiWs() as fake, recording(fake.url, tmp_path) as harness:
+        set_books(fake)
+        await harness.supervisor.set_group(GROUP)
+        harness.start()
+        connection = await subscribed(fake, harness)
+        await until(lambda: harness.fresh("KXA-1", "KXA-2"))
+        assert harness.supervisor.tapped_tickers == frozenset()
+
+        tap = harness.supervisor.open_tap(["KXA-1", "KXA-9"], max_events=10)
+        assert harness.supervisor.tapped_tickers == {"KXA-1", "KXA-9"}
+        for ticker, price in (("KXA-2", "0.2000"), ("KXA-1", "0.4000")):
+            await connection.push_sequenced(
+                "orderbook_delta", delta(ticker, price, "2.50"), sid=BOOK_SID
+            )
+        await connection.push_sequenced(
+            "orderbook_snapshot",
+            {"market_ticker": "KXA-1", "yes_dollars_fp": [["0.4500", "3.00"]]},
+            sid=BOOK_SID,
+        )
+        await until(lambda: harness.count(BookDelta) == 2 and harness.count(BookSnapshot) == 3)
+        windows = tap.close()
+        assert tap.close() is windows
+        assert harness.supervisor.tapped_tickers == frozenset()
+
+    applied = [
+        event
+        for event in harness.events
+        if isinstance(event, BookDelta | BookSnapshot) and event.ticker == "KXA-1"
+    ]
+    assert windows["KXA-1"] == TapWindow(
+        ticker="KXA-1",
+        start=BookImage(bids=(level(4000, 1000),), asks=(level(6000, 500),)),
+        events=tuple(applied[1:]),  # everything after the initial snapshot
+        fault=None,
+    )
+    assert windows["KXA-9"] == TapWindow.absent("KXA-9")
+
+
+async def test_with_no_tap_open_an_applied_change_reaches_no_tap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: list[BookChange] = []
+
+    def spy(self: LiveBookTap, change: BookChange, *, was_stale: bool) -> None:
+        recorded.append(change)
+
+    monkeypatch.setattr(LiveBookTap, "record", spy)
+    async with FakeKalshiWs() as fake, recording(fake.url, tmp_path) as harness:
+        set_books(fake)
+        await harness.supervisor.set_group(GROUP)
+        harness.start()
+        connection = await subscribed(fake, harness)
+        await until(lambda: harness.fresh("KXA-1", "KXA-2"))
+        harness.supervisor.open_tap(["KXA-1"], max_events=10).close()  # released at once
+        await connection.push_sequenced(
+            "orderbook_delta", delta("KXA-1", "0.4000", "1.00"), sid=BOOK_SID
+        )
+        await until(lambda: harness.count(BookDelta) == 1)
+        assert harness.supervisor.tapped_tickers == frozenset()
+    assert recorded == []
+
+
+async def test_a_gap_inside_a_tap_faults_its_window_though_the_book_is_resnapshotted(
+    tmp_path: Path,
+) -> None:
+    async with FakeKalshiWs() as fake, recording(fake.url, tmp_path) as harness:
+        set_books(fake)
+        await harness.supervisor.set_group(GROUP)
+        harness.start()
+        connection = await subscribed(fake, harness)
+        await until(lambda: harness.fresh("KXA-1", "KXA-2"))
+
+        tap = harness.supervisor.open_tap(["KXA-1", "KXA-2"], max_events=1)
+        for _ in range(2):
+            await connection.push_sequenced(
+                "orderbook_delta", delta("KXA-2", "0.2000", "1.00"), sid=BOOK_SID
+            )
+        await until(lambda: harness.count(BookDelta) == 2)
+        connection.skip_seq(BOOK_SID)
+        await connection.push_sequenced(
+            "orderbook_delta", delta("KXA-1", "0.4000", "1.00"), sid=BOOK_SID
+        )
+        await until(lambda: harness.count(BookSnapshot) == 4 and harness.fresh("KXA-1", "KXA-2"))
+        windows = tap.close()
+
+    assert harness.supervisor.stats.gaps == 1
+    assert (windows["KXA-1"].fault, windows["KXA-1"].events) == (FAULT_STALE, ())
+    # The first fault is kept: KXA-2 overflowed before the gap staled it.
+    assert (windows["KXA-2"].fault, len(windows["KXA-2"].events)) == (FAULT_OVERFLOW, 1)
 
 
 async def test_a_live_only_connection_writes_nothing_but_publishes_everything(

@@ -112,6 +112,11 @@ def test_only_identity_and_paths_are_required_and_everything_else_has_a_default(
     )
     assert (recorder.keyframe_interval_s, recorder.audit_interval_s) == (300, 300)
     assert (recorder.audit_sample, recorder.writer_queue_max) == (200, 200_000)
+    assert (recorder.audit_lead_ms, recorder.audit_settle_ms, recorder.audit_tap_max_events) == (
+        250,
+        750,
+        5000,
+    )
     assert (recorder.universe_refresh_s, recorder.status_interval_s) == (300, 60)
     assert recorder.universe.policy() == UniversePolicy(
         min_volume_24h=CountE2(100_000),
@@ -195,6 +200,9 @@ def test_environment_overrides_replace_and_add_values(
             "TAPE_KALSHI__WS_SILENCE_TIMEOUT_S": "90",
             "TAPE_RECORDER__GROUP_SIZE": "200",
             "TAPE_RECORDER__BOOK_CONNECTIONS": "10",
+            "TAPE_RECORDER__AUDIT_LEAD_MS": "5000",
+            "TAPE_RECORDER__AUDIT_SETTLE_MS": "1",
+            "TAPE_RECORDER__AUDIT_TAP_MAX_EVENTS": "50000",
             "TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES": "KXA, KXB,",
             "TAPE_RECORDER__UNIVERSE__EXCLUDE_MVE": "false",
             "TAPE_RECORDER__UNIVERSE__MIN_VOLUME_24H": "5.00",
@@ -207,6 +215,12 @@ def test_environment_overrides_replace_and_add_values(
     assert (settings.kalshi.ws_ping_interval_s, settings.kalshi.ws_ping_timeout_s) == (5, 15)
     assert settings.kalshi.ws_silence_timeout_s == 90
     assert (settings.recorder.group_size, settings.recorder.book_connections) == (200, 10)
+    recorder = settings.recorder
+    assert (recorder.audit_lead_ms, recorder.audit_settle_ms, recorder.audit_tap_max_events) == (
+        5000,
+        1,
+        50000,
+    )
     assert settings.recorder.universe == UniverseSettings(
         min_volume_24h="5.00", showcase_series=("KXA", "KXB"), exclude_mve=False
     )
@@ -224,6 +238,11 @@ def test_environment_overrides_replace_and_add_values(
             {"TAPE_KALSHI__WS_PING_TIMEOUT_S": "61"},
             r"<= 60 - at `\$\.kalshi\.ws_ping_timeout_s` \(environment overrides: "
             r"TAPE_KALSHI__WS_PING_TIMEOUT_S\)",
+        ),
+        (
+            {"TAPE_RECORDER__AUDIT_TAP_MAX_EVENTS": "50001"},
+            r"<= 50000 - at `\$\.recorder\.audit_tap_max_events` \(environment overrides: "
+            r"TAPE_RECORDER__AUDIT_TAP_MAX_EVENTS\)",
         ),
         (
             {"TAPE_RECORDER__GROUP_SIZE": "501"},
@@ -271,6 +290,12 @@ def test_an_override_into_a_value_that_is_not_a_table_is_refused(tmp_path: Path)
         (("recorder", "keyframe_interval_s"), 0, r"at `\$\.recorder\.keyframe_interval_s`"),
         (("recorder", "audit_interval_s"), 0, r"at `\$\.recorder\.audit_interval_s`"),
         (("recorder", "audit_sample"), 0, r"at `\$\.recorder\.audit_sample`"),
+        (("recorder", "audit_lead_ms"), 0, r">= 1 - at `\$\.recorder\.audit_lead_ms`"),
+        (("recorder", "audit_lead_ms"), 5001, r"<= 5000 - at `\$\.recorder\.audit_lead_ms`"),
+        (("recorder", "audit_settle_ms"), 0, r">= 1 - at `\$\.recorder\.audit_settle_ms`"),
+        (("recorder", "audit_settle_ms"), 5001, r"<= 5000 - at `\$\.recorder\.audit_settle_ms`"),
+        (("recorder", "audit_tap_max_events"), 0, r">= 1 - at `\$\.recorder\.audit_tap_max"),
+        (("recorder", "audit_tap_max_events"), 50001, r"<= 50000 - at `\$\.recorder\.audit_tap"),
         (("recorder", "writer_queue_max"), 0, r"at `\$\.recorder\.writer_queue_max`"),
         (("recorder", "universe_refresh_s"), 0, r"at `\$\.recorder\.universe_refresh_s`"),
         (("recorder", "status_interval_s"), 0, r"at `\$\.recorder\.status_interval_s`"),

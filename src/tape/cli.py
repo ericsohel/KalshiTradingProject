@@ -22,7 +22,7 @@ import secrets
 import signal
 import socket
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
@@ -39,8 +39,9 @@ from tape.config import Settings, load_settings, redacted
 from tape.errors import ConfigError
 from tape.recorder.auditor import Auditor
 from tape.recorder.recorder import Recorder, RecorderConfig
+from tape.recorder.tap import BookTap
 from tape.recorder.writer import HeaderFactory, SegmentSink
-from tape.timeutil import NS_PER_S, Clock, SystemClock
+from tape.timeutil import NS_PER_MS, NS_PER_S, Clock, SystemClock
 
 __all__ = [
     "LOG_FORMATS",
@@ -251,8 +252,20 @@ def build_recorder(
     def sink_for(ticker: str) -> SegmentSink | None:
         return recorder.sink_for(ticker)
 
+    def open_tap(tickers: Collection[str], *, max_events: int) -> BookTap:
+        return recorder.open_book_tap(tickers, max_events=max_events)
+
     auditor = Auditor(
-        rest, books, clock, sink_for=sink_for, sample_size=settings.recorder.audit_sample
+        rest,
+        books,
+        clock,
+        sink_for=sink_for,
+        open_tap=open_tap,
+        sample_size=settings.recorder.audit_sample,
+        lead_ns=settings.recorder.audit_lead_ms * NS_PER_MS,
+        settle_ns=settings.recorder.audit_settle_ms * NS_PER_MS,
+        tap_max_events=settings.recorder.audit_tap_max_events,
+        window_sleep=asyncio.sleep,
     )
     recorder = Recorder(
         recorder_config(settings, host=host),

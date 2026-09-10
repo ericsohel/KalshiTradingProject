@@ -20,7 +20,7 @@ from tape.client.ratelimit import Bucket, BucketLimits
 from tape.client.rest import KalshiRest
 from tape.client.ws import WsSession
 from tape.errors import KalshiHttpError
-from tape.events import Level, Side
+from tape.events import BookDelta, Level, Side
 from tape.fixedpoint import CountE2, PriceE4
 from tape.recorder.planner import Group
 from tape.recorder.recorder import (
@@ -36,6 +36,7 @@ from tape.recorder.recorder import (
     keyframe_path,
     universe_retry_delay_s,
 )
+from tape.recorder.tap import BookImage, TapWindow
 from tape.recorder.universe import UniversePolicy
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.segment import Record, RecordKind, SegmentHeader, SegmentReader, read_keyframe
@@ -137,6 +138,9 @@ class FakeRest:
 
     def __init__(self, markets: Sequence[Mapping[str, object]]) -> None:
         self.requests: list[httpx.Request] = []
+        # A path listed here answers only once its event is set, so a test can hold a request
+        # in flight, for example a universe refresh that a shutdown catches mid-listing.
+        self.holds: dict[str, asyncio.Event] = {}
         self.answers: dict[str, list[httpx.Response]] = {
             "/exchange/status": [
                 httpx.Response(200, json={"exchange_active": True, "trading_active": True})
@@ -145,9 +149,13 @@ class FakeRest:
             "/markets": [httpx.Response(200, json={"markets": list(markets), "cursor": ""})],
         }
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        queue = self.answers[request.url.path.removeprefix("/trade-api/v2")]
+        path = request.url.path.removeprefix("/trade-api/v2")
+        hold = self.holds.get(path)
+        if hold is not None:
+            await hold.wait()
+        queue = self.answers[path]
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
 
@@ -498,6 +506,60 @@ async def test_capture_tapes_lifecycle_and_books_keyframes_them_and_never_tapes_
     assert frame_types(records).count("orderbook_delta") == 1
     assert "orderbook_snapshot" in frame_types(records)
     assert harness.sinks[2].put(records[0]) is False  # closed
+
+
+async def test_a_book_tap_spans_the_connections_the_plan_assigns_its_markets_to(
+    tmp_path: Path,
+) -> None:
+    async with FakeKalshiWs() as fake, recording(fake.url, tmp_path) as harness:
+        fake.set_book("KXA-1", yes=[("0.4000", "10.00")])
+        fake.set_book("KXSHOW-1", yes=[("0.2000", "1.00")])
+        harness.start()
+        books = await harness.connection(fake, 2)
+        await harness.subscribed(2, 3)
+        await until(lambda: fresh(harness.recorder.books(), "KXA-1", "KXSHOW-1"))
+        supervisors = harness.recorder.supervisors
+        with pytest.raises(ValueError, match="max_events must be positive"):
+            harness.recorder.open_book_tap(["KXA-1"], max_events=0)
+        assert all(not supervisor.tapped_tickers for supervisor in supervisors.values())
+
+        tap = harness.recorder.open_book_tap(
+            ["KXSHOW-1", "KXA-1", "KXLOW-1", "KXA-1"], max_events=5
+        )
+        assert (supervisors[2].tapped_tickers, supervisors[3].tapped_tickers) == (
+            frozenset({"KXA-1"}),
+            frozenset({"KXSHOW-1"}),
+        )
+        await books.push_sequenced(
+            "orderbook_delta",
+            {
+                "market_ticker": "KXA-1",
+                "price_dollars": "0.4100",
+                "delta_fp": "1.00",
+                "side": "yes",
+                "ts_ms": 1_789_000_000_000,
+            },
+            sid=1,
+        )
+        await until(
+            lambda: (
+                harness.recorder.books()["KXA-1"].best_bid() == Level(PriceE4(4100), CountE2(100))
+            )
+        )
+        windows = tap.close()
+        assert tap.close() is windows
+        assert all(not supervisor.tapped_tickers for supervisor in supervisors.values())
+
+    assert sorted(windows) == ["KXA-1", "KXLOW-1", "KXSHOW-1"]
+    tapped = windows["KXA-1"]
+    assert tapped.start == BookImage(bids=(Level(PriceE4(4000), CountE2(1000)),), asks=())
+    assert [(type(e), e.price) for e in tapped.events if isinstance(e, BookDelta)] == [
+        (BookDelta, PriceE4(4100))
+    ]
+    assert (len(tapped.events), tapped.fault) == (1, None)
+    assert (windows["KXSHOW-1"].events, windows["KXSHOW-1"].fault) == ((), None)
+    # A market the plan does not place has no book anywhere.
+    assert windows["KXLOW-1"] == TapWindow.absent("KXLOW-1")
 
 
 class FailingTask:
@@ -856,3 +918,29 @@ def test_a_recorder_config_that_cannot_work_is_refused(
     with pytest.raises(ValueError, match=message):
         RecorderConfig(**(fields | overrides))
     check_connection_budget(book_connections=14, max_connections=16)
+
+
+async def test_stop_does_not_wait_for_a_universe_refresh_in_flight(tmp_path: Path) -> None:
+    """A shutdown cancels a refresh caught mid-listing instead of waiting it out.
+
+    A production listing runs to a hundred-odd pages. Before the fix the refresh ran to
+    completion during shutdown; held open here, it would last the whole 30-second
+    shutdown deadline, so a prompt stop proves the refresh was cancelled.
+    """
+
+    def listings() -> int:
+        return sum(1 for request in harness.rest.requests if request.url.path.endswith("/markets"))
+
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, shutdown_timeout_s=30) as harness,
+    ):
+        harness.start()
+        await harness.connection(fake, 2)
+        await until(lambda: harness.recorder.universe is not None)
+        await harness.parked()
+        harness.rest.holds["/markets"] = asyncio.Event()
+        before = listings()
+        harness.time.advance(300)
+        await until(lambda: listings() > before)
+        await asyncio.wait_for(harness.recorder.stop(), timeout=5.0)

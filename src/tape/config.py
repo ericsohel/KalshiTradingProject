@@ -75,6 +75,17 @@ _MAX_KEEPALIVE_S: Final = 60
 their sum, so beyond a minute each a silently dead connection loses more than the
 reconnect, capped at 30 seconds of backoff, that the long wait would avoid."""
 
+_MAX_AUDIT_ALLOWANCE_MS: Final = 5_000
+"""Ceiling on the audit window's lead and settle allowances (ADR 0021). They absorb the
+milliseconds by which the live feed leads or trails a REST snapshot; allowances of seconds
+would let a busy market's snapshot match states far from the reply, so a consistent audit
+would say little, and every batch would hold its round open that long."""
+
+_MAX_AUDIT_TAP_EVENTS: Final = 50_000
+"""Ceiling on the book changes an audit tap holds per market. At about 160 bytes a change, a
+full batch of 100 markets at the cap holds under a gigabyte; the widest window the allowances
+permit, about eleven seconds, fills under 8,000 at the busiest rate observed (738 a second)."""
+
 _INTEGER: Final = re.compile(r"[+-]?[0-9]+")
 _TRUE: Final = frozenset({"true", "1", "yes"})
 _FALSE: Final = frozenset({"false", "0", "no"})
@@ -84,6 +95,8 @@ PositiveInt = Annotated[int, msgspec.Meta(gt=0)]
 NonNegativeInt = Annotated[int, msgspec.Meta(ge=0)]
 Word = Annotated[str, msgspec.Meta(pattern=r"^\S+$")]
 KeepaliveSeconds = Annotated[int, msgspec.Meta(ge=1, le=_MAX_KEEPALIVE_S)]
+AuditAllowanceMs = Annotated[int, msgspec.Meta(ge=1, le=_MAX_AUDIT_ALLOWANCE_MS)]
+AuditTapEvents = Annotated[int, msgspec.Meta(ge=1, le=_MAX_AUDIT_TAP_EVENTS)]
 
 
 class KalshiEndpoints(msgspec.Struct, frozen=True, kw_only=True):
@@ -201,6 +214,11 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
         keyframe_interval_s: Seconds between keyframes; whole minutes dividing an hour.
         audit_interval_s: Seconds between REST audits.
         audit_sample: Books sampled per audit.
+        audit_lead_ms: How long an audit window is open before its REST request is sent
+            (ADR 0021); 1 to 5000.
+        audit_settle_ms: How long an audit window stays open after the REST reply; 1 to 5000.
+        audit_tap_max_events: Most book changes an audit window holds per market before that
+            audit is undecidable; 1 to 50000.
         writer_queue_max: Records one segment sink holds before refusing more.
         universe_refresh_s: Seconds between market listings and replans.
         status_interval_s: Seconds between status log lines.
@@ -219,6 +237,9 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
     keyframe_interval_s: PositiveInt = 300
     audit_interval_s: PositiveInt = 300
     audit_sample: PositiveInt = 200
+    audit_lead_ms: AuditAllowanceMs = 250
+    audit_settle_ms: AuditAllowanceMs = 750
+    audit_tap_max_events: AuditTapEvents = 5000
     writer_queue_max: PositiveInt = DEFAULT_MAX_QUEUED_RECORDS
     universe_refresh_s: PositiveInt = 300
     status_interval_s: PositiveInt = 60

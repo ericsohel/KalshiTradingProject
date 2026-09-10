@@ -34,6 +34,13 @@ group_size = 500
 keyframe_interval_s = 300
 audit_interval_s = 300
 audit_sample = 200
+# An audit passes when the REST book matches the local book at any state in a window that
+# opens audit_lead_ms before the request and closes audit_settle_ms after the reply (ADR 0021);
+# each is 1 to 5000. A market with more than audit_tap_max_events (at most 50000) book changes
+# in its window is counted undecidable.
+audit_lead_ms = 250
+audit_settle_ms = 750
+audit_tap_max_events = 5000
 writer_queue_max = 200000
 universe_refresh_s = 300
 status_interval_s = 60

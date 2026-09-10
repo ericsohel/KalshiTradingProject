@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -24,7 +26,9 @@ from tape.cli import (
 )
 from tape.config import ENDPOINTS, load_settings
 from tape.errors import ConfigError
-from tape.timeutil import NS_PER_S, FrozenClock
+from tape.recorder.auditor import Auditor
+from tape.recorder.tap import CompositeBookTap, TapWindow
+from tape.timeutil import NS_PER_MS, NS_PER_S, FrozenClock
 
 
 def write_settings(tmp_path: Path, *, group_size: int = 500, pem: bytes | None = None) -> Path:
@@ -215,6 +219,50 @@ async def test_build_recorder_gives_every_session_the_keepalive_and_the_chosen_s
         {"url": "wss://x", "conn_id": 0, "silence_timeout_ns": 60 * NS_PER_S, **keepalive},
         {"url": "wss://x", "conn_id": 2, "silence_timeout_ns": None, **keepalive},
     ]
+
+
+async def test_build_recorder_gives_the_auditor_its_window_and_the_recorder_s_book_taps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built: list[dict[str, Any]] = []  # Any: the auditor's keyword arguments, of several types
+
+    def capturing_auditor(*args: Any, **kwargs: Any) -> Auditor:  # Any: passed through as given
+        built.append(kwargs)
+        return Auditor(*args, **kwargs)
+
+    monkeypatch.setattr("tape.cli.Auditor", capturing_auditor)
+    settings = load_settings(
+        write_settings(tmp_path),
+        environ={
+            "TAPE_RECORDER__AUDIT_LEAD_MS": "40",
+            "TAPE_RECORDER__AUDIT_SETTLE_MS": "60",
+            "TAPE_RECORDER__AUDIT_TAP_MAX_EVENTS": "7",
+        },
+    )
+    async with httpx.AsyncClient() as http:
+        recorder = build_recorder(settings, http=http, clock=FrozenClock(), host="box")
+        (arguments,) = built
+        assert (arguments["lead_ns"], arguments["settle_ns"], arguments["tap_max_events"]) == (
+            40 * NS_PER_MS,
+            60 * NS_PER_MS,
+            7,
+        )
+        assert arguments["window_sleep"] is asyncio.sleep
+        # Before any universe is planned, a market has no book to observe.
+        assert dict(arguments["open_tap"](["KXA-1"], max_events=7).close()) == {
+            "KXA-1": TapWindow.absent("KXA-1")
+        }
+
+        opened: list[tuple[list[str], int]] = []
+
+        def open_book_tap(tickers: Collection[str], *, max_events: int) -> CompositeBookTap:
+            opened.append((list(tickers), max_events))
+            return CompositeBookTap([])
+
+        monkeypatch.setattr(recorder, "open_book_tap", open_book_tap)
+        arguments["open_tap"](["KXA-2"], max_events=3)
+        assert opened == [(["KXA-2"], 3)]
+        await recorder.stop()
 
 
 async def test_build_recorder_refuses_a_key_that_is_not_rsa(tmp_path: Path) -> None:

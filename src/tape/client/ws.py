@@ -60,7 +60,9 @@ WS_SIGN_PATH: Final = "/trade-api/ws/v2"
 
 DEFAULT_CONNECT_TIMEOUT_NS: Final = 10 * NS_PER_S
 DEFAULT_SEND_TIMEOUT_NS: Final = 10 * NS_PER_S
-DEFAULT_CLOSE_TIMEOUT_NS: Final = 5 * NS_PER_S
+DEFAULT_CLOSE_TIMEOUT_NS: Final = 2 * NS_PER_S
+# A recorder loses nothing by waiting less for the peer's close frame: frames after a close
+# is initiated are not recorded. A long wait only delays shutdown and dead-peer detection.
 DEFAULT_PING_INTERVAL_NS: Final = 10 * NS_PER_S
 """Client keepalive ping interval, matching the server's own heartbeat (ADR 0019)."""
 DEFAULT_PING_TIMEOUT_NS: Final = 20 * NS_PER_S

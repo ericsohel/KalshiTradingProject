@@ -6,7 +6,8 @@ limiter from the account's tier; then it runs one ``ConnectionSupervisor`` per W
 connection, lists and selects the order-book universe and hands each book connection its
 subscription groups every ``universe_refresh_s`` (sooner, on a capped backoff, while a
 refresh is failing), writes keyframes, logs a status line, tapes a ``clock_jump`` record
-when the host slept, and runs auxiliary periodic tasks such as the auditor. Dependencies
+when the host slept, and runs auxiliary periodic tasks such as the auditor, which reads books,
+sinks, and book taps through it (:meth:`Recorder.open_book_tap`). Dependencies
 arrive fully built, so the orchestration is tested against a fake exchange in virtual time.
 
 Connection layout (ADR 0018): connection 0 is live-only and carries the unfiltered
@@ -33,7 +34,7 @@ import asyncio
 import contextlib
 import functools
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Protocol
@@ -55,6 +56,7 @@ from tape.recorder.supervisor import (
     SupervisorConfig,
     backoff_delay_s,
 )
+from tape.recorder.tap import CompositeBookTap
 from tape.recorder.universe import MarketSummary, UniverseDecision, UniversePolicy, select
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.segment import Record, RecordKind, SegmentHeader, write_keyframe
@@ -559,6 +561,39 @@ class Recorder:
         conn_id = self._conn_of.get(ticker)
         return None if conn_id is None else self._sinks.get(conn_id)
 
+    def open_book_tap(self, tickers: Iterable[str], *, max_events: int) -> CompositeBookTap:
+        """Open one tap over markets on whichever book connections the plan assigns them to.
+
+        Each market is tapped on the connection that :meth:`sink_for` also names, so its audit
+        record lands beside the frames the tap saw. A market the plan does not place has no
+        book to observe and gets an absent window.
+
+        Args:
+            tickers: Markets to observe; duplicates are ignored.
+            max_events: Most book changes held per market.
+
+        Returns:
+            A tap whose :meth:`CompositeBookTap.close` closes every connection's tap.
+
+        Raises:
+            ValueError: If ``max_events`` is not positive; no tap is opened then.
+        """
+        if max_events <= 0:
+            raise ValueError(f"max_events must be positive, got {max_events}")
+        by_conn: dict[int, list[str]] = {}
+        uncovered: list[str] = []
+        for ticker in sorted(set(tickers)):
+            conn_id = self._conn_of.get(ticker)
+            if conn_id is None:
+                uncovered.append(ticker)
+            else:
+                by_conn.setdefault(conn_id, []).append(ticker)
+        taps = [
+            self._supervisors[conn_id].open_tap(group, max_events=max_events)
+            for conn_id, group in sorted(by_conn.items())
+        ]
+        return CompositeBookTap(taps, uncovered=uncovered)
+
     def latest_tickers(self) -> Mapping[str, Ticker]:
         """The latest ``ticker`` value per market from the live-only connection; never taped.
 
@@ -775,8 +810,11 @@ class Recorder:
 
     async def _universe_loop(self) -> None:
         # The wait is set by the refresh before it, so a failure at startup is retried soon.
+        # The refresh itself also races the stop: listing a hundred-odd pages must not hold
+        # up shutdown, and a plan left half applied is harmless when every connection stops.
         while await self._pause(self._universe_wait_s):
-            await self._refresh_universe_or_log()
+            if not await self._until_stopped(self._refresh_universe_or_log):
+                return
 
     async def _keyframe_loop(self) -> None:
         interval_s = self._config.keyframe_interval_s

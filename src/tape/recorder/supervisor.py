@@ -13,7 +13,9 @@ subscription is written into the tape, every book of the connection is marked st
 ``get_snapshot`` names all of the connection's markets. A lost connection is written into
 the tape, every book is marked stale, the segment is rotated, and after a jittered
 exponential backoff the connection is rebuilt and resubscribed from the supervisor's own
-group, because ``sid``s do not survive a connection.
+group, because ``sid``s do not survive a connection. For the auditor, :meth:`open_tap` opens
+a :class:`tape.recorder.tap.LiveBookTap` over some markets; every snapshot and delta applied
+to a tapped market's book is handed to it, and a closed tap is forgotten.
 
 Invariants: per frame the order is sink, envelope, sequence check, everything else, so a
 decoder can never lose a frame; a book is touched only by a frame on an orderbook
@@ -69,6 +71,7 @@ from tape.recorder.planner import (
     diff,
     to_commands,
 )
+from tape.recorder.tap import BookChange, LiveBookTap
 from tape.recorder.writer import SegmentSink
 from tape.segment import Record, RecordKind, SubscriptionInfo
 from tape.timeutil import NS_PER_S, Clock
@@ -324,6 +327,9 @@ class ConnectionSupervisor:
         # Survives reconnects: the desired group and the books it feeds.
         self._desired: Group | None = None
         self._books: dict[str, Book] = {}
+        # Open taps by tapped ticker; empty unless the auditor is inside a window, so an applied
+        # change costs one failed membership check.
+        self._taps: dict[str, list[LiveBookTap]] = {}
         # Rebuilt for every connection, because sids and sequence numbers are connection-scoped.
         self._session: WsSession | None = None
         self._reply_failure: asyncio.Future[WsClosedError] | None = None
@@ -381,6 +387,11 @@ class ConnectionSupervisor:
     def last_errors(self) -> tuple[WsProtocolError, ...]:
         """The most recent error frames, oldest first, at most ``MAX_RECENT_ERRORS``."""
         return tuple(self._last_errors)
+
+    @property
+    def tapped_tickers(self) -> frozenset[str]:
+        """Markets some open tap observes; empty when no tap is open."""
+        return frozenset(self._taps)
 
     @property
     def stats(self) -> SupervisorStats:
@@ -474,6 +485,30 @@ class ConnectionSupervisor:
                 if session is not None:
                     await session.close()
             self._prune_books()
+
+    def open_tap(self, tickers: Iterable[str], *, max_events: int) -> LiveBookTap:
+        """Start observing every change this supervisor applies to some markets' books.
+
+        The tap copies each market's book now and then receives, in order, every snapshot and
+        delta applied to it, until :meth:`LiveBookTap.close` releases it. Opening and closing
+        never await, so no frame is applied between copying a book and watching it.
+
+        Args:
+            tickers: Markets to observe; one with no fresh book gets a ``no_book`` window.
+            max_events: Most changes held per market before its window faults.
+
+        Returns:
+            The open tap.
+
+        Raises:
+            ValueError: If ``max_events`` is not positive.
+        """
+        tap = LiveBookTap(
+            tickers, books=self.books, max_events=max_events, on_close=self._release_tap
+        )
+        for ticker in tap.tickers:
+            self._taps.setdefault(ticker, []).append(tap)
+        return tap
 
     # ---------------------------------------------------------------- connection epochs
 
@@ -788,6 +823,10 @@ class ConnectionSupervisor:
         book = self._book_for(snapshot.sid, snapshot.ticker, create=True)
         if book is None:
             return
+        tapped = snapshot.ticker in self._taps
+        # Read before applying: a snapshot is the only way out of the stale state, so it is
+        # where a tap learns that its book went stale inside the window.
+        was_stale = tapped and book.is_stale()
         try:
             book.apply_snapshot(snapshot.bids, snapshot.asks, ts_ms=snapshot.ts_ms)
         except BookInvariantError as exc:
@@ -795,6 +834,8 @@ class ConnectionSupervisor:
             # the same way forever. The book stays stale until a gap or delta error asks.
             self._book_error(exc, snapshot.sid)
             return
+        if tapped:
+            self._record_in_taps(snapshot, was_stale=was_stale)
         self._emit(snapshot)
 
     async def _on_delta(self, envelope: Envelope, receipt: Receipt) -> None:
@@ -815,6 +856,8 @@ class ConnectionSupervisor:
             await self._request_snapshot(delta.sid, (delta.ticker,))
             return
         if applied:
+            if delta.ticker in self._taps:
+                self._record_in_taps(delta, was_stale=False)
             self._emit(delta)
 
     def _book_for(self, sid: int, ticker: str, *, create: bool) -> Book | None:
@@ -1179,6 +1222,19 @@ class ConnectionSupervisor:
                 "event consumer failed",
                 extra={"conn_id": self._config.conn_id, "error": repr(exc)},
             )
+
+    def _record_in_taps(self, change: BookChange, *, was_stale: bool) -> None:
+        for tap in self._taps.get(change.ticker, ()):
+            tap.record(change, was_stale=was_stale)
+
+    def _release_tap(self, tap: LiveBookTap) -> None:
+        """Stop routing changes to a tap that has closed."""
+        for ticker in tap.tickers:
+            remaining = [open_tap for open_tap in self._taps.get(ticker, ()) if open_tap is not tap]
+            if remaining:
+                self._taps[ticker] = remaining
+            else:
+                self._taps.pop(ticker, None)
 
     def _decode_error(self, exc: Exception, message_type: str | None) -> None:
         self._decode_errors += 1

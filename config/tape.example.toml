@@ -14,7 +14,13 @@ key_id = "REPLACE-WITH-YOUR-READ-KEY-ID"
 # The PEM Kalshi gave you, readable by you alone: chmod 600.
 private_key_path = "~/.config/tape/keys/prod-read.pem"
 rest_timeout_s = 10
-ws_silence_timeout_s = 30
+# Every WebSocket pings every ws_ping_interval_s and is closed when no pong arrives
+# within ws_ping_timeout_s; each is at most 60 (ADR 0019).
+ws_ping_interval_s = 10
+ws_ping_timeout_s = 20
+# Only the live-only ticker connection, which always carries traffic, is also closed
+# after this many seconds without a frame; quiet connections are healthy.
+ws_silence_timeout_s = 60
 
 [recorder]
 data_dir = "data"

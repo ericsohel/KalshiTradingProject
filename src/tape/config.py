@@ -69,6 +69,11 @@ DEFAULT_SHOWCASE_SERIES: Final = ("KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDE
 _PRIVATE_KEY_FORBIDDEN_BITS: Final = stat.S_IRWXG | stat.S_IRWXO
 """A private key readable, writable, or executable by anyone but its owner is refused."""
 
+_MAX_KEEPALIVE_S: Final = 60
+"""Ceiling on the keepalive interval and pong timeout. A dead peer goes unnoticed for up to
+their sum, so beyond a minute each a silently dead connection loses more than the
+reconnect, capped at 30 seconds of backoff, that the long wait would avoid."""
+
 _INTEGER: Final = re.compile(r"[+-]?[0-9]+")
 _TRUE: Final = frozenset({"true", "1", "yes"})
 _FALSE: Final = frozenset({"false", "0", "no"})
@@ -77,6 +82,7 @@ _HOME: Final = "~"
 PositiveInt = Annotated[int, msgspec.Meta(gt=0)]
 NonNegativeInt = Annotated[int, msgspec.Meta(ge=0)]
 Word = Annotated[str, msgspec.Meta(pattern=r"^\S+$")]
+KeepaliveSeconds = Annotated[int, msgspec.Meta(ge=1, le=_MAX_KEEPALIVE_S)]
 
 
 class KalshiEndpoints(msgspec.Struct, frozen=True, kw_only=True):
@@ -114,14 +120,21 @@ class KalshiSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_f
         key_id: API key id shown when the key was created. Not a secret on its own.
         private_key_path: PEM file holding the private key; readable by its owner only.
         rest_timeout_s: Timeout for each REST request.
-        ws_silence_timeout_s: Inbound silence after which a WebSocket is declared dead.
+        ws_ping_interval_s: Seconds between keepalive pings on every WebSocket (ADR 0019).
+        ws_ping_timeout_s: Seconds to wait for a keepalive pong before closing the socket.
+        ws_silence_timeout_s: Seconds without an inbound frame after which the live-only
+            ``ticker`` connection is declared dead. It always carries traffic, so silence
+            there means the subscription stopped; no other connection has this timeout,
+            because a quiet connection is healthy.
     """
 
     env: Env
     key_id: Word
     private_key_path: Path
     rest_timeout_s: PositiveInt = 10
-    ws_silence_timeout_s: PositiveInt = 30
+    ws_ping_interval_s: KeepaliveSeconds = 10
+    ws_ping_timeout_s: KeepaliveSeconds = 20
+    ws_silence_timeout_s: PositiveInt = 60
 
     @property
     def endpoints(self) -> KalshiEndpoints:

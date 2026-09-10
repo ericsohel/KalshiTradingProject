@@ -4,14 +4,17 @@ Responsibility: orchestrate the recorder process (docs/ARCHITECTURE.md 4, 5, and
 of parts tested on their own. At start it reads the exchange status and sizes the rate
 limiter from the account's tier; then it runs one ``ConnectionSupervisor`` per WebSocket
 connection, lists and selects the order-book universe and hands each book connection its
-subscription groups every ``universe_refresh_s``, writes keyframes, logs a status line,
-and runs auxiliary periodic tasks such as the auditor. Dependencies arrive fully built, so
-the orchestration is tested against a fake exchange in virtual time.
+subscription groups every ``universe_refresh_s`` (sooner, on a capped backoff, while a
+refresh is failing), writes keyframes, logs a status line, tapes a ``clock_jump`` record
+when the host slept, and runs auxiliary periodic tasks such as the auditor. Dependencies
+arrive fully built, so the orchestration is tested against a fake exchange in virtual time.
 
 Connection layout (ADR 0018): connection 0 is live-only and carries the unfiltered
 ``ticker`` channel, whose latest value per market is kept in memory and never written;
 connection 1 is taped and carries ``market_lifecycle_v2``; connections 2 onwards are taped
 and carry the planner's ``orderbook_delta`` and ``trade`` groups with ``use_yes_price``.
+Only connection 0, which always carries traffic, has a data-silence timeout; every
+connection relies on the transport keepalive for liveness (ADR 0019).
 
 Invariants: a supervisor, sink, or internal loop that fails ends the run with its
 exception after a full shutdown, never silently; a periodic task that fails is logged and
@@ -44,18 +47,25 @@ from tape.client.ws import WsSession
 from tape.errors import FixedPointError, KalshiError, WireError
 from tape.events import MarketEvent, Ticker
 from tape.recorder.planner import Group, Plan, plan
-from tape.recorder.supervisor import ORDERBOOK_CHANNEL, ConnectionSupervisor, SupervisorConfig
+from tape.recorder.supervisor import (
+    ORDERBOOK_CHANNEL,
+    ConnectionSupervisor,
+    SupervisorConfig,
+    backoff_delay_s,
+)
 from tape.recorder.universe import MarketSummary, UniverseDecision, UniversePolicy, select
 from tape.recorder.writer import HeaderFactory, SegmentSink
-from tape.segment import SegmentHeader, write_keyframe
+from tape.segment import Record, RecordKind, SegmentHeader, write_keyframe
 from tape.timeutil import NS_PER_S, Clock, Ns, wall_ns_to_datetime
 
 __all__ = [
     "BOOK_CHANNELS",
+    "CLOCK_JUMP_THRESHOLD_NS",
     "CONTROL_CONN_ID",
     "DEFAULT_KEYFRAME_WRITE_TIMEOUT_S",
     "DEFAULT_MAX_MARKET_PAGES",
     "DEFAULT_SHUTDOWN_TIMEOUT_S",
+    "DEFAULT_TICKER_SILENCE_TIMEOUT_S",
     "FIRST_BOOK_CONN_ID",
     "LIFECYCLE_CHANNEL",
     "MARKET_PAGE_LIMIT",
@@ -64,6 +74,7 @@ __all__ = [
     "TICKER_CHANNEL",
     "TICKER_CONN_ID",
     "TICKER_RETENTION_NS",
+    "UNIVERSE_RETRY_INITIAL_S",
     "ConnectionStatus",
     "PeriodicTask",
     "Recorder",
@@ -73,7 +84,9 @@ __all__ = [
     "SinkBuilder",
     "check_connection_budget",
     "check_keyframe_interval",
+    "is_clock_jump",
     "keyframe_path",
+    "universe_retry_delay_s",
 ]
 
 TICKER_CONN_ID: Final = 0
@@ -111,6 +124,19 @@ DEFAULT_KEYFRAME_WRITE_TIMEOUT_S: Final = 60
 
 TICKER_RETENTION_NS: Final = 24 * 3_600 * NS_PER_S
 """A market's latest ``ticker`` value is forgotten after a day without an update."""
+
+DEFAULT_TICKER_SILENCE_TIMEOUT_S: Final = 60
+"""Seconds without a frame before the live-only ticker connection is declared dead (ADR 0019)."""
+
+UNIVERSE_RETRY_INITIAL_S: Final = 15
+"""Nominal wait before retrying a failed universe refresh; it doubles up to the interval."""
+
+CLOCK_JUMP_THRESHOLD_NS: Final = 5 * NS_PER_S
+"""Excess of wall over monotonic time between status ticks that counts as a clock jump.
+
+Monotonic clocks stop while macOS and Linux hosts sleep, and wall clocks do not. The margin
+absorbs scheduling delay and NTP slewing, which move the two by milliseconds, not seconds.
+"""
 
 _SECONDS_PER_MINUTE: Final = 60
 _SECONDS_PER_HOUR: Final = 3_600
@@ -158,6 +184,56 @@ def check_keyframe_interval(interval_s: int) -> None:
         )
 
 
+def universe_retry_delay_s(consecutive_failures: int, *, refresh_s: int, jitter: float) -> float:
+    """Return how long to wait before retrying a failed universe refresh.
+
+    The delay is ``min(refresh_s, UNIVERSE_RETRY_INITIAL_S * 2**consecutive_failures)``
+    scaled into its upper half by ``jitter``, so a transient failure costs seconds of book
+    capture rather than a whole refresh interval, and a persistent one never polls the
+    exchange more often than a jittered interval would.
+
+    Args:
+        consecutive_failures: Failed refreshes in a row before this retry, starting at zero.
+        refresh_s: The refresh interval, which caps the nominal delay.
+        jitter: A draw from ``[0, 1)``.
+
+    Returns:
+        Seconds to wait, in ``[nominal / 2, nominal)``.
+
+    Raises:
+        ValueError: If ``consecutive_failures`` is negative, ``refresh_s`` is not positive,
+            or ``jitter`` is outside ``[0, 1)``.
+    """
+    max_ns = refresh_s * NS_PER_S
+    return backoff_delay_s(
+        consecutive_failures,
+        # An interval shorter than the initial delay caps every retry at the interval.
+        initial_ns=min(UNIVERSE_RETRY_INITIAL_S * NS_PER_S, max_ns),
+        max_ns=max_ns,
+        jitter=jitter,
+    )
+
+
+def is_clock_jump(
+    *, wall_ns_delta: int, mono_ns_delta: int, threshold_ns: int = CLOCK_JUMP_THRESHOLD_NS
+) -> bool:
+    """Whether wall time outran monotonic time by more than ``threshold_ns``.
+
+    Between two readings on an awake host both clocks advance alike. When the host sleeps
+    the monotonic clock stops while the wall clock does not, so the excess is how long
+    nothing could be recorded; a forward step of the wall clock looks the same.
+
+    Args:
+        wall_ns_delta: Wall-clock nanoseconds between the two readings.
+        mono_ns_delta: Monotonic nanoseconds between the same two readings.
+        threshold_ns: Excess that counts as a jump.
+
+    Returns:
+        ``True`` if ``wall_ns_delta - mono_ns_delta > threshold_ns``.
+    """
+    return wall_ns_delta - mono_ns_delta > threshold_ns
+
+
 def keyframe_path(root: Path, wall_ns: int, *, interval_s: int) -> Path:
     """Return where a keyframe taken at ``wall_ns`` belongs (docs/DATA_FORMATS.md 5).
 
@@ -194,8 +270,11 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
         book_connections: Connections carrying order-book groups.
         group_size: Most markets per subscription group.
         keyframe_interval_s: Seconds between keyframes.
-        universe_refresh_s: Seconds between market listings.
-        status_interval_s: Seconds between status log lines.
+        universe_refresh_s: Seconds between market listings; a failed listing is retried
+            sooner, see :func:`universe_retry_delay_s`.
+        status_interval_s: Seconds between status log lines and clock-jump checks.
+        ticker_silence_timeout_s: Seconds without a frame before the live-only ticker
+            connection is declared dead; no other connection has a silence timeout.
         max_market_pages: Page cap on one market listing.
         shutdown_timeout_s: Deadline for each shutdown stage.
         keyframe_write_timeout_s: Deadline for writing one keyframe file.
@@ -220,6 +299,7 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_market_pages: int = DEFAULT_MAX_MARKET_PAGES
     shutdown_timeout_s: int = DEFAULT_SHUTDOWN_TIMEOUT_S
     keyframe_write_timeout_s: int = DEFAULT_KEYFRAME_WRITE_TIMEOUT_S
+    ticker_silence_timeout_s: int = DEFAULT_TICKER_SILENCE_TIMEOUT_S
 
     def __post_init__(self) -> None:
         check_connection_budget(
@@ -234,6 +314,7 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
             "max_market_pages",
             "shutdown_timeout_s",
             "keyframe_write_timeout_s",
+            "ticker_silence_timeout_s",
         ):
             value = getattr(self, name)
             if value <= 0:
@@ -283,8 +364,12 @@ class RecorderStatus(msgspec.Struct, frozen=True, kw_only=True):
 class SessionBuilder(Protocol):
     """Builds a new, unconnected WebSocket session; sessions are single-use."""
 
-    def __call__(self, url: str, *, conn_id: int) -> WsSession:
-        """Return a session for ``url`` whose errors name connection ``conn_id``."""
+    def __call__(self, url: str, *, conn_id: int, silence_timeout_ns: int | None) -> WsSession:
+        """Return a session for ``url`` whose errors name connection ``conn_id``.
+
+        ``silence_timeout_ns`` is the data-silence timeout the recorder chose for this
+        connection, ``None`` for none; the session must honor it.
+        """
         ...
 
 
@@ -318,7 +403,7 @@ class Recorder:
         session_builder: Builds a session for one connection attempt.
         sink_builder: Builds the sink of each taped connection.
         sleep: Waits the given seconds; drives every loop and every reconnect backoff.
-        jitter: Returns a draw from ``[0, 1)`` for each reconnect backoff.
+        jitter: Returns a draw from ``[0, 1)`` for each reconnect or universe retry backoff.
         periodic_tasks: Auxiliary work; a failure in one is logged and capture continues.
         logger: Destination for logs; defaults to this module's logger.
     """
@@ -342,12 +427,15 @@ class Recorder:
         self._rest = rest
         self._limiter = limiter
         self._sleep = sleep
+        self._jitter = jitter
         self._periodic = tuple(periodic_tasks)
         self._log = logger if logger is not None else logging.getLogger(__name__)
         self._tickers: dict[str, Ticker] = {}
         self._plan = Plan(groups=())
         self._universe: UniverseDecision | None = None
         self._conn_of: dict[str, int] = {}
+        self._universe_failures = 0
+        self._universe_wait_s: float = config.universe_refresh_s
         self._stop_requested = asyncio.Event()
         self._periodic_stop = asyncio.Event()
         self._finished = asyncio.Event()
@@ -370,7 +458,12 @@ class Recorder:
                 self._sinks[conn_id] = sink
             self._supervisors[conn_id] = ConnectionSupervisor(
                 supervisor_config,
-                session_factory=functools.partial(session_builder, config.ws_url, conn_id=conn_id),
+                session_factory=functools.partial(
+                    session_builder,
+                    config.ws_url,
+                    conn_id=conn_id,
+                    silence_timeout_ns=self._silence_timeout_ns(conn_id),
+                ),
                 clock=clock,
                 sleep=sleep,
                 jitter=jitter,
@@ -537,6 +630,17 @@ class Recorder:
             ),
         ]
 
+    def _silence_timeout_ns(self, conn_id: int) -> int | None:
+        """The data-silence timeout of one connection (ADR 0019).
+
+        Only the unfiltered ticker connection always carries traffic, so only there does
+        silence on a live transport mean a failure. A book connection with no markets yet
+        or a quiet lifecycle channel is healthy, and the keepalive covers a dead peer.
+        """
+        if conn_id == TICKER_CONN_ID:
+            return self._config.ticker_silence_timeout_s * NS_PER_S
+        return None
+
     def _book_conn_ids(self) -> range:
         return range(FIRST_BOOK_CONN_ID, FIRST_BOOK_CONN_ID + self._config.book_connections)
 
@@ -632,7 +736,8 @@ class Recorder:
     # ---------------------------------------------------------------------- loops
 
     async def _universe_loop(self) -> None:
-        while await self._pause(self._config.universe_refresh_s):
+        # The wait is set by the refresh before it, so a failure at startup is retried soon.
+        while await self._pause(self._universe_wait_s):
             await self._refresh_universe_or_log()
 
     async def _keyframe_loop(self) -> None:
@@ -646,13 +751,53 @@ class Recorder:
             await self._write_keyframe(interval_s=interval_s)
 
     async def _status_loop(self) -> None:
+        mono_ns, wall_ns = int(self._clock.mono_ns()), int(self._clock.wall_ns())
         while await self._pause(self._config.status_interval_s):
+            mono_ns, wall_ns = self._note_clock_jump(since_mono_ns=mono_ns, since_wall_ns=wall_ns)
             for conn_id, sink in self._sinks.items():
                 if sink.failure is not None:
                     # Every later record would be refused; stopping loudly lets the process
                     # be restarted instead of recording nothing while it looks healthy.
                     raise RuntimeError(f"segment sink {conn_id} failed") from sink.failure
             self._log.info("recorder status", extra=msgspec.to_builtins(self.status()))
+
+    def _note_clock_jump(self, *, since_mono_ns: int, since_wall_ns: int) -> tuple[int, int]:
+        """Tape a ``clock_jump`` on every taped connection if the host slept since a reading.
+
+        Nothing notices a sleep otherwise: timers run on the monotonic clock, which stops
+        with the host, so the tape would show a gap with no cause. The record is stamped
+        when the jump is noticed, after the gap; its deltas say how long the gap was.
+
+        Args:
+            since_mono_ns: Monotonic reading at the previous check.
+            since_wall_ns: Wall-clock reading at the previous check.
+
+        Returns:
+            The current monotonic and wall-clock readings, the baseline for the next check.
+        """
+        mono_ns, wall_ns = int(self._clock.mono_ns()), int(self._clock.wall_ns())
+        mono_ns_delta, wall_ns_delta = mono_ns - since_mono_ns, wall_ns - since_wall_ns
+        if not is_clock_jump(wall_ns_delta=wall_ns_delta, mono_ns_delta=mono_ns_delta):
+            return mono_ns, wall_ns
+        self._log.warning(
+            "wall clock jumped ahead of the monotonic clock; the host probably slept",
+            extra={"wall_ns_delta": wall_ns_delta, "mono_ns_delta": mono_ns_delta},
+        )
+        payload = msgspec.json.encode(
+            {"event": "clock_jump", "wall_ns_delta": wall_ns_delta, "mono_ns_delta": mono_ns_delta}
+        )
+        for conn_id, sink in self._sinks.items():
+            # A refusal is counted by the sink and reported in the status line.
+            sink.put(
+                Record(
+                    kind=RecordKind.CONNECTION,
+                    conn_id=conn_id,
+                    recv_mono_ns=mono_ns,
+                    recv_wall_ns=wall_ns,
+                    payload=payload,
+                )
+            )
+        return mono_ns, wall_ns
 
     async def _run_periodic(self, task: PeriodicTask, name: str) -> None:
         try:
@@ -699,13 +844,33 @@ class Recorder:
     # --------------------------------------------------------------------- universe
 
     async def _refresh_universe_or_log(self) -> None:
-        """Refresh the universe; an exchange or decoding failure keeps the current plan."""
+        """Refresh the universe and set the wait before the next refresh.
+
+        An exchange or decoding failure keeps the current plan and schedules a retry on a
+        capped, jittered backoff (:func:`universe_retry_delay_s`); a success waits the full
+        interval and resets the backoff.
+        """
         try:
             await self._refresh_universe()
         except (KalshiError, WireError) as exc:
-            self._log.error(
-                "universe refresh failed; keeping the current plan", extra={"error": repr(exc)}
+            retry_in_s = universe_retry_delay_s(
+                self._universe_failures,
+                refresh_s=self._config.universe_refresh_s,
+                jitter=self._jitter(),
             )
+            self._universe_failures += 1
+            self._universe_wait_s = retry_in_s
+            self._log.error(
+                "universe refresh failed; keeping the current plan and retrying",
+                extra={
+                    "error": repr(exc),
+                    "consecutive_failures": self._universe_failures,
+                    "retry_in_s": retry_in_s,
+                },
+            )
+            return
+        self._universe_failures = 0
+        self._universe_wait_s = self._config.universe_refresh_s
 
     async def _refresh_universe(self) -> None:
         """List open markets, select the universe, replan, and hand each connection its groups.

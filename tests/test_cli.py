@@ -24,7 +24,7 @@ from tape.cli import (
 )
 from tape.config import ENDPOINTS, load_settings
 from tape.errors import ConfigError
-from tape.timeutil import FrozenClock
+from tape.timeutil import NS_PER_S, FrozenClock
 
 
 def write_settings(tmp_path: Path, *, group_size: int = 500, pem: bytes | None = None) -> Path:
@@ -159,6 +159,7 @@ async def test_build_recorder_wires_the_environment_and_the_connection_layout(
         assert recorder.config == recorder_config(settings, host="box")
         assert recorder.config.ws_url == ENDPOINTS["demo"].ws_url
         assert recorder.config.universe == settings.recorder.universe.policy()
+        assert recorder.config.ticker_silence_timeout_s == settings.kalshi.ws_silence_timeout_s
         supervisors = recorder.supervisors
         assert sorted(supervisors) == [0, 1, 2, 3, 4]
         assert (supervisors[0].config.persist, supervisors[0].config.firehose_channels) == (
@@ -178,6 +179,41 @@ async def test_build_recorder_wires_the_environment_and_the_connection_layout(
         assert isinstance(task, AuditTask)
         assert task.interval_s == settings.recorder.audit_interval_s
         await recorder.stop()
+
+
+async def test_build_recorder_gives_every_session_the_keepalive_and_the_chosen_silence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built: list[dict[str, object]] = []
+    builders: list[object] = []
+
+    def recording_session(url: str, signer: object, clock: object, **kwargs: object) -> object:
+        _ = (signer, clock)
+        built.append({"url": url, **kwargs})
+        return object()
+
+    def capturing_recorder(config: object, **kwargs: object) -> object:
+        _ = config
+        builders.append(kwargs["session_builder"])
+        return object()
+
+    monkeypatch.setattr("tape.cli.WsSession", recording_session)
+    monkeypatch.setattr("tape.cli.Recorder", capturing_recorder)
+    settings = load_settings(
+        write_settings(tmp_path),
+        environ={"TAPE_KALSHI__WS_PING_INTERVAL_S": "7", "TAPE_KALSHI__WS_PING_TIMEOUT_S": "9"},
+    )
+    async with httpx.AsyncClient() as http:
+        build_recorder(settings, http=http, clock=FrozenClock(), host="box")
+    (builder,) = builders
+    assert callable(builder)
+    builder("wss://x", conn_id=0, silence_timeout_ns=60 * NS_PER_S)
+    builder("wss://x", conn_id=2, silence_timeout_ns=None)
+    keepalive = {"ping_interval_ns": 7 * NS_PER_S, "ping_timeout_ns": 9 * NS_PER_S}
+    assert built == [
+        {"url": "wss://x", "conn_id": 0, "silence_timeout_ns": 60 * NS_PER_S, **keepalive},
+        {"url": "wss://x", "conn_id": 2, "silence_timeout_ns": None, **keepalive},
+    ]
 
 
 async def test_build_recorder_refuses_a_key_that_is_not_rsa(tmp_path: Path) -> None:

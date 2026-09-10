@@ -1,0 +1,37 @@
+# Secrets and credentials. Never commit keys.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Recorded data. The tape is private by design (see docs/adr/0007).
+data/
+*.tape.zst
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+
+# Node / web
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

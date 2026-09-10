@@ -16,6 +16,9 @@
 | **`seq`** | Per-`sid` sequence number on sequenced channels. A skip is a gap. |
 | **Snapshot / delta** | A full book image versus a signed change to one price level on one side. |
 | **Keyframe** | A periodic full-book image written by the recorder so replay can seek. Named after video I-frames. |
+| **Bus** | The ZeroMQ PUB/SUB channel on which the recorder publishes live events to `tape serve` and the engine. Lossy per subscriber by design. |
+| **`bus_epoch` / `bus_seq`** | The publisher's start time, and the number of each message it attempts from 1. A new epoch or a skipped number means a subscriber lost messages. |
+| **Refresh image** | A `BookRefresh`: the recorder's own copy of one book, republished every `bus_refresh_s` so a bus consumer can recover that book after loss. |
 | **Segment** | One raw tape file: every frame received on one connection during one hour (or until rotation). |
 | **Tape** | The whole recorded archive: segments, keyframes, baked tables, manifests. |
 | **Bake** | Converting raw segments into typed Parquet tables. |

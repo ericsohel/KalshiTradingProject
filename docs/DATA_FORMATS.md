@@ -351,3 +351,30 @@ above and carry the same integer encodings.
   opens an issue; decoders are updated; old raw segments remain readable because the
   decoder version is chosen from the segment header's `spec_versions`.
 - Tape and Parquet versions are bumped only with an ADR and a migration note.
+
+## 10. Bus messages (version 1)
+
+The recorder publishes live events on a ZeroMQ PUB socket (ADR 0008, ADR 0022). Every
+message has two frames:
+
+| frame | content |
+|---|---|
+| topic | ASCII: `md.<ticker>` for `BookSnapshot`, `BookDelta`, `BookRefresh`, `Trade`, and `Ticker`; `ctl.lifecycle` for `Lifecycle`; `ctl.gap` for `GapEvent` |
+| payload | MessagePack map `{bus_epoch, bus_seq, event}` |
+
+| field | type | note |
+|---|---|---|
+| `bus_epoch` | int | publisher start, wall ns; a new value means the publisher restarted |
+| `bus_seq` | int | 1 for an epoch's first attempted message, then one more for every attempted message on any topic, delivered or not |
+| `event` | map | one struct from [INTERFACES.md](INTERFACES.md) section 4, named by its `type` key; integers follow section 1.1, `Side` is 0 or 1, and a `Level` is the array `[price_e4, count_e2]` |
+
+`BookRefresh` is the recorder's own image of a book it holds: `ticker`; `ts_ms`, the exchange
+time of the last change applied, or null; `receipt`, the connection holding the book and the
+local time the image was taken; `stale`; and `bids` and `asks`, best first. It is taken
+between frames, so it equals the book after every message with a lower `bus_seq`.
+
+Delivery is lossy per subscriber: one whose queue is full misses messages that others
+receive, and learns it from a gap in `bus_seq`, which it can see only if it subscribes to
+every topic. Messages are MessagePack rather than JSON because the bus is local and read only
+by Python consumers built on the same structs. The payload carries no version field: the
+recorder and its consumers are deployed from one revision, and a change here ships to both.

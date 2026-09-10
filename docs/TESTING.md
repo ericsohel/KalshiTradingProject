@@ -22,6 +22,7 @@ modules.
 | `GapTracker` reports a gap exactly when `seq` skips or decreases | `recorder` |
 | `SubscriptionPlanner.diff(plan(a), plan(b))` applied to `a` yields `b` | `recorder` |
 | Segment writer then reader round-trips any record sequence, including a truncated tail | `segment` |
+| For any interleaving of book changes, silent stale transitions, publisher restarts, and lost bus messages, a consumer's copy reported stale is stale at the publisher, and a fresh copy equals the publisher's book whenever that book is fresh | `bus` |
 | Simulator never fills a post-only order at a crossing price; never fills after close | `sim` |
 
 ## 3. Contract tests

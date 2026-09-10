@@ -22,8 +22,9 @@ is not merged, regardless of whether it works.
 ## 2. Architecture rules
 
 1. **Layering.** `core` modules import only the standard library, `msgspec`, and
-   `numpy`. `adapter` modules may import `core` and I/O libraries. `shell` modules
-   (`cli`, `config`) may import anything. A script in CI (`scripts/check_layers.py`)
+   `numpy`. `adapter` modules may import `core` and I/O libraries; leaf adapters (`client`,
+   `segment`, `bus`) import no other adapter. `shell` modules (`cli`, `config`) may import
+   anything. A script in CI (`scripts/check_layers.py`)
    parses imports and fails on violations. The layer of each module is listed in
    [ARCHITECTURE.md](ARCHITECTURE.md) section 6.
 2. **No global mutable state.** No module-level singletons, caches, or clients.

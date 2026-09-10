@@ -112,7 +112,9 @@ implemented after the simulator is calibrated (see [ROADMAP.md](ROADMAP.md)).
    reading from midnight.
 5. **Publication.** Decoded events are published on a ZeroMQ PUB socket
    (`ipc://`) with the market ticker as topic. Consumers (API, engine) subscribe with
-   their own high-water marks; the recorder never blocks on them. (ADR 0008)
+   their own high-water marks; the recorder never blocks on them. (ADR 0008) Every message
+   is numbered, and every `bus_refresh_s` the recorder republishes each book it holds, so a
+   consumer that lost messages or started late recovers its books. (ADR 0022)
 6. **Audit.** Every five minutes the recorder samples active markets and fetches
    `GET /markets/orderbooks?tickers=...` (100 per call), diffing the response against
    the local book at response time. Mismatches are written as audit records.
@@ -153,7 +155,9 @@ src/tape/
 ```
 
 Dependency rule: `core` modules import only the standard library, `msgspec`, and
-`numpy`. `adapter` modules may import `core` and third-party I/O libraries. `shell`
+`numpy`. `adapter` modules may import `core` and third-party I/O libraries. Leaf adapters
+(`client`, `segment`, `bus`) each wrap one I/O mechanism and import no other adapter, so,
+for example, the bus can never depend on the recorder or the exchange client. `shell`
 modules may import anything. A lint check enforces this (see
 [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md)).
 

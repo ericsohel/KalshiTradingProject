@@ -45,10 +45,24 @@ a `clock_jump` record, so the resulting gap is attributable rather than mysterio
 - `tape record` exposes Prometheus metrics on localhost: messages per second per
   channel and connection, gap count, resync count, reconnects, writer queue depth,
   frames dropped, disk free, audit mismatches, last-frame age.
+- The recorder's status line carries the bus counters: `bus_seq`, `sent`, `dropped`,
+  `errors`, and `refreshes`. A subscriber's own losses are not among them, because ZeroMQ
+  drops a slow subscriber's copies without telling the publisher; the subscriber counts them
+  from gaps in `bus_seq`.
 - A dead-man ping fires every minute while the control connection is open; a missed
   ping alerts within three minutes.
 - Alerts: recorder down, disk under 10% free, gap share over 1% in the last hour,
   audit exact ratio under 99% in the last hour, certificate expiry within 14 days.
+
+### 4.1 The live bus
+
+`tape record` publishes on the bus only when `recorder.bus_endpoint` is set; enabling or
+changing it takes a recorder restart, which the tape records as a gap. Use an absolute
+`ipc://` path, at most 103 bytes on macOS, in a directory that only the `tape` user can
+write; the recorder replaces a stale socket left by a crash and refuses to start if another
+process is listening on the path or a file other than a socket is there. `tape serve` connects
+to the same endpoint and can start, stop, or restart at any time: it knows each book again
+within `bus_refresh_s` (ADR 0022). Nothing a consumer does can block or stop the recorder.
 
 ## 5. Storage and retention
 
@@ -79,6 +93,7 @@ lifecycle traffic. Policy from day one:
 | Audit mismatches on one group | affected `sid` | Force `get_snapshot`; if persistent, open an issue with the raw frames |
 | Disk filling | `df`, manifest sizes | Run `tape bake --prune`; tighten the L2 universe |
 | API slow | client count, outbound queue depths | Lower `max_clients`; the recorder is unaffected by design |
+| Live view stuck in resync | recorder status `bus.refreshes` and `bus.errors`; both processes name the same `bus_endpoint`; the API's gap count | Refreshes not rising: check the recorder log for `bus refresh failed`. Gaps rising: raise the API's receive high-water mark or `bus_send_hwm`. The tape is unaffected either way |
 | Spec-drift CI failure | the diff | Update `wire` structs and decoders; raw tape is unaffected |
 
 ## 7. Backups and restore

@@ -91,7 +91,8 @@ Trade(ticker, ts_ms, receipt, sid, seq, trade_id, price, count, taker_side, is_b
 Ticker(ticker, ts_ms, receipt, sid, last, bid, ask, bid_size, ask_size, volume, open_interest)
 Lifecycle(ticker, receipt, sid, seq, event_type, payload_json)
 GapEvent(receipt, sid, expected_seq, got_seq)
-MarketEvent = BookSnapshot | BookDelta | Trade | Ticker | Lifecycle | GapEvent
+BookRefresh(ticker, ts_ms, receipt, stale, bids, asks)    # the recorder's image of a live book (ADR 0022)
+MarketEvent = BookSnapshot | BookDelta | Trade | Ticker | Lifecycle | GapEvent | BookRefresh
 ```
 
 Private events (fills, order updates, acknowledgements, timers) are defined in
@@ -504,11 +505,16 @@ class PeriodicTask(Protocol):
 class RecorderConfig(Struct): ...           # built from Settings by tape.cli.recorder_config
 PINNED_SPEC_VERSIONS: Mapping[str, str]     # copied into every segment header
 def keyframe_path(root: Path, wall_ns: int, interval_s: int) -> Path
+def refresh_slices(tickers: Sequence[str], *, interval_s: int) -> tuple[tuple[str, ...], ...]
+class BusStatus(Struct): bus_epoch; bus_seq; sent; dropped; errors; refreshes
+class RecorderStatus(Struct): connections; universe_size; subscribed_markets; live_tickers;
+                              bus: BusStatus | None      # None without a publisher
 
 class Recorder:
     def __init__(self, config: RecorderConfig, *, clock: Clock, rest: KalshiRest,
                  limiter: RateLimiter, session_builder: SessionBuilder, sink_builder: SinkBuilder,
-                 sleep, jitter, periodic_tasks: Sequence[PeriodicTask] = ())
+                 sleep, jitter, periodic_tasks: Sequence[PeriodicTask] = (),
+                 publisher: Publisher | None = None)
     async def run(self) -> None
     async def stop(self) -> None; def request_stop(self) -> None     # idempotent
     def books(self) -> Mapping[str, Book]                            # merged across book connections
@@ -547,8 +553,19 @@ group through `set_group`.
 Every `keyframe_interval_s` it writes merged books to
 `data_dir/keyframes/YYYY-MM-DD/HH/MM.parquet`. Every `status_interval_s` it logs one
 structured status line. A failing periodic task is logged and does not stop capture; a
-failing supervisor surfaces. Shutdown stops periodic tasks, writes a final keyframe,
-stops every supervisor, and closes every sink so everything is flushed.
+failing supervisor surfaces. Shutdown stops periodic tasks and the bus refresh cycle, writes
+a final keyframe, stops every supervisor, closes the bus publisher, and closes every sink so
+everything is flushed.
+
+With a publisher (section 9), every supervisor's `on_event` publishes each event through a
+`SequencedPublisher` whose epoch is the wall clock when the recorder was built; on the ticker
+connection that follows updating the latest-ticker table. The tape path is untouched. The
+refresh cycle publishes a `BookRefresh` of every book `books()` holds, receipt naming the
+connection holding it, once per `bus_refresh_s`: each cycle fixes its markets, splits them
+with `refresh_slices` (one slice per market, at most 10 slices per second), and publishes
+one slice, without awaiting, before each pause of `bus_refresh_s / len(slices)`. The cycle
+races the stop request like every loop; if it fails, it is logged and capture continues.
+The status line carries `BusStatus`.
 
 ### 8.7 `tape.recorder.tap`
 
@@ -588,26 +605,94 @@ frame.
 
 ## 9. `tape.bus`
 
+A leaf adapter: it imports core modules only, never the recorder or the client.
+
 ```python
+# ports
+class PublisherStats(Struct): sent; dropped; errors         # sent + dropped + errors = publish calls
 class Publisher(Protocol):
-    def publish(self, topic: bytes, payload: bytes) -> None     # never blocks; drops on HWM
+    stats: PublisherStats
+    def publish(self, topic: bytes, payload: bytes) -> None   # never blocks, never raises
+    def close(self) -> None                                    # idempotent; unsent messages discarded
 class Subscriber(Protocol):
-    async def messages(self) -> AsyncIterator[tuple[bytes, bytes]]
-    def subscribe(self, topic_prefix: bytes) -> None
+    def subscribe(self, topic_prefix: bytes) -> None           # b"" = every topic; BusError once closed
+    def messages(self) -> AsyncIterator[tuple[bytes, bytes]]   # (topic, payload) until close()
+    def close(self) -> None                                    # idempotent
+
+# envelope
+MARKET_DATA_PREFIX = b"md."; CONTROL_PREFIX = b"ctl."; LIFECYCLE_TOPIC = b"ctl.lifecycle"; GAP_TOPIC = b"ctl.gap"
+FIRST_BUS_SEQ = 1
+class BusEnvelope(Struct): bus_epoch: int; bus_seq: int; event: MarketEvent
+def topic_for(event: MarketEvent) -> bytes
+def encode_bus_envelope(envelope: BusEnvelope) -> bytes        # MessagePack
+def decode_bus_envelope(payload: bytes) -> BusEnvelope         # WireError if malformed
+class SequencedPublisher:
+    def __init__(self, publisher: Publisher, *, epoch: int)    # ValueError on a negative epoch
+    epoch: int; last_seq: int; stats: PublisherStats           # stats.errors adds failures before the transport
+    def publish(self, event: MarketEvent) -> None              # next bus_seq; never raises
+    def close(self) -> None
+
+# sockets
+DEFAULT_SEND_HWM = 10_000
+def check_endpoint(endpoint: str) -> None                      # ipc:///absolute/path (<= zmq.IPC_PATH_MAX_LEN) or tcp://host:port
+class ZmqPublisher(Publisher):
+    def __init__(self, endpoint: str, *, send_hwm: int, context: zmq.Context | None = None)
+    endpoint: str                                              # BusError if the path is taken or bind fails
+class SubscriberStats(Struct): received; malformed
+class ZmqSubscriber(Subscriber):
+    def __init__(self, endpoint: str, *, receive_hwm: int, context: zmq.asyncio.Context | None = None)
+    stats: SubscriberStats
+
+# livebooks (pure)
+type BookStatus = Literal["unknown", "fresh", "stale"]         # BOOK_UNKNOWN, BOOK_FRESH, BOOK_STALE
+type ResetReason = Literal["start", "epoch", "gap"]            # RESET_START, RESET_EPOCH, RESET_GAP
+class StatusChange(Struct): ticker; before: BookStatus; after: BookStatus
+class Observation(Struct): reset: ResetReason | None; missed: int; applied: bool;
+                           changes: tuple[StatusChange, ...]
+class LiveBooksStats(Struct): messages; resets; missed; refreshes; ignored; book_errors
+class LiveBooks:
+    def observe(self, envelope: BusEnvelope) -> Observation    # one message, in arrival order
+    def status(self, ticker: str) -> BookStatus
+    def books(self) -> Mapping[str, Book]                      # held copies, fresh or stale; read only
+    epoch: int | None; last_seq: int | None; stats: LiveBooksStats
 ```
 
-Topics: `md.<ticker>` for market data events (msgspec-encoded `Event` union),
-`ctl.lifecycle`, `ctl.gap`, `ctl.audit`, `ctl.heartbeat`. Private events never use the
-`md.` prefix. Transport: ZeroMQ PUB/SUB over `ipc://` (ADR 0008).
+Topics: `md.<ticker>` for snapshots, deltas, refresh images, trades, and ticker updates;
+`ctl.lifecycle` and `ctl.gap`; `ctl.audit` and `ctl.heartbeat` are reserved. Private events
+never use the `md.` prefix. Transport: ZeroMQ PUB/SUB over `ipc://` (ADR 0008); message layout
+in [DATA_FORMATS.md](DATA_FORMATS.md) section 10.
 
-Every payload is an envelope `{bus_epoch, bus_seq, event}`: `bus_epoch` is the
-publisher's start time in wall ns and `bus_seq` counts every attempted send from 1, so
-a subscriber detects loss as a gap. Every `bus_refresh_s` (default 10) the recorder
-also publishes, paced across the interval, a refresh image of each book it holds
-(`BookRefresh(ticker, receipt, stale, bids, asks)`), consistent with every message of
-lower `bus_seq`. A subscriber recovers from a gap, a new epoch, or its own start by
-treating each book as unknown until its next refresh image (ADR 0022). Publishing
-never blocks or raises; drops are counted in the recorder's status.
+Every payload is an envelope `{bus_epoch, bus_seq, event}`: `bus_epoch` is the publisher's
+start time in wall ns and `bus_seq` counts every attempted send from 1, including sends that
+fail to encode or that the transport drops, so a subscriber detects loss as a gap. Numbers
+are shared by every topic, so only a subscriber to every topic can tell loss from filtering.
+Every `bus_refresh_s` (default 10) the recorder also publishes, paced across the interval, a
+refresh image of each book it holds (`BookRefresh`), consistent with every message of lower
+`bus_seq` (section 8.6). Publishing never blocks or raises; counts appear in the recorder's
+status.
+
+Loss is per subscriber. A PUB socket never refuses a send: when one subscriber's queue is full
+(`send_hwm` at the publisher, the kernel buffer, `receive_hwm` at the subscriber), ZeroMQ drops
+that subscriber's copies alone and tells no one, so the other subscribers are unaffected and
+the publisher's `dropped` counts only sends refused outright. The slow subscriber sees a gap.
+
+`ZmqPublisher` binds with `LINGER 0` and sends with `NOBLOCK`, counting `zmq.Again` as
+dropped and any other `ZMQError`, or a send after `close()`, as an error. Because libzmq
+unlinks whatever is at an ipc path before binding, the publisher first removes a leftover
+socket that refuses connections and raises `BusError` for a socket a live process listens on
+or for anything that is not a socket, leaving it in place. `ZmqSubscriber.close()` ends
+`messages()` cleanly; a message without two frames is skipped and counted.
+
+`LiveBooks` implements the consumer rule of ADR 0022. At its first message, a new epoch, or a
+`bus_seq` that is not the next one, every book becomes unknown and is dropped; a book becomes
+known at its next `BookRefresh`, fresh or stale as the image says, and later snapshots and
+deltas apply to it (a stale copy ignores deltas until a snapshot, as the recorder's book does).
+Book events for an unknown book are ignored, and a change that would break a book invariant
+drops the copy. `Observation.changes` lists every status change once, so a server sends
+`resync` for books that became unknown and snapshots for books that became known; `applied`
+says whether a book event reached a held copy. Property-tested: for any interleaving of book
+changes, silent stale transitions, restarts, and lost messages, a copy reported stale is stale
+at the publisher, and a fresh copy equals the publisher's book whenever that book is fresh.
 
 ## 10. `tape.bake` and `tape.store`
 
@@ -718,6 +803,7 @@ TapeError
   BookInvariantError(ticker, detail)
   TapeCorruptionError
   ConfigError
+  BusError                 # endpoint taken, bind or receive failure; never raised by publish
   KalshiError
     KalshiHttpError(status, code, message, details)
     RateLimitedError
@@ -757,6 +843,9 @@ audit_tap_max_events = 5000     # 1 to 50000 book changes per market per window
 writer_queue_max = 200000
 universe_refresh_s = 300
 status_interval_s = 60
+bus_endpoint = "ipc:///run/tape/bus.sock"   # absent by default: no bus; ipc:///absolute/path or tcp://host:port
+bus_refresh_s = 10              # 1 to 60; seconds between refresh images of each book
+bus_send_hwm = 10000            # 1000 to 100000 messages queued per bus subscriber
 
 [recorder.universe]
 min_volume_24h = "1000.00"      # fixed-point string, never a float
@@ -785,9 +874,13 @@ Rules:
 - **Validation**: positive intervals, ping interval and pong timeout each between 1 and
   60 seconds (a dead connection goes unnoticed for their sum), `group_size` at most 500,
   `book_connections * group_size` at least `max_l2_markets`, audit lead and settle
-  between 1 and 5000 milliseconds, the audit tap bound between 1 and 50000 changes, and
-  `2 + book_connections` at most `max_connections` (ADR 0020), the private key file must
-  exist and be readable by its owner alone, and `data_dir` must be writable.
+  between 1 and 5000 milliseconds, the audit tap bound between 1 and 50000 changes,
+  `bus_refresh_s` between 1 and 60 seconds (a consumer waits up to that long to recover a
+  book), `bus_send_hwm` between 1000 and 100000 messages (a reconnect's snapshot burst must
+  fit; the queue lives in the recorder's memory), a `bus_endpoint`, when set, that is an
+  absolute ipc path within ZeroMQ's length limit (103 bytes on macOS) or a tcp address with a
+  port, and `2 + book_connections` at most `max_connections` (ADR 0020), the private key file
+  must exist and be readable by its owner alone, and `data_dir` must be writable.
 - **Secrets are paths, never values.** `tape config check` prints the effective settings
   with nothing to redact beyond what is already only a path.
 

@@ -4,9 +4,9 @@ An order-book flight recorder, deterministic replay engine, and self-calibrating
 market maker for [Kalshi](https://kalshi.com), with a live WebGL viewer.
 
 > Status: recording. The exchange client (RSA-PSS signing, rate-limit
-> mirror, bounded-buffer WebSocket session), the book, the tape writer, and
-> the recorder orchestrator are built and tested; the viewer, simulator, and
-> market maker are still ahead. The design documents in `docs/` remain the
+> mirror, bounded-buffer WebSocket session), the book, the tape writer, the
+> recorder orchestrator, and its live event bus are built and tested; the
+> viewer, simulator, and market maker are still ahead. The design documents in `docs/` remain the
 > contract the code is built against.
 
 ## What this is

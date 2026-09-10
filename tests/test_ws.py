@@ -189,6 +189,36 @@ async def test_subscribe_replies_arrive_as_frames(signer: Signer, clock: FrozenC
     assert all(envelope.id == 1 for envelope in envelopes)
 
 
+async def test_a_second_subscribe_merges_into_the_connections_one_subscription_per_channel(
+    signer: Signer, clock: FrozenClock
+) -> None:
+    """Production behavior observed 2026-09-10 (ADR 0020): no new sids, one ``ok`` per channel
+    carrying the existing sid and the merged membership, then snapshots for the new markets."""
+    channels = ("orderbook_delta", "trade")
+    async with FakeKalshiWs() as fake, session_for(fake, signer, clock) as session:
+        fake.set_book("KXB-1", yes=[("0.3000", "1.00")])
+        connection = await fake.wait_for_connection()
+        await session.send(SubscribeCommand(channels, ("KXA-1",), True))
+        await session.send(SubscribeCommand(channels, ("KXB-1", "KXA-1"), True))
+        frames = await take(session, 5)
+        assert connection.subscriptions == {
+            1: {"channel": "orderbook_delta", "market_tickers": ["KXA-1", "KXB-1"]},
+            2: {"channel": "trade", "market_tickers": ["KXA-1", "KXB-1"]},
+        }
+
+    merged = {"market_tickers": ["KXA-1", "KXB-1"]}
+    assert [payload_of(frame) for frame in frames[2:]] == [
+        {"id": 2, "sid": 1, "seq": 1, "type": "ok", "msg": merged},
+        {
+            "type": "orderbook_snapshot",
+            "sid": 1,
+            "seq": 2,
+            "msg": {"market_ticker": "KXB-1", "yes_dollars_fp": [["0.3000", "1.00"]]},
+        },
+        {"id": 2, "sid": 2, "seq": 1, "type": "ok", "msg": merged},
+    ]
+
+
 async def test_frames_arrive_in_order_with_local_timestamps(signer: Signer) -> None:
     system_clock = SystemClock()
     before_mono, before_wall = system_clock.mono_ns(), system_clock.wall_ns()

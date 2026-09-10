@@ -1,23 +1,24 @@
-"""Partition the universe into subscription groups and move between plans cheaply.
+"""Assign the universe to order-book connections and move between assignments cheaply.
 
-Responsibility: decide which markets share a ``subscribe`` command, on which
-connection, and produce the smallest ordered set of commands that turns the plan the
-recorder is running into the plan it wants (ADR 0010, docs/ARCHITECTURE.md 7.1). The
+Responsibility: decide which markets each order-book connection carries, and produce the
+smallest ordered set of commands that turns the assignment the recorder is running into the
+one it wants (ADR 0020, docs/ARCHITECTURE.md 7.1). Kalshi keeps one subscription per channel
+per connection and merges every further ``subscribe`` into it, so a connection's markets are
+one group: one ``subscribe``, then ``update_subscription`` for every membership change. The
 module is pure: no clock, no socket, no state between calls.
 
-Invariants: a group holds markets of exactly one exchange shard, because collateral and
-routing are per shard; a group holds at most ``max_per_group`` tickers and is never
-empty; a ticker belongs to exactly one group; a plan is canonically ordered so two
-plans are equal when they describe the same subscriptions; and replanning moves a
-ticker only when it must, because every move costs a resnapshot and a resnapshot is a
-hole in the tape.
+Invariants: a connection carries at most one group; a group holds at most ``max_per_group``
+tickers and is never empty; a ticker belongs to exactly one group; a plan is canonically
+ordered so two plans are equal when they describe the same subscriptions; and replanning
+moves a ticker only when its connection is over capacity or no longer exists, because every
+move costs a resnapshot and a resnapshot is a hole in the tape. Exchange shards play no
+part: they matter for collateral and order routing, not for market data.
 """
 
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Container, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+import heapq
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Final, assert_never
 
 import msgspec
@@ -47,13 +48,12 @@ _GROUP_ID_DIGITS: Final = 4
 
 
 class Group(msgspec.Struct, frozen=True, kw_only=True):
-    """One ``subscribe`` command's worth of markets.
+    """The whole market set of one order-book connection.
 
     Attributes:
-        group_id: Stable identity of the group across replans; the recorder's
-            subscription table is keyed by it. Not the server's ``sid``, which is
-            connection-scoped and reassigned on every reconnect.
-        exchange_index: The single exchange shard every member belongs to.
+        group_id: Stable identity of the group across replans, written into segment
+            headers. Not the server's ``sid``, which is connection-scoped and reassigned
+            on every reconnect.
         conn_id: WebSocket connection carrying this group.
         tickers: Members. Never empty.
 
@@ -62,7 +62,6 @@ class Group(msgspec.Struct, frozen=True, kw_only=True):
     """
 
     group_id: str
-    exchange_index: int
     conn_id: int
     tickers: frozenset[str]
 
@@ -73,20 +72,20 @@ class Group(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(f"group {self.group_id} has a negative conn_id {self.conn_id}")
 
 
-def group_sort_key(group: Group) -> tuple[int, str]:
+def group_sort_key(group: Group) -> int:
     """Return the key that puts a plan's groups in canonical order.
 
     Args:
         group: Any group.
 
     Returns:
-        ``(exchange_index, group_id)``, so groups of one shard sit together.
+        The group's ``conn_id``, which is unique within a plan.
     """
-    return (group.exchange_index, group.group_id)
+    return group.conn_id
 
 
 class Plan(msgspec.Struct, frozen=True, kw_only=True):
-    """A complete set of subscription groups.
+    """A complete assignment of markets to order-book connections.
 
     Groups are held in canonical order so that two plans describing the same
     subscriptions compare equal; build the tuple with ``sorted(groups,
@@ -96,18 +95,19 @@ class Plan(msgspec.Struct, frozen=True, kw_only=True):
         groups: Every group, ordered by :func:`group_sort_key`.
 
     Raises:
-        ValueError: On a duplicate group id, a ticker in two groups, or groups out of
-            canonical order.
+        ValueError: On groups out of canonical order, two groups on one connection, a
+            duplicate group id, or a ticker in two groups.
     """
 
     groups: tuple[Group, ...]
 
     def __post_init__(self) -> None:
-        keys = [group_sort_key(group) for group in self.groups]
-        if keys != sorted(keys):
-            raise ValueError("plan groups must be sorted by (exchange_index, group_id)")
-        ids = {group.group_id for group in self.groups}
-        if len(ids) != len(self.groups):
+        conn_ids = [group_sort_key(group) for group in self.groups]
+        if conn_ids != sorted(conn_ids):
+            raise ValueError("plan groups must be sorted by conn_id")
+        if len(set(conn_ids)) != len(conn_ids):
+            raise ValueError("plan has two groups on one connection")
+        if len({group.group_id for group in self.groups}) != len(self.groups):
             raise ValueError("plan has duplicate group ids")
         owner: dict[str, str] = {}
         for group in self.groups:
@@ -159,163 +159,93 @@ PlanChange = AddGroup | RemoveGroup | AddMarkets | RemoveMarkets
 """One step from the running plan towards the desired one."""
 
 
-@dataclass(slots=True)
-class _Draft:
-    """A group under construction: shard, its connection once chosen, and its members."""
-
-    exchange_index: int
-    conn_id: int | None
-    members: list[str] = field(default_factory=list)
-
-
-def _shard_of_ticker(shard_of: Mapping[str, int], ticker: str) -> int:
-    """Look up a ticker's exchange shard.
-
-    Args:
-        shard_of: Ticker to ``exchange_index``.
-        ticker: The ticker to place.
-
-    Returns:
-        The exchange shard.
-
-    Raises:
-        KeyError: If the shard is unknown; guessing one would route a subscription to
-            the wrong exchange.
-    """
-    try:
-        return shard_of[ticker]
-    except KeyError:
-        raise KeyError(f"no exchange_index known for ticker {ticker}") from None
-
-
-def _fresh_group_ids(shard: int, used: Container[str]) -> Iterator[str]:
-    """Yield the shard's unused group ids in ascending order, for example ``s0-g0007``.
-
-    The shard is part of the id, so an id can never be reused for a different shard and
-    :func:`diff` never has to update a group across shards. ``used`` is consulted lazily,
-    so ids claimed after the generator was created are skipped too.
-
-    Args:
-        shard: The exchange shard the ids are for.
-        used: Group ids already taken.
-
-    Yields:
-        Group ids not in ``used`` at the moment each one is produced.
-    """
-    ordinal = 0
-    while True:
-        group_id = f"s{shard}-g{ordinal:0{_GROUP_ID_DIGITS}d}"
-        ordinal += 1
-        if group_id not in used:
-            yield group_id
+def _group_id(conn_id: int) -> str:
+    """Name the group of a connection, for example ``g0002``; a connection has one group."""
+    return f"g{conn_id:0{_GROUP_ID_DIGITS}d}"
 
 
 def _carry_over(
-    previous: Plan, desired: frozenset[str], shards: Mapping[str, int], cap: int
-) -> dict[str, _Draft]:
-    """Keep every member of the previous plan that may stay where it is.
+    previous: Plan, desired: frozenset[str], cap: int, max_connections: int
+) -> dict[int, list[str]]:
+    """Keep every member of the previous plan that may stay on its connection.
 
-    A member is kept when it is still wanted and its shard has not changed. If the group
+    A member stays when it is still wanted and its connection still exists. If a connection
     is over a shrunken ``cap`` the surplus is evicted in ticker order, so the eviction is
     deterministic rather than dependent on set iteration.
 
     Args:
         previous: The plan currently running.
-        desired: The tickers the new plan must cover.
-        shards: Ticker to ``exchange_index`` for every desired ticker.
-        cap: Maximum members per group.
+        desired: The tickers the new plan should cover.
+        cap: Maximum members per connection.
+        max_connections: Number of book connections available.
 
     Returns:
-        Drafts keyed by group id, empty groups already dropped.
+        The members kept, by connection id, for every connection that keeps any.
     """
-    drafts: dict[str, _Draft] = {}
+    members: dict[int, list[str]] = {}
     for group in previous.groups:
-        members = sorted(
-            ticker
-            for ticker in group.tickers
-            if ticker in desired and shards[ticker] == group.exchange_index
-        )
-        del members[cap:]
-        if members:
-            drafts[group.group_id] = _Draft(group.exchange_index, group.conn_id, members)
-    return drafts
+        if group.conn_id >= max_connections:
+            continue
+        kept = sorted(ticker for ticker in group.tickers if ticker in desired)
+        del kept[cap:]
+        if kept:
+            members[group.conn_id] = kept
+    return members
 
 
-def _place(drafts: dict[str, _Draft], unplaced: Sequence[str], shard: int, cap: int) -> None:
-    """Fill the shard's existing groups, then open new ones for what is left.
+def _fill(
+    members: dict[int, list[str]], unplaced: Sequence[str], cap: int, max_connections: int
+) -> None:
+    """Give each unplaced ticker, in order, to the connection with the fewest members.
 
-    Existing groups are filled in group-id order and new groups take the lowest free ids,
-    so the same inputs always produce the same groups.
-
-    Args:
-        drafts: Drafts so far, mutated in place.
-        unplaced: Tickers of this shard needing a group, in ticker order.
-        shard: The exchange shard being filled.
-        cap: Maximum members per group.
-    """
-    index = 0
-    for group_id in sorted(gid for gid, draft in drafts.items() if draft.exchange_index == shard):
-        if index >= len(unplaced):
-            return
-        draft = drafts[group_id]
-        room = cap - len(draft.members)
-        if room > 0:
-            chunk = unplaced[index : index + room]
-            draft.members.extend(chunk)
-            index += len(chunk)
-    fresh_ids = _fresh_group_ids(shard, drafts)
-    while index < len(unplaced):
-        drafts[next(fresh_ids)] = _Draft(shard, None, list(unplaced[index : index + cap]))
-        index += cap
-
-
-def _assign_connections(drafts: Mapping[str, _Draft], max_connections: int) -> None:
-    """Give every draft without a usable connection the least loaded one.
-
-    A group that already has a connection keeps it, because moving a group between
-    connections resubscribes it and costs the same resnapshot as moving its tickers.
+    Ties go to the lowest connection id, so the same inputs always produce the same plan.
+    Once every connection holds ``cap`` members the remaining tickers are left out.
 
     Args:
-        drafts: Drafts to assign, mutated in place.
+        members: Members by connection id, mutated in place.
+        unplaced: Tickers needing a connection, in ticker order.
+        cap: Maximum members per connection.
         max_connections: Number of book connections available.
     """
-    load: Counter[int] = Counter()
-    for draft in drafts.values():
-        if draft.conn_id is not None and 0 <= draft.conn_id < max_connections:
-            load[draft.conn_id] += 1
-        else:
-            draft.conn_id = None
-    for group_id in sorted(drafts):
-        draft = drafts[group_id]
-        if draft.conn_id is not None:
-            continue
-        chosen = min(range(max_connections), key=lambda conn_id: (load[conn_id], conn_id))
-        draft.conn_id = chosen
-        load[chosen] += 1
+    room = [
+        (len(members.get(conn_id, ())), conn_id)
+        for conn_id in range(max_connections)
+        if len(members.get(conn_id, ())) < cap
+    ]
+    heapq.heapify(room)
+    for ticker in unplaced:
+        if not room:
+            return
+        load, conn_id = heapq.heappop(room)
+        members.setdefault(conn_id, []).append(ticker)
+        if load + 1 < cap:
+            heapq.heappush(room, (load + 1, conn_id))
 
 
 def plan(
     tickers: Iterable[str],
     *,
-    shard_of: Mapping[str, int],
     max_per_group: int,
     max_connections: int,
     previous: Plan | None = None,
 ) -> Plan:
-    """Partition tickers into subscription groups spread over the connections.
+    """Assign tickers to at most ``max_connections`` connections, one group each.
 
-    Without ``previous`` the tickers of each shard are chunked in ticker order and the
-    groups are spread evenly over the connections. With ``previous``, every ticker that
-    is still wanted and still on the same shard stays in the group it is already in, new
-    tickers fill the gaps left in existing groups before any group is opened, and
-    surviving groups keep their connection. That makes replanning cost the fewest
-    resnapshots, at the price of groups that need not be as evenly sized as a fresh plan.
+    Without ``previous`` the tickers are dealt in ticker order to the least loaded
+    connection, so connections differ in size by at most one. With ``previous``, every
+    ticker that is still wanted stays on its connection unless that connection no longer
+    exists or is over ``max_per_group``, and only the tickers without a connection are
+    dealt out. That makes replanning cost the fewest resnapshots, at the price of
+    connections that need not be as evenly loaded as a fresh plan.
+
+    The plan holds at most ``max_per_group * max_connections`` tickers. When more are
+    wanted, the tickers kept from ``previous`` take precedence and the rest are left out
+    from the end of ticker order; the caller detects this as ``tickers - plan.tickers``.
 
     Args:
         tickers: The markets to subscribe to, in any order.
-        shard_of: Exchange shard of every ticker.
-        max_per_group: Maximum tickers per ``subscribe`` command.
-        max_connections: Number of book connections to spread the groups over.
+        max_per_group: Maximum tickers on one connection.
+        max_connections: Number of book connections, identified ``0 .. max_connections - 1``.
         previous: The plan currently running, if any.
 
     Returns:
@@ -323,36 +253,23 @@ def plan(
 
     Raises:
         ValueError: If ``max_per_group`` or ``max_connections`` is below one.
-        KeyError: If a ticker's exchange shard is unknown.
     """
     if max_per_group < 1:
         raise ValueError(f"max_per_group must be at least 1, got {max_per_group}")
     if max_connections < 1:
         raise ValueError(f"max_connections must be at least 1, got {max_connections}")
     desired = frozenset(tickers)
-    shards = {ticker: _shard_of_ticker(shard_of, ticker) for ticker in desired}
-
-    drafts: dict[str, _Draft] = {}
+    members: dict[int, list[str]] = {}
     if previous is not None:
-        drafts = _carry_over(previous, desired, shards, max_per_group)
-    placed = {ticker for draft in drafts.values() for ticker in draft.members}
-    unplaced: dict[int, list[str]] = {}
-    for ticker in sorted(desired - placed):
-        unplaced.setdefault(shards[ticker], []).append(ticker)
-    for shard in sorted(unplaced):
-        _place(drafts, unplaced[shard], shard, max_per_group)
-
-    _assign_connections(drafts, max_connections)
-    groups = [
-        Group(
-            group_id=group_id,
-            exchange_index=draft.exchange_index,
-            conn_id=draft.conn_id if draft.conn_id is not None else 0,
-            tickers=frozenset(draft.members),
+        members = _carry_over(previous, desired, max_per_group, max_connections)
+    placed = {ticker for kept in members.values() for ticker in kept}
+    _fill(members, sorted(desired - placed), max_per_group, max_connections)
+    return Plan(
+        groups=tuple(
+            Group(group_id=_group_id(conn_id), conn_id=conn_id, tickers=frozenset(kept))
+            for conn_id, kept in sorted(members.items())
         )
-        for group_id, draft in drafts.items()
-    ]
-    return Plan(groups=tuple(sorted(groups, key=group_sort_key)))
+    )
 
 
 def diff(current: Plan, desired: Plan) -> tuple[PlanChange, ...]:
@@ -399,10 +316,10 @@ def diff(current: Plan, desired: Plan) -> tuple[PlanChange, ...]:
 def _must_rebuild(old: Group, new: Group) -> bool:
     """Decide whether a group kept by id must be unsubscribed and subscribed afresh.
 
-    ``update_subscription`` can move a subscription to neither another shard nor another
-    connection. A group whose members are all replaced is rebuilt too: updating it in
-    place would pass through a subscription with no markets, which Kalshi does not
-    document, and the rebuild costs the same snapshots because every member is new.
+    ``update_subscription`` cannot move a subscription to another connection. A group whose
+    members are all replaced is rebuilt too: updating it in place would pass through a
+    subscription with no markets, which Kalshi does not document, and the rebuild costs the
+    same snapshots because every member is new.
 
     Args:
         old: The group as it is running.
@@ -411,11 +328,7 @@ def _must_rebuild(old: Group, new: Group) -> bool:
     Returns:
         ``True`` when ``diff`` must emit :class:`RemoveGroup` then :class:`AddGroup`.
     """
-    return (
-        new.exchange_index != old.exchange_index
-        or new.conn_id != old.conn_id
-        or old.tickers.isdisjoint(new.tickers)
-    )
+    return new.conn_id != old.conn_id or old.tickers.isdisjoint(new.tickers)
 
 
 def to_commands(

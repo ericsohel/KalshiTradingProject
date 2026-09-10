@@ -53,7 +53,7 @@ class SubscribedMsg(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class OkMsg(msgspec.Struct, frozen=True, kw_only=True):
-    """Payload of ``type: ok`` after an ``update_subscription``."""
+    """Payload of ``type: ok``: an update, or a subscribe merged into a live one (ADR 0020)."""
 
     market_tickers: list[str] | None = None
     market_ids: list[str] | None = None

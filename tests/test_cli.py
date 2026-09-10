@@ -41,7 +41,8 @@ def write_settings(tmp_path: Path, *, group_size: int = 500, pem: bytes | None =
     config = tmp_path / "tape.toml"
     config.write_text(
         f'[kalshi]\nenv = "demo"\nkey_id = "key-1"\nprivate_key_path = "{key}"\n\n'
-        f'[recorder]\ndata_dir = "data"\ngroup_size = {group_size}\nbook_connections = 3\n'
+        f'[recorder]\ndata_dir = "data"\ngroup_size = {group_size}\nbook_connections = 3\n\n'
+        "[recorder.universe]\nmax_l2_markets = 1500\n"
     )
     return config
 

@@ -120,7 +120,8 @@ class MarketSummary(msgspec.Struct, frozen=True, kw_only=True):
         ticker: Market ticker; the primary key everywhere (docs/DATA_FORMATS.md 1.4).
         series_ticker: Series this market belongs to; matched against the showcase list.
         event_ticker: Event this market belongs to; carried for the manifest.
-        exchange_index: Exchange shard, which the planner never mixes within a group.
+        exchange_index: Exchange shard. It matters for collateral and order routing, not
+            for market data, so the planner ignores it (ADR 0020).
         status: Kalshi's market status, verbatim.
         volume_24h: Contracts traded in the last 24 hours.
         close_ts: Unix seconds at which the market closes, or ``None`` when unknown.

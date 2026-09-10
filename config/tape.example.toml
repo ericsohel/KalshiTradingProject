@@ -2,7 +2,7 @@
 # then run `uv run tape config check --config tape.toml` before `tape record`.
 #
 # Every setting can be overridden from the environment as TAPE_<SECTION>__<KEY>, for
-# example TAPE_RECORDER__GROUP_SIZE=200 or TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES=A,B.
+# example TAPE_RECORDER__BOOK_CONNECTIONS=6 or TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES=A,B.
 # Relative paths resolve against this file's directory; a leading ~ is your home.
 # Secrets are never values here, only paths (docs/OPERATIONS.md 2).
 
@@ -26,7 +26,9 @@ ws_silence_timeout_s = 60
 data_dir = "data"
 # One live-only ticker connection + one control connection + book_connections.
 max_connections = 16
-book_connections = 2
+# Each book connection carries at most group_size (at most 500) markets in one subscription
+# per channel (ADR 0020), so book_connections * group_size must cover max_l2_markets.
+book_connections = 4
 group_size = 500
 # Whole minutes that divide an hour.
 keyframe_interval_s = 300

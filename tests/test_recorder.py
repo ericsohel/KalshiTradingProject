@@ -22,6 +22,7 @@ from tape.client.ws import WsSession
 from tape.errors import KalshiHttpError
 from tape.events import Level, Side
 from tape.fixedpoint import CountE2, PriceE4
+from tape.recorder.planner import Group
 from tape.recorder.recorder import (
     CLOCK_JUMP_THRESHOLD_NS,
     CONTROL_CONN_ID,
@@ -44,7 +45,7 @@ from tests.fakes import FakeConnection, FakeKalshiWs
 NOON: Final = int(datetime(2026, 9, 10, 12, tzinfo=UTC).timestamp()) * NS_PER_S
 REST_URL: Final = "https://rest.test/trade-api/v2"
 POLICY: Final = UniversePolicy(
-    min_volume_24h=CountE2(100_000), max_l2_markets=10, showcase_series=frozenset({"KXSHOW"})
+    min_volume_24h=CountE2(100_000), max_l2_markets=4, showcase_series=frozenset({"KXSHOW"})
 )
 LIMITS: Final = {
     "usage_tier": "advanced",
@@ -103,7 +104,7 @@ MARKETS: Final = (
     market("KXLOW-1", "1.00"),
     market("KXDONE-1", "9000.00", status="finalized"),
 )
-"""With groups of two: ``KXA-1, KXA-2`` on connection 2 and ``KXA-3, KXSHOW-1`` on 3."""
+"""Dealt to two connections of two: ``KXA-1, KXA-3`` on connection 2, ``KXA-2, KXSHOW-1`` on 3."""
 
 
 class StubSigner:
@@ -232,6 +233,7 @@ class Harness:
             "data_dir": root,
             "host": "test-host",
             "universe": POLICY,
+            "book_connections": 2,
             "group_size": 2,
             "shutdown_timeout_s": 2,
         }
@@ -355,8 +357,8 @@ async def test_startup_sizes_the_limiter_and_subscribes_the_planned_groups(tmp_p
             {"id": 1, "cmd": "subscribe", "params": {"channels": ["market_lifecycle_v2"]}}
         ]
         for connection, tickers in (
-            (first_books, ["KXA-1", "KXA-2"]),
-            (second_books, ["KXA-3", "KXSHOW-1"]),
+            (first_books, ["KXA-1", "KXA-3"]),
+            (second_books, ["KXA-2", "KXSHOW-1"]),
         ):
             (command,) = await connection.wait_for_commands(1)
             assert command["params"] == {
@@ -593,7 +595,7 @@ async def test_a_failed_universe_refresh_keeps_the_plan_and_retries_on_a_short_b
         books = await harness.connection(fake, 2)
         await until(lambda: bool(logged(caplog, "universe refresh failed")))
         assert harness.recorder.universe is None
-        assert harness.recorder.supervisors[2].groups == ()
+        assert harness.recorder.supervisors[2].group is None
 
         # With jitter 0.5 the first retry waits 0.75 of 15 s, not the 300-second interval.
         await harness.parked()
@@ -606,7 +608,7 @@ async def test_a_failed_universe_refresh_keeps_the_plan_and_retries_on_a_short_b
         await harness.parked()
         harness.time.advance(23)
         (command,) = await books.wait_for_commands(1)
-        assert command["params"]["market_tickers"] == ["KXA-1", "KXA-2"]
+        assert command["params"]["market_tickers"] == ["KXA-1", "KXA-3"]
         await until(lambda: harness.recorder.universe is not None)
         # Success resets the backoff: the next refresh is a full interval away.
         await harness.parked()
@@ -754,6 +756,35 @@ async def test_listing_quirks_are_logged_and_never_fatal(
     assert harness.recorder.universe.l2_tickers == {"KXA-1"}
 
 
+async def test_showcase_markets_beyond_book_capacity_are_left_out_and_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    showcase = [market(f"KXSHOW-{index}", "0.00") for index in (1, 2, 3)]
+    async with (
+        FakeKalshiWs() as fake,
+        recording(
+            fake.url,
+            tmp_path,
+            markets=showcase,
+            universe=msgspec.structs.replace(POLICY, max_l2_markets=2),
+            group_size=1,
+        ) as harness,
+    ):
+        harness.start()
+        await until(lambda: harness.recorder.universe is not None)
+        supervisors = harness.recorder.supervisors
+        assert [supervisors[conn_id].group for conn_id in (2, 3)] == [
+            Group(group_id="g0000", conn_id=2, tickers=frozenset({"KXSHOW-1"})),
+            Group(group_id="g0001", conn_id=3, tickers=frozenset({"KXSHOW-2"})),
+        ]
+        assert harness.recorder.sink_for("KXSHOW-3") is None
+
+    (left_out,) = logged(caplog, "markets left without a book connection")
+    assert left_out.levelno == logging.ERROR
+    assert (left_out.__dict__["unplaced"], left_out.__dict__["first_unplaced"]) == (1, "KXSHOW-3")
+    assert left_out.__dict__["book_capacity"] == 2
+
+
 async def test_a_startup_failure_is_raised_before_anything_connects(tmp_path: Path) -> None:
     async with FakeKalshiWs() as fake, recording(fake.url, tmp_path) as harness:
         harness.rest.answers["/account/limits"] = [httpx.Response(401)]
@@ -800,6 +831,10 @@ def test_keyframe_paths_floor_to_the_slot_in_utc() -> None:
         ({"book_connections": 3, "max_connections": 4}, "needs 5 connections"),
         ({"keyframe_interval_s": 600 + 1}, "divides an hour"),
         ({"group_size": 501}, r"group_size must be in \[1, 500\]"),
+        (
+            {"group_size": 1, "book_connections": 3},
+            r"max_l2_markets = 4 needs 4 book connections at group_size = 1",
+        ),
         ({"universe_refresh_s": 0}, "universe_refresh_s must be positive"),
         ({"status_interval_s": -1}, "status_interval_s must be positive"),
         ({"max_market_pages": 0}, "max_market_pages must be positive"),

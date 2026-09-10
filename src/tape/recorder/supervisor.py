@@ -4,19 +4,26 @@ Responsibility: own the life of one WebSocket connection for the recorder
 (docs/ARCHITECTURE.md 7.1 and 9, docs/INTERFACES.md 8.4). Every inbound frame is handed to
 the segment sink before anything parses it (ADR 0001); then its envelope is read and its
 sequence number checked per ``sid``; only then is the payload decoded into books and
-events. A sequence gap on a book subscription is written into the tape, the group's books
-are marked stale, and a ``get_snapshot`` is requested. A lost connection is written into
+events. Kalshi keeps one subscription per channel per connection and merges every further
+``subscribe`` into it (ADR 0020), so a book connection subscribes its channels once, for its
+whole market set, and changes membership with ``update_subscription``. An ``ok`` reply to a
+``subscribe`` is such a merge and is bound to the existing ``sid``; a subscribe left without
+a reply for any channel past its deadline fails the connection. A sequence gap on a book
+subscription is written into the tape, every book of the connection is marked stale, and a
+``get_snapshot`` names all of the connection's markets. A lost connection is written into
 the tape, every book is marked stale, the segment is rotated, and after a jittered
-exponential backoff the connection is rebuilt and every group resubscribed from the
-supervisor's own group table, because ``sid``s do not survive a connection.
+exponential backoff the connection is rebuilt and resubscribed from the supervisor's own
+group, because ``sid``s do not survive a connection.
 
 Invariants: per frame the order is sink, envelope, sequence check, everything else, so a
-decoder can never lose a frame; a book leaves the stale state only through a snapshot
-that arrived on a subscription of the current connection; the subscription table holds
-only ``sid``s the current connection assigned; a membership change is sent to every
-``sid`` of its group, and never while one of them is still unknown; the reconnect loop
-ends on :meth:`ConnectionSupervisor.stop` or after ``max_consecutive_failures``; and the
-module sleeps, draws randomness, and reads time only through what was injected.
+decoder can never lose a frame; a book is touched only by a frame on an orderbook
+subscription of the current connection for a market in the connection's market set, and it
+leaves the stale state only through such a snapshot; the subscription table holds only
+``sid``s the current connection assigned; a membership change is sent to every ``sid`` of the
+group, and never while a subscribe still awaits a reply; no subscribe awaits a reply longer
+than ``subscribe_timeout_ns`` on a live connection; the reconnect loop ends on
+:meth:`ConnectionSupervisor.stop` or after ``max_consecutive_failures``; and the module
+sleeps, draws randomness, and reads time only through what was injected.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ import asyncio
 import contextlib
 import logging
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, assert_never
@@ -60,7 +67,6 @@ from tape.recorder.planner import (
     RemoveGroup,
     RemoveMarkets,
     diff,
-    group_sort_key,
     to_commands,
 )
 from tape.recorder.writer import SegmentSink
@@ -70,6 +76,7 @@ from tape.wire import (
     Envelope,
     ErrorMsg,
     MarketLifecycleV2Msg,
+    OkMsg,
     OrderbookDeltaMsg,
     OrderbookSnapshotMsg,
     SubscribedMsg,
@@ -88,6 +95,7 @@ __all__ = [
     "CAPACITY_ERROR_CODES",
     "DEFAULT_BACKOFF_INITIAL_NS",
     "DEFAULT_BACKOFF_MAX_NS",
+    "DEFAULT_SUBSCRIBE_TIMEOUT_NS",
     "FIREHOSE_GROUP_ID",
     "MAX_RECENT_ERRORS",
     "ORDERBOOK_CHANNEL",
@@ -109,6 +117,9 @@ FIREHOSE_GROUP_ID: Final = "*"
 DEFAULT_BACKOFF_INITIAL_NS: Final = NS_PER_S // 2
 DEFAULT_BACKOFF_MAX_NS: Final = 30 * NS_PER_S
 """The reconnect cap from docs/ARCHITECTURE.md 7.1."""
+
+DEFAULT_SUBSCRIBE_TIMEOUT_NS: Final = 10 * NS_PER_S
+"""How long a subscribe may wait for a reply on every channel before the connection fails."""
 
 MAX_RECENT_ERRORS: Final = 64
 """Error frames kept in :attr:`ConnectionSupervisor.last_errors`; older ones are only counted."""
@@ -154,11 +165,11 @@ class SupervisorConfig(msgspec.Struct, frozen=True, kw_only=True):
     """What one connection carries and how hard it tries to stay up.
 
     Attributes:
-        conn_id: Connection id; every group given to the supervisor must carry it.
-        book_channels: Channels each group subscribes, one ``sid`` each.
+        conn_id: Connection id; the group given to the supervisor must carry it.
+        book_channels: Channels the connection's group subscribes, one ``sid`` each.
         firehose_channels: Channels subscribed once per connection with no market filter,
             for example ``("ticker",)`` on the control connection. A :class:`Group` cannot
-            express "every market", so these live outside the group table.
+            express "every market", so these live outside the group.
         use_yes_price: Request YES-leg prices for both book sides and convert accordingly
             (ADR 0006).
         persist: Write frames, commands, gaps, and connection events to the sink. When
@@ -167,10 +178,13 @@ class SupervisorConfig(msgspec.Struct, frozen=True, kw_only=True):
         backoff_max_ns: Cap on the nominal delay.
         max_consecutive_failures: Failures in a row tolerated before :meth:`run` raises;
             ``None`` retries until stopped.
+        subscribe_timeout_ns: How long a subscribe may wait for a ``subscribed`` or ``ok``
+            reply on every channel it names before the connection is failed.
 
     Raises:
-        ValueError: On a negative ``conn_id``, no channels at all, a non-positive initial
-            backoff, a cap below it, or a negative failure limit.
+        ValueError: On a negative ``conn_id``, no channels at all, a channel that is both a
+            book and a firehose channel, a non-positive initial backoff or subscribe
+            timeout, a backoff cap below the initial backoff, or a negative failure limit.
     """
 
     conn_id: int
@@ -181,12 +195,20 @@ class SupervisorConfig(msgspec.Struct, frozen=True, kw_only=True):
     backoff_initial_ns: int = DEFAULT_BACKOFF_INITIAL_NS
     backoff_max_ns: int = DEFAULT_BACKOFF_MAX_NS
     max_consecutive_failures: int | None = None
+    subscribe_timeout_ns: int = DEFAULT_SUBSCRIBE_TIMEOUT_NS
 
     def __post_init__(self) -> None:
         if self.conn_id < 0:
             raise ValueError(f"conn_id must be non-negative, got {self.conn_id}")
         if not self.book_channels and not self.firehose_channels:
             raise ValueError("a connection needs book_channels or firehose_channels")
+        shared = set(self.book_channels) & set(self.firehose_channels)
+        if shared:
+            # Kalshi would merge the filtered and unfiltered subscriptions into one (ADR 0020).
+            raise ValueError(
+                f"channels {sorted(shared)} are both book and firehose channels; a connection "
+                f"holds one subscription per channel"
+            )
         if self.backoff_initial_ns <= 0 or self.backoff_max_ns < self.backoff_initial_ns:
             raise ValueError(
                 f"need 0 < backoff_initial_ns <= backoff_max_ns, got "
@@ -195,6 +217,10 @@ class SupervisorConfig(msgspec.Struct, frozen=True, kw_only=True):
         limit = self.max_consecutive_failures
         if limit is not None and limit < 0:
             raise ValueError(f"max_consecutive_failures must be non-negative, got {limit}")
+        if self.subscribe_timeout_ns <= 0:
+            raise ValueError(
+                f"subscribe_timeout_ns must be positive, got {self.subscribe_timeout_ns}"
+            )
 
 
 class SupervisorStats(msgspec.Struct, frozen=True, kw_only=True):
@@ -229,10 +255,17 @@ class SupervisorStats(msgspec.Struct, frozen=True, kw_only=True):
 
 @dataclass(slots=True)
 class _PendingSubscribe:
-    """A ``subscribe`` whose ``subscribed`` responses have not all arrived."""
+    """A ``subscribe`` that some of its channels have not answered yet.
+
+    Attributes:
+        group_id: Group the subscribe was sent for.
+        channels: Channels still awaiting a ``subscribed`` or ``ok`` reply.
+        expiry: Task that fails the connection if the replies do not arrive in time.
+    """
 
     group_id: str
     channels: set[str]
+    expiry: asyncio.Task[None]
 
 
 class ConnectionSupervisor:
@@ -253,6 +286,8 @@ class ConnectionSupervisor:
         on_event: Receives every trade, ticker, lifecycle event, and gap, and every snapshot
             and delta that was applied to a book. Exceptions it raises are logged and
             counted, never propagated, because nothing downstream may stop the recorder.
+        deadline_sleep: Waits out ``config.subscribe_timeout_ns``, given in seconds. Kept
+            apart from ``sleep`` so reply deadlines never interleave with reconnect backoff.
         logger: Destination for logs; defaults to this module's logger.
 
     Raises:
@@ -270,6 +305,7 @@ class ConnectionSupervisor:
         jitter: Callable[[], float],
         sink: SegmentSink | None = None,
         on_event: Callable[[MarketEvent], None] | None = None,
+        deadline_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         logger: logging.Logger | None = None,
     ) -> None:
         if config.persist and sink is None:
@@ -283,16 +319,19 @@ class ConnectionSupervisor:
         self._jitter = jitter
         self._sink = sink
         self._on_event = on_event
+        self._deadline_sleep = deadline_sleep
         self._log = logger if logger is not None else logging.getLogger(__name__)
-        # Survives reconnects: the desired groups and the books they feed.
-        self._desired = Plan(groups=())
+        # Survives reconnects: the desired group and the books it feeds.
+        self._desired: Group | None = None
         self._books: dict[str, Book] = {}
         # Rebuilt for every connection, because sids and sequence numbers are connection-scoped.
         self._session: WsSession | None = None
+        self._reply_failure: asyncio.Future[WsClosedError] | None = None
         self._tracker = GapTracker()
-        self._applied: dict[str, Group] = {}
+        self._applied: Group | None = None
         self._subscriptions: dict[int, SubscriptionInfo] = {}
         self._subscription_infos: tuple[SubscriptionInfo, ...] = ()
+        self._channel_of_sid: dict[int, str] = {}
         self._pending: dict[int, _PendingSubscribe] = {}
         self._resyncing: dict[int, set[str]] = {}
         self._reconcile_deferred = False
@@ -329,9 +368,9 @@ class ConnectionSupervisor:
         return MappingProxyType(self._books)
 
     @property
-    def groups(self) -> tuple[Group, ...]:
-        """The desired groups, applied now or on the next connection."""
-        return self._desired.groups
+    def group(self) -> Group | None:
+        """The desired group, applied now or on the next connection; ``None`` for no markets."""
+        return self._desired
 
     @property
     def subscriptions(self) -> tuple[SubscriptionInfo, ...]:
@@ -397,30 +436,32 @@ class ConnectionSupervisor:
             # frame stream after the frames already buffered.
             await self._exited.wait()
 
-    async def set_groups(self, groups: Sequence[Group]) -> None:
-        """Replace the group table and move the live connection to it.
+    async def set_group(self, group: Group | None) -> None:
+        """Replace the connection's market set and move the live connection to it.
 
-        The difference is sent as ``planner`` commands; if the connection is down, or a
-        subscribe is still waiting for its ``sid``s, it is applied as soon as that
-        changes. If a command cannot be sent, the connection is dropped so that the
-        reconnect resubscribes from the table rather than from a half-applied change.
+        The difference is sent as ``planner`` commands: a subscribe when the connection has
+        no markets yet, ``update_subscription`` for a membership change, and an unsubscribe
+        when ``group`` is ``None``. If the connection is down, or a subscribe is still
+        waiting for its replies, it is applied as soon as that changes. If a command cannot
+        be sent, the connection is dropped so that the reconnect resubscribes from the
+        desired group rather than from a half-applied change.
 
         Args:
-            groups: Every group this connection should carry.
+            group: Every market this connection should carry, or ``None`` for none.
 
         Raises:
-            ValueError: If a group belongs to another connection, two groups share an id
-                or a ticker, or groups are given to a connection without book channels.
+            ValueError: If the group belongs to another connection, or is given to a
+                connection without book channels.
         """
-        for group in groups:
+        if group is not None:
             if group.conn_id != self._config.conn_id:
                 raise ValueError(
                     f"group {group.group_id} is for connection {group.conn_id}, "
                     f"not {self._config.conn_id}"
                 )
-        if groups and not self._config.book_channels:
-            raise ValueError(f"connection {self._config.conn_id} has no book channels")
-        self._desired = Plan(groups=tuple(sorted(groups, key=group_sort_key)))
+            if not self._config.book_channels:
+                raise ValueError(f"connection {self._config.conn_id} has no book channels")
+        self._desired = group
         async with self._command_lock:
             session = self._session
             try:
@@ -455,9 +496,8 @@ class ConnectionSupervisor:
                 self._record_connection_event("open", "connected")
                 async with self._command_lock:
                     await self._reconcile_locked()
-                async for frame in session.frames():
-                    await self._on_frame(frame)
-                if not self._stop_requested.is_set():
+                failure = await self._consume(session)
+                if failure is None and not self._stop_requested.is_set():
                     failure = WsClosedError(
                         f"connection {self._config.conn_id} frame stream ended unrequested"
                     )
@@ -475,10 +515,39 @@ class ConnectionSupervisor:
             await self._end_connection(session, opened=opened, detail=detail)
         return failure
 
+    async def _consume(self, session: WsSession) -> WsClosedError | None:
+        """Handle frames until the stream ends or a subscribe outlives its reply deadline.
+
+        Returns:
+            The deadline failure, or ``None`` if the frame stream ended on its own.
+
+        Raises:
+            WsClosedError: If the frame stream failed.
+            KalshiTransportError: If a command sent while handling a frame timed out.
+        """
+        reply_failure = self._reply_failure
+        frames = asyncio.ensure_future(self._handle_frames(session))
+        waiters: set[asyncio.Future[None] | asyncio.Future[WsClosedError]] = {frames}
+        if reply_failure is not None:
+            waiters.add(reply_failure)
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            await _cancel(frames)
+        if not frames.cancelled() or reply_failure is None:
+            frames.result()
+            return None
+        return reply_failure.result()
+
+    async def _handle_frames(self, session: WsSession) -> None:
+        async for frame in session.frames():
+            await self._on_frame(frame)
+
     def _begin_connection(self, session: WsSession) -> None:
         """Adopt a new session with no connection-scoped state. Call with the lock held."""
         self._forget_connection()
         self._session = session
+        self._reply_failure = asyncio.get_running_loop().create_future()
 
     def _forget_connection(self) -> None:
         """Drop everything scoped to a connection: sids, sequences, pending commands.
@@ -487,10 +556,14 @@ class ConnectionSupervisor:
         change under it.
         """
         self._session = None
+        self._reply_failure = None
         self._tracker = GapTracker()
-        self._applied = {}
+        self._applied = None
         self._subscriptions.clear()
         self._publish_subscriptions()
+        self._channel_of_sid.clear()
+        for pending in self._pending.values():
+            pending.expiry.cancel()
         self._pending.clear()
         self._resyncing.clear()
         self._reconcile_deferred = False
@@ -558,11 +631,8 @@ class ConnectionSupervisor:
             # sleep waits a finite delay.
             await asyncio.wait((work_future, stop_future), return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for future in (stop_future, work_future):
-                if not future.done():
-                    future.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await future
+            await _cancel(stop_future)
+            await _cancel(work_future)
         if work_future.cancelled():
             return False
         work_future.result()
@@ -624,18 +694,20 @@ class ConnectionSupervisor:
                 self._emit(to_lifecycle(lifecycle, envelope, receipt))
             case "subscribed":
                 await self._on_subscribed(envelope)
+            case "ok":
+                await self._on_ok(envelope)
             case "unsubscribed":
                 if envelope.sid is not None:
                     self._tracker.forget(envelope.sid)
             case "error":
                 await self._on_error(envelope)
             case _:
-                # ``ok`` acknowledgements and types this supervisor does not interpret are
-                # already in the tape; there is nothing to apply.
+                # Types this supervisor does not interpret are already in the tape; there
+                # is nothing to apply.
                 return
 
     async def _on_gap(self, sid: int, gap: Gap, receipt: Receipt) -> None:
-        """Record a gap and, on a book subscription, stale its group and ask for snapshots."""
+        """Record a gap and, on a book subscription, stale the connection and resnapshot it."""
         self._gaps += 1
         payload = msgspec.json.encode(
             {"sid": sid, "expected_seq": gap.expected, "got_seq": gap.got}
@@ -654,7 +726,7 @@ class ConnectionSupervisor:
         )
         self._emit(GapEvent(receipt=receipt, sid=sid, expected_seq=gap.expected, got_seq=gap.got))
         # The hole may have swallowed a snapshot already requested, so ask for every market.
-        await self._resync_group(sid, ask_again=True)
+        await self._resync_connection(sid, ask_again=True)
 
     async def _on_duplicate(self, sid: int, duplicate: Duplicate) -> None:
         """Count a sequence number that did not advance, and resynchronize its books.
@@ -674,13 +746,15 @@ class ConnectionSupervisor:
                 "got_seq": duplicate.got,
             },
         )
-        await self._resync_group(sid, ask_again=False)
+        await self._resync_connection(sid, ask_again=False)
 
-    async def _resync_group(self, sid: int, *, ask_again: bool) -> None:
-        """Stale every book of a book subscription's group and request their snapshots.
+    async def _resync_connection(self, sid: int, *, ask_again: bool) -> None:
+        """Stale every book of the connection and request snapshots for all of its markets.
 
-        Only book subscriptions can be repaired: ``get_snapshot`` exists for the orderbook
-        channel alone, and a missed trade or lifecycle message leaves no book wrong.
+        The whole market set shares the one orderbook subscription (ADR 0020), so a sequence
+        fault on it may have touched any of them. Only book subscriptions can be repaired:
+        ``get_snapshot`` exists for the orderbook channel alone, and a missed trade or
+        lifecycle message leaves no book wrong.
 
         Args:
             sid: Subscription whose sequence misbehaved.
@@ -691,16 +765,16 @@ class ConnectionSupervisor:
             KalshiTransportError: If the request times out.
         """
         info = self._subscriptions.get(sid)
-        group = None if info is None else self._applied.get(info.group_id)
-        if info is None or group is None or info.channel != ORDERBOOK_CHANNEL:
+        applied = self._applied
+        if info is None or info.channel != ORDERBOOK_CHANNEL or applied is None:
             return
-        for ticker in group.tickers:
+        for ticker in applied.tickers:
             book = self._books.get(ticker)
             if book is not None:
                 book.mark_stale()
         if ask_again:
             self._resyncing.pop(sid, None)
-        await self._request_snapshot(sid, group.tickers)
+        await self._request_snapshot(sid, applied.tickers)
 
     def _on_snapshot(self, envelope: Envelope, receipt: Receipt) -> None:
         """Replace a book with a snapshot and clear its stale flag."""
@@ -747,14 +821,15 @@ class ConnectionSupervisor:
         """Return the book a book message may touch, or ``None`` if it may touch none.
 
         A message may touch a book only if it arrived on a live orderbook subscription of
-        this connection whose group holds the market; anything else is a straggler from a
-        subscription already retired, and applying it could revive a book no one updates.
+        this connection and names a market in the connection's market set, however that
+        market joined it; anything else is a straggler from a subscription or market already
+        retired, and applying it could revive a book no one updates.
         """
         info = self._subscriptions.get(sid)
+        applied = self._applied
         if info is None or info.channel != ORDERBOOK_CHANNEL:
             return None
-        group = self._applied.get(info.group_id)
-        if group is None or ticker not in group.tickers:
+        if applied is None or ticker not in applied.tickers:
             return None
         book = self._books.get(ticker)
         if book is None and create:
@@ -788,11 +863,11 @@ class ConnectionSupervisor:
     # ------------------------------------------------------------ subscriptions
 
     async def _reconcile_locked(self) -> None:
-        """Send what turns this connection's subscriptions into the desired groups.
+        """Send what turns this connection's subscriptions into the desired group.
 
-        Call with the command lock held. While any subscribe still awaits a ``sid`` the
-        work is deferred until the last one arrives, because a membership change sent then
-        would miss the channel whose ``sid`` is still unknown.
+        Call with the command lock held. While any subscribe still awaits a reply the work
+        is deferred until the last one arrives, because a membership change sent then would
+        miss the channel whose ``sid`` is still unknown.
 
         Raises:
             WsClosedError: If the connection closes while sending.
@@ -808,9 +883,8 @@ class ConnectionSupervisor:
         if firehose and not self._firehose_requested:
             self._firehose_requested = True
             command_id = await self._send(session, SubscribeCommand(channels=firehose))
-            self._pending[command_id] = _PendingSubscribe(FIREHOSE_GROUP_ID, set(firehose))
-        applied = Plan(groups=tuple(sorted(self._applied.values(), key=group_sort_key)))
-        for change in diff(applied, self._desired):
+            self._await_replies(command_id, FIREHOSE_GROUP_ID, firehose)
+        for change in diff(_plan_of(self._applied), _plan_of(self._desired)):
             commands = to_commands(
                 (change,),
                 channels=self._config.book_channels,
@@ -820,39 +894,52 @@ class ConnectionSupervisor:
             for command in commands:
                 command_id = await self._send(session, command)
                 if isinstance(change, AddGroup):
-                    self._pending[command_id] = _PendingSubscribe(
-                        change.group.group_id, set(self._config.book_channels)
+                    self._await_replies(
+                        command_id, change.group.group_id, self._config.book_channels
                     )
             self._record_change(change)
 
     def _record_change(self, change: PlanChange) -> None:
-        """Update the applied table once a change's commands are on the wire."""
+        """Update the applied group once a change's commands are on the wire."""
         if isinstance(change, AddGroup):
-            self._applied[change.group.group_id] = change.group
+            self._applied = change.group
         elif isinstance(change, RemoveGroup):
-            group = self._applied.pop(change.group_id)
+            group = self._applied_group(change.group_id)
+            self._applied = None
             for sid in [s for s, i in self._subscriptions.items() if i.group_id == group.group_id]:
                 del self._subscriptions[sid]
                 self._resyncing.pop(sid, None)
             self._publish_subscriptions()
             self._release_books(group.tickers)
         elif isinstance(change, AddMarkets):
-            group = self._applied[change.group_id]
-            self._applied[change.group_id] = msgspec.structs.replace(
+            group = self._applied_group(change.group_id)
+            self._applied = msgspec.structs.replace(
                 group, tickers=group.tickers | frozenset(change.tickers)
             )
         elif isinstance(change, RemoveMarkets):
-            group = self._applied[change.group_id]
-            self._applied[change.group_id] = msgspec.structs.replace(
+            group = self._applied_group(change.group_id)
+            self._applied = msgspec.structs.replace(
                 group, tickers=group.tickers - frozenset(change.tickers)
             )
             self._release_books(change.tickers)
         else:
             assert_never(change)
 
+    def _applied_group(self, group_id: str) -> Group:
+        """Return the applied group a change names.
+
+        Raises:
+            RuntimeError: If no such group is applied; ``diff`` of the applied group never
+                names another, so this is a supervisor bug.
+        """
+        applied = self._applied
+        if applied is None or applied.group_id != group_id:
+            raise RuntimeError(f"connection {self._config.conn_id} has no applied {group_id}")
+        return applied
+
     def _release_books(self, tickers: Iterable[str]) -> None:
-        """Stale books of markets moving to another group; drop books of markets leaving."""
-        wanted = self._desired.tickers
+        """Stale books of markets still wanted here; drop books of markets leaving."""
+        wanted = _tickers_of(self._desired)
         for ticker in tickers:
             if ticker in wanted:
                 book = self._books.get(ticker)
@@ -863,14 +950,67 @@ class ConnectionSupervisor:
 
     def _prune_books(self) -> None:
         """Drop books of markets neither desired nor still subscribed."""
-        keep = self._desired.tickers | {t for g in self._applied.values() for t in g.tickers}
+        keep = _tickers_of(self._desired) | _tickers_of(self._applied)
         for ticker in [t for t in self._books if t not in keep]:
             del self._books[ticker]
+
+    def _await_replies(self, command_id: int, group_id: str, channels: Iterable[str]) -> None:
+        """Track a subscribe just sent until every channel it names has answered."""
+        expiry = asyncio.create_task(
+            self._expire_unanswered(command_id),
+            name=f"subscribe-deadline-{self._config.conn_id}-{command_id}",
+        )
+        self._pending[command_id] = _PendingSubscribe(
+            group_id=group_id, channels=set(channels), expiry=expiry
+        )
+
+    async def _expire_unanswered(self, command_id: int) -> None:
+        """Fail the connection if a subscribe still lacks a reply once its deadline passes.
+
+        Left pending, the subscribe would defer every later change on the connection
+        forever. A reconnect starts from a clean subscription table instead. The task is
+        cancelled as soon as the subscribe is answered, refused, or its connection ends.
+        """
+        timeout_ns = self._config.subscribe_timeout_ns
+        await self._deadline_sleep(timeout_ns / NS_PER_S)
+        pending = self._pending.get(command_id)
+        reply_failure = self._reply_failure
+        if pending is None or reply_failure is None or reply_failure.done():
+            return
+        channels = ", ".join(sorted(pending.channels))
+        self._log.error(
+            "subscribe unanswered; reconnecting",
+            extra={
+                "conn_id": self._config.conn_id,
+                "command_id": command_id,
+                "channels": sorted(pending.channels),
+                "timeout_ns": timeout_ns,
+            },
+        )
+        reply_failure.set_result(
+            WsClosedError(
+                f"connection {self._config.conn_id} subscribe {command_id} had no reply for "
+                f"{channels} within {timeout_ns} ns"
+            )
+        )
+
+    def _answer(self, command_id: int, pending: _PendingSubscribe, sid: int, channel: str) -> None:
+        """Bind a channel's ``sid`` to the subscribe it answers. Call with the lock held."""
+        self._subscriptions[sid] = SubscriptionInfo(
+            sid=sid, channel=channel, group_id=pending.group_id
+        )
+        self._publish_subscriptions()
+        pending.channels.discard(channel)
+        if not pending.channels:
+            del self._pending[command_id]
+            pending.expiry.cancel()
 
     async def _on_subscribed(self, envelope: Envelope) -> None:
         """Bind a new ``sid`` to the group whose subscribe it answers."""
         msg = decode_msg(envelope, SubscribedMsg)
         async with self._command_lock:
+            # Remembered even when unmatched: a sid names one channel for its connection's life.
+            self._channel_of_sid[msg.sid] = msg.channel
             pending = None if envelope.id is None else self._pending.get(envelope.id)
             if envelope.id is None or pending is None:
                 self._log.warning(
@@ -878,14 +1018,72 @@ class ConnectionSupervisor:
                     extra={"conn_id": self._config.conn_id, "command_id": envelope.id},
                 )
                 return
-            self._subscriptions[msg.sid] = SubscriptionInfo(
-                sid=msg.sid, channel=msg.channel, group_id=pending.group_id
+            self._answer(envelope.id, pending, msg.sid, msg.channel)
+            await self._resume_reconcile()
+
+    async def _on_ok(self, envelope: Envelope) -> None:
+        """Treat an ``ok`` that answers a subscribe as a merge into an existing subscription.
+
+        Kalshi keeps one subscription per channel per connection; a subscribe naming a
+        channel the connection already has is merged into it and answered with ``ok``,
+        carrying that ``sid`` and the merged membership (ADR 0020). ``ok`` replies to
+        ``update_subscription`` need nothing: the change was recorded when it was sent.
+        """
+        async with self._command_lock:
+            command_id, sid = envelope.id, envelope.sid
+            pending = None if command_id is None else self._pending.get(command_id)
+            if command_id is None or pending is None:
+                return
+            channel = None if sid is None else self._channel_of_sid.get(sid)
+            if sid is None or channel is None or channel not in pending.channels:
+                # Left to the reply deadline: the channel it answers cannot be known.
+                self._log.warning(
+                    "ok reply to a subscribe names no subscription it could merge into",
+                    extra={"conn_id": self._config.conn_id, "command_id": command_id, "sid": sid},
+                )
+                return
+            msg = decode_msg(envelope, OkMsg)
+            self._log.info(
+                "subscribe merged into an existing subscription",
+                extra={"conn_id": self._config.conn_id, "command_id": command_id, "sid": sid},
             )
-            self._publish_subscriptions()
-            pending.channels.discard(msg.channel)
-            if not pending.channels:
-                del self._pending[envelope.id]
-                await self._resume_reconcile()
+            self._answer(command_id, pending, sid, channel)
+            await self._adopt_membership(pending, sid, channel, msg.market_tickers)
+            await self._resume_reconcile()
+
+    async def _adopt_membership(
+        self,
+        pending: _PendingSubscribe,
+        sid: int,
+        channel: str,
+        market_tickers: list[str] | None,
+    ) -> None:
+        """Make a merged subscription's membership the connection's market set.
+
+        The merged subscription may hold markets the subscribe did not name, so the next
+        reconciliation compares it with the desired group. Which markets of a merge Kalshi
+        snapshots is undocumented, and a market the subscription already held may get none,
+        so a snapshot is requested for every merged market wanted here without a fresh book.
+
+        Raises:
+            WsClosedError: If the snapshot request cannot be sent because the connection closed.
+            KalshiTransportError: If the snapshot request times out.
+        """
+        applied = self._applied
+        if not market_tickers or applied is None or applied.group_id != pending.group_id:
+            return
+        merged = frozenset(market_tickers)
+        if merged != applied.tickers:
+            self._applied = msgspec.structs.replace(applied, tickers=merged)
+            self._reconcile_deferred = True
+        if channel != ORDERBOOK_CHANNEL:
+            return
+        wanted = merged & _tickers_of(self._desired)
+        await self._request_snapshot(sid, [ticker for ticker in wanted if not self._fresh(ticker)])
+
+    def _fresh(self, ticker: str) -> bool:
+        book = self._books.get(ticker)
+        return book is not None and not book.is_stale()
 
     async def _on_error(self, envelope: Envelope) -> None:
         """Count and surface an error frame; a refused subscribe or snapshot may be retried."""
@@ -912,16 +1110,17 @@ class ConnectionSupervisor:
             pending = self._pending.pop(envelope.id, None)
             if pending is None:
                 return
+            pending.expiry.cancel()
             if pending.group_id == FIREHOSE_GROUP_ID:
                 self._firehose_requested = False
             elif all(info.group_id != pending.group_id for info in self._subscriptions.values()):
                 # Nothing was subscribed, so the group is not applied; the next
                 # reconciliation subscribes it again.
-                self._applied.pop(pending.group_id, None)
+                self._applied = None
             await self._resume_reconcile()
 
     async def _resume_reconcile(self) -> None:
-        """Run a deferred reconciliation once no subscribe awaits a ``sid``. Lock held."""
+        """Run a deferred reconciliation once no subscribe awaits a reply. Lock held."""
         if self._reconcile_deferred and not self._pending:
             self._reconcile_deferred = False
             await self._reconcile_locked()
@@ -999,3 +1198,20 @@ class ConnectionSupervisor:
                 "detail": exc.detail,
             },
         )
+
+
+def _plan_of(group: Group | None) -> Plan:
+    """The one-group plan ``diff`` compares; a connection carries at most one group."""
+    return Plan(groups=() if group is None else (group,))
+
+
+def _tickers_of(group: Group | None) -> frozenset[str]:
+    return frozenset() if group is None else group.tickers
+
+
+async def _cancel[T](future: asyncio.Future[T]) -> None:
+    """Cancel a future unless it is done, and wait for the cancellation to land."""
+    if not future.done():
+        future.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await future

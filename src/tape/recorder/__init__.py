@@ -1,7 +1,7 @@
 """The recorder's pure decisions: what to capture, how to subscribe, and where data has holes.
 
-``universe`` chooses the markets that earn full order-book capture, ``planner`` splits
-them into subscription groups and turns plan changes into WebSocket commands (ADR 0010),
+``universe`` chooses the markets that earn full order-book capture, ``planner`` assigns
+them to order-book connections and turns plan changes into WebSocket commands (ADR 0020),
 and ``gaps`` detects sequence discontinuities per subscription (docs/INTERFACES.md 8).
 """
 

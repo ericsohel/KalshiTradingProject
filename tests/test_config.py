@@ -107,7 +107,7 @@ def test_only_identity_and_paths_are_required_and_everything_else_has_a_default(
     recorder = settings.recorder
     assert (recorder.max_connections, recorder.book_connections, recorder.group_size) == (
         16,
-        2,
+        4,
         500,
     )
     assert (recorder.keyframe_interval_s, recorder.audit_interval_s) == (300, 300)
@@ -194,6 +194,7 @@ def test_environment_overrides_replace_and_add_values(
             "TAPE_KALSHI__WS_PING_TIMEOUT_S": "15",
             "TAPE_KALSHI__WS_SILENCE_TIMEOUT_S": "90",
             "TAPE_RECORDER__GROUP_SIZE": "200",
+            "TAPE_RECORDER__BOOK_CONNECTIONS": "10",
             "TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES": "KXA, KXB,",
             "TAPE_RECORDER__UNIVERSE__EXCLUDE_MVE": "false",
             "TAPE_RECORDER__UNIVERSE__MIN_VOLUME_24H": "5.00",
@@ -205,7 +206,7 @@ def test_environment_overrides_replace_and_add_values(
     assert settings.kalshi.private_key_path == key
     assert (settings.kalshi.ws_ping_interval_s, settings.kalshi.ws_ping_timeout_s) == (5, 15)
     assert settings.kalshi.ws_silence_timeout_s == 90
-    assert settings.recorder.group_size == 200
+    assert (settings.recorder.group_size, settings.recorder.book_connections) == (200, 10)
     assert settings.recorder.universe == UniverseSettings(
         min_volume_24h="5.00", showcase_series=("KXA", "KXB"), exclude_mve=False
     )
@@ -261,7 +262,7 @@ def test_an_override_into_a_value_that_is_not_a_table_is_refused(tmp_path: Path)
         (("kalshi", "ws_silence_timeout_s"), -1, r"at `\$\.kalshi\.ws_silence_timeout_s`"),
         (("kalshi", "ws_silence_timeout_s"), 0, r">= 1 - at `\$\.kalshi\.ws_silence_timeout_s`"),
         (("recorder", "data_dir"), DELETE, "missing required field `data_dir`"),
-        (("recorder", "max_connections"), 3, r"needs 4 connections.*max_connections = 3"),
+        (("recorder", "max_connections"), 3, r"needs 6 connections.*max_connections = 3"),
         (("recorder", "book_connections"), 0, r"at `\$\.recorder\.book_connections`"),
         (("recorder", "group_size"), 0, r">= 1 - at `\$\.recorder\.group_size`"),
         (("recorder", "group_size"), 501, r"<= 500 - at `\$\.recorder\.group_size`"),
@@ -302,6 +303,27 @@ def test_every_invalid_value_is_refused_with_its_location(
         body[setting] = value
     with pytest.raises(ConfigError, match=message):
         load_all(tmp_path, tables)
+
+
+def test_a_universe_the_book_connections_cannot_carry_is_refused_with_the_fix(
+    tmp_path: Path, tables: Tables
+) -> None:
+    """Each book connection carries at most group_size markets in one subscription (ADR 0020)."""
+    tables["recorder"] |= {"book_connections": 2, "group_size": 500}
+    tables["recorder.universe"] = {"max_l2_markets": 1001}
+    with pytest.raises(
+        ConfigError,
+        match=(
+            r"max_l2_markets = 1001 needs 3 book connections at group_size = 500, but "
+            r"book_connections = 2 carry only 1000 markets; set book_connections to at least 3 "
+            r"\(and max_connections to at least 5\) or lower max_l2_markets to 1000"
+        ),
+    ):
+        load_all(tmp_path, tables)
+    tables["recorder.universe"] = {"max_l2_markets": 1000}
+    assert load(tmp_path, tables).universe.max_l2_markets == 1000
+    with pytest.raises(ConfigError, match="set book_connections to at least 5"):
+        load_all(tmp_path, tables, {"TAPE_RECORDER__UNIVERSE__MAX_L2_MARKETS": "2001"})
 
 
 def test_the_private_key_must_be_a_file_only_its_owner_can_read(

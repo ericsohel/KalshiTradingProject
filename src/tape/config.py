@@ -33,6 +33,7 @@ from tape.errors import ConfigError, FixedPointError
 from tape.fixedpoint import parse_count
 from tape.recorder.recorder import (
     MAX_GROUP_SIZE,
+    check_book_capacity,
     check_connection_budget,
     check_keyframe_interval,
 )
@@ -194,8 +195,9 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
         data_dir: Root of ``raw/`` and ``keyframes/``; created on first write.
         max_connections: Ceiling on WebSocket connections the recorder opens.
         book_connections: Connections carrying order-book groups, after the live-only
-            ticker connection and the taped control connection.
-        group_size: Most markets per subscription group (ADR 0010).
+            ticker connection and the taped control connection. Together they must carry
+            ``universe.max_l2_markets`` at ``group_size`` markets each.
+        group_size: Most markets on one book connection (ADR 0020).
         keyframe_interval_s: Seconds between keyframes; whole minutes dividing an hour.
         audit_interval_s: Seconds between REST audits.
         audit_sample: Books sampled per audit.
@@ -205,13 +207,14 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
         universe: The ``[recorder.universe]`` section.
 
     Raises:
-        ValueError: If the connection layout does not fit ``max_connections`` or the
-            keyframe interval does not tile an hour.
+        ValueError: If the connection layout does not fit ``max_connections``, the book
+            connections cannot carry ``universe.max_l2_markets``, or the keyframe interval
+            does not tile an hour.
     """
 
     data_dir: Path
     max_connections: PositiveInt = 16
-    book_connections: PositiveInt = 2
+    book_connections: PositiveInt = 4
     group_size: Annotated[int, msgspec.Meta(ge=1, le=MAX_GROUP_SIZE)] = MAX_GROUP_SIZE
     keyframe_interval_s: PositiveInt = 300
     audit_interval_s: PositiveInt = 300
@@ -224,6 +227,11 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
     def __post_init__(self) -> None:
         check_connection_budget(
             book_connections=self.book_connections, max_connections=self.max_connections
+        )
+        check_book_capacity(
+            max_l2_markets=self.universe.max_l2_markets,
+            group_size=self.group_size,
+            book_connections=self.book_connections,
         )
         check_keyframe_interval(self.keyframe_interval_s)
 

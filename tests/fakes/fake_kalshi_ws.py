@@ -4,10 +4,15 @@ The double covers docs/DATA_FORMATS.md 3.2 well enough that a client cannot tell
 difference for the parts we depend on: it records the handshake headers, answers
 ``subscribe`` with one ``subscribed`` per channel carrying an incrementing sid,
 answers ``update_subscription`` with ``ok`` and ``unsubscribe`` with ``unsubscribed``,
-and keeps a per-sid ``seq`` counter. Everything a test needs to provoke is explicit:
-pushing arbitrary frames (malformed ones included), pushing an error frame, skipping a
-sequence number, going silent, no longer reading the socket (so pings go unanswered), and
-dropping the socket without a close handshake.
+and keeps a per-sid ``seq`` counter. Like the production exchange (observed 2026-09-10,
+ADR 0020) a connection holds one subscription per channel: a ``subscribe`` naming a channel
+the connection already subscribes is merged into that subscription and answered with a
+sequenced ``ok`` carrying its sid and the merged ``market_tickers``, never a new sid.
+
+Everything a test needs to provoke is explicit: pushing arbitrary frames (malformed ones
+included), pushing an error frame, skipping a sequence number, going silent, no longer
+reading the socket (so pings go unanswered), and dropping the socket without a close
+handshake.
 
 Order books are opt-in: a market given a book with :meth:`FakeKalshiWs.set_book` gets a
 sequenced ``orderbook_snapshot`` on its ``orderbook_delta`` sid when it is subscribed,
@@ -237,20 +242,46 @@ class FakeConnection:
 
     def _subscribe(self, command_id: Any, params: Mapping[str, Any]) -> list[dict[str, Any]]:
         replies: list[dict[str, Any]] = []
+        incoming: list[str] = list(params.get("market_tickers") or [])
         for channel in params.get("channels", []):
-            sid = self._next_sid
-            self._next_sid += 1
-            self._subscriptions[sid] = {
-                "channel": channel,
-                "market_tickers": list(params.get("market_tickers") or []),
-            }
-            self._seq_by_sid[sid] = 0
-            replies.append(
-                {"id": command_id, "type": "subscribed", "msg": {"channel": channel, "sid": sid}}
-            )
+            existing = self._sid_of_channel(channel)
+            if existing is None:
+                sid = self._next_sid
+                self._next_sid += 1
+                self._subscriptions[sid] = {"channel": channel, "market_tickers": incoming}
+                self._seq_by_sid[sid] = 0
+                replies.append(
+                    {
+                        "id": command_id,
+                        "type": "subscribed",
+                        "msg": {"channel": channel, "sid": sid},
+                    }
+                )
+                added = incoming
+            else:
+                sid = existing
+                subscription = self._subscriptions[sid]
+                held: list[str] = subscription["market_tickers"]
+                added = [ticker for ticker in incoming if ticker not in held]
+                subscription["market_tickers"] = held + added
+                replies.append(
+                    {
+                        "id": command_id,
+                        "sid": sid,
+                        "seq": self._next_seq(sid),
+                        "type": "ok",
+                        "msg": {"market_tickers": list(subscription["market_tickers"])},
+                    }
+                )
             if params.get("send_initial_snapshot") is not False:
-                replies.extend(self._snapshots(sid, params.get("market_tickers") or []))
+                replies.extend(self._snapshots(sid, added))
         return replies
+
+    def _sid_of_channel(self, channel: str) -> int | None:
+        """Return the sid of the connection's subscription to ``channel``, if it has one."""
+        return next(
+            (sid for sid, info in self._subscriptions.items() if info["channel"] == channel), None
+        )
 
     def _update_subscription(
         self, command_id: Any, params: Mapping[str, Any]

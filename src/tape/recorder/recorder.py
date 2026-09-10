@@ -12,7 +12,9 @@ arrive fully built, so the orchestration is tested against a fake exchange in vi
 Connection layout (ADR 0018): connection 0 is live-only and carries the unfiltered
 ``ticker`` channel, whose latest value per market is kept in memory and never written;
 connection 1 is taped and carries ``market_lifecycle_v2``; connections 2 onwards are taped
-and carry the planner's ``orderbook_delta`` and ``trade`` groups with ``use_yes_price``.
+and each carries one planner group, its whole market set, on ``orderbook_delta`` and
+``trade`` with ``use_yes_price``, because Kalshi keeps one subscription per channel per
+connection (ADR 0020).
 Only connection 0, which always carries traffic, has a data-silence timeout; every
 connection relies on the transport keepalive for liveness (ADR 0019).
 
@@ -82,6 +84,7 @@ __all__ = [
     "RecorderStatus",
     "SessionBuilder",
     "SinkBuilder",
+    "check_book_capacity",
     "check_connection_budget",
     "check_keyframe_interval",
     "is_clock_jump",
@@ -103,7 +106,7 @@ LIFECYCLE_CHANNEL: Final = "market_lifecycle_v2"
 BOOK_CHANNELS: Final = (ORDERBOOK_CHANNEL, "trade")
 
 MAX_GROUP_SIZE: Final = 500
-"""Most markets in one subscription group (ADR 0010)."""
+"""Most markets on one order-book connection, all in its one subscription (ADR 0020)."""
 
 PINNED_SPEC_VERSIONS: Final[Mapping[str, str]] = MappingProxyType(
     {"openapi": "3.30.0", "asyncapi": "2.0.0"}
@@ -164,6 +167,34 @@ def check_connection_budget(*, book_connections: int, max_connections: int) -> N
             f"ticker connection, one control connection, and the book connections), but "
             f"max_connections = {max_connections}"
         )
+
+
+def check_book_capacity(*, max_l2_markets: int, group_size: int, book_connections: int) -> None:
+    """Check that the book connections can carry the order-book universe.
+
+    Each book connection carries at most ``group_size`` markets (ADR 0020), so the budget
+    needs ``ceil(max_l2_markets / group_size)`` of them. Showcase markets may still exceed
+    the budget at run time; the recorder logs the markets it has no room for.
+
+    Args:
+        max_l2_markets: Budget of order-book markets.
+        group_size: Most markets on one book connection; positive.
+        book_connections: Connections carrying order-book groups.
+
+    Raises:
+        ValueError: If ``book_connections * group_size < max_l2_markets``; the message names
+            the settings that would fix it.
+    """
+    capacity = book_connections * group_size
+    if capacity >= max_l2_markets:
+        return
+    needed = -(-max_l2_markets // group_size)
+    raise ValueError(
+        f"max_l2_markets = {max_l2_markets} needs {needed} book connections at group_size = "
+        f"{group_size}, but book_connections = {book_connections} carry only {capacity} "
+        f"markets; set book_connections to at least {needed} (and max_connections to at "
+        f"least {FIRST_BOOK_CONN_ID + needed}) or lower max_l2_markets to {capacity}"
+    )
 
 
 def check_keyframe_interval(interval_s: int) -> None:
@@ -267,8 +298,8 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
         host: Host name written into every segment header.
         universe: Which markets earn order-book capture.
         max_connections: Ceiling on connections.
-        book_connections: Connections carrying order-book groups.
-        group_size: Most markets per subscription group.
+        book_connections: Connections carrying order-book groups, one group each.
+        group_size: Most markets on one book connection.
         keyframe_interval_s: Seconds between keyframes.
         universe_refresh_s: Seconds between market listings; a failed listing is retried
             sooner, see :func:`universe_retry_delay_s`.
@@ -281,8 +312,9 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     Raises:
         ValueError: On a layout over ``max_connections``, a group size outside
-            ``[1, MAX_GROUP_SIZE]``, a keyframe interval that does not tile an hour, or a
-            non-positive interval, cap, or timeout.
+            ``[1, MAX_GROUP_SIZE]``, book connections too few for ``universe.max_l2_markets``,
+            a keyframe interval that does not tile an hour, or a non-positive interval, cap,
+            or timeout.
     """
 
     env: str
@@ -291,7 +323,7 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
     host: str
     universe: UniversePolicy
     max_connections: int = 16
-    book_connections: int = 2
+    book_connections: int = 4
     group_size: int = MAX_GROUP_SIZE
     keyframe_interval_s: int = 300
     universe_refresh_s: int = 300
@@ -308,6 +340,11 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
         check_keyframe_interval(self.keyframe_interval_s)
         if not 1 <= self.group_size <= MAX_GROUP_SIZE:
             raise ValueError(f"group_size must be in [1, {MAX_GROUP_SIZE}], got {self.group_size}")
+        check_book_capacity(
+            max_l2_markets=self.universe.max_l2_markets,
+            group_size=self.group_size,
+            book_connections=self.book_connections,
+        )
         for name in (
             "universe_refresh_s",
             "status_interval_s",
@@ -351,7 +388,7 @@ class RecorderStatus(msgspec.Struct, frozen=True, kw_only=True):
     Attributes:
         connections: Every connection, by ascending id.
         universe_size: Markets the last universe selection chose.
-        subscribed_markets: Markets in groups whose subscriptions are live now.
+        subscribed_markets: Markets of book connections whose subscriptions are live now.
         live_tickers: Markets with a latest ``ticker`` value in memory.
     """
 
@@ -541,10 +578,11 @@ class Recorder:
         for conn_id, supervisor in sorted(self._supervisors.items()):
             stats = supervisor.stats
             sink = self._sinks.get(conn_id)
-            live_groups = {info.group_id for info in supervisor.subscriptions}
-            subscribed += sum(
-                len(g.tickers) for g in supervisor.groups if g.group_id in live_groups
-            )
+            group = supervisor.group
+            if group is not None and any(
+                info.group_id == group.group_id for info in supervisor.subscriptions
+            ):
+                subscribed += len(group.tickers)
             connections.append(
                 ConnectionStatus(
                     conn_id=conn_id,
@@ -873,7 +911,7 @@ class Recorder:
         self._universe_wait_s = self._config.universe_refresh_s
 
     async def _refresh_universe(self) -> None:
-        """List open markets, select the universe, replan, and hand each connection its groups.
+        """List open markets, select the universe, replan, and hand each connection its group.
 
         Raises:
             KalshiError: If a listing page cannot be fetched.
@@ -884,18 +922,31 @@ class Recorder:
         decision = select(summaries, self._config.universe, now_ts=now_wall_ns // NS_PER_S)
         desired = plan(
             decision.l2_tickers,
-            shard_of={summary.ticker: summary.exchange_index for summary in summaries},
             max_per_group=self._config.group_size,
             max_connections=self._config.book_connections,
             previous=self._plan,
         )
-        groups_by_conn: dict[int, list[Group]] = {conn_id: [] for conn_id in self._book_conn_ids()}
-        for group in desired.groups:
-            # The planner numbers book connections from zero; the recorder's start at 2.
-            conn_id = FIRST_BOOK_CONN_ID + group.conn_id
-            groups_by_conn[conn_id].append(msgspec.structs.replace(group, conn_id=conn_id))
-        for conn_id, groups in groups_by_conn.items():
-            await self._supervisors[conn_id].set_groups(groups)
+        # The planner numbers book connections from zero; the recorder's start at 2.
+        group_of_conn: dict[int, Group] = {
+            FIRST_BOOK_CONN_ID + group.conn_id: msgspec.structs.replace(
+                group, conn_id=FIRST_BOOK_CONN_ID + group.conn_id
+            )
+            for group in desired.groups
+        }
+        for conn_id in self._book_conn_ids():
+            await self._supervisors[conn_id].set_group(group_of_conn.get(conn_id))
+        unplaced = decision.l2_tickers - desired.tickers
+        if unplaced:
+            # Possible only when showcase markets alone exceed the budget, which configuration
+            # validation otherwise guarantees the book connections can carry.
+            self._log.error(
+                "markets left without a book connection; raise book_connections",
+                extra={
+                    "unplaced": len(unplaced),
+                    "first_unplaced": sorted(unplaced)[0],
+                    "book_capacity": self._config.book_connections * self._config.group_size,
+                },
+            )
         self._plan = desired
         self._universe = decision
         self._conn_of = {
@@ -914,6 +965,7 @@ class Recorder:
                 "dropped_for_cap": decision.dropped_for_cap,
                 "reason_counts": dict(decision.reason_counts),
                 "groups": len(desired.groups),
+                "unplaced": len(unplaced),
             },
         )
 

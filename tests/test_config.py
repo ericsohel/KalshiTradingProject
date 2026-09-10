@@ -118,6 +118,11 @@ def test_only_identity_and_paths_are_required_and_everything_else_has_a_default(
         5000,
     )
     assert (recorder.universe_refresh_s, recorder.status_interval_s) == (300, 60)
+    assert (recorder.bus_endpoint, recorder.bus_refresh_s, recorder.bus_send_hwm) == (
+        None,
+        10,
+        10_000,
+    )
     assert recorder.universe.policy() == UniversePolicy(
         min_volume_24h=CountE2(100_000),
         max_l2_markets=2000,
@@ -203,6 +208,9 @@ def test_environment_overrides_replace_and_add_values(
             "TAPE_RECORDER__AUDIT_LEAD_MS": "5000",
             "TAPE_RECORDER__AUDIT_SETTLE_MS": "1",
             "TAPE_RECORDER__AUDIT_TAP_MAX_EVENTS": "50000",
+            "TAPE_RECORDER__BUS_ENDPOINT": "ipc:///run/tape/bus.sock",
+            "TAPE_RECORDER__BUS_REFRESH_S": "60",
+            "TAPE_RECORDER__BUS_SEND_HWM": "1000",
             "TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES": "KXA, KXB,",
             "TAPE_RECORDER__UNIVERSE__EXCLUDE_MVE": "false",
             "TAPE_RECORDER__UNIVERSE__MIN_VOLUME_24H": "5.00",
@@ -220,6 +228,11 @@ def test_environment_overrides_replace_and_add_values(
         5000,
         1,
         50000,
+    )
+    assert (recorder.bus_endpoint, recorder.bus_refresh_s, recorder.bus_send_hwm) == (
+        "ipc:///run/tape/bus.sock",
+        60,
+        1000,
     )
     assert settings.recorder.universe == UniverseSettings(
         min_volume_24h="5.00", showcase_series=("KXA", "KXB"), exclude_mve=False
@@ -299,6 +312,13 @@ def test_an_override_into_a_value_that_is_not_a_table_is_refused(tmp_path: Path)
         (("recorder", "writer_queue_max"), 0, r"at `\$\.recorder\.writer_queue_max`"),
         (("recorder", "universe_refresh_s"), 0, r"at `\$\.recorder\.universe_refresh_s`"),
         (("recorder", "status_interval_s"), 0, r"at `\$\.recorder\.status_interval_s`"),
+        (("recorder", "bus_endpoint"), "ipc://bus.sock", r"ipc path must be absolute - at `\$\."),
+        (("recorder", "bus_endpoint"), "udp://127.0.0.1:1", r"ipc:///absolute/path or tcp://"),
+        (("recorder", "bus_endpoint"), 5, r"Expected `str \| null`, got `int` - at `\$\.recorder"),
+        (("recorder", "bus_refresh_s"), 0, r">= 1 - at `\$\.recorder\.bus_refresh_s`"),
+        (("recorder", "bus_refresh_s"), 61, r"<= 60 - at `\$\.recorder\.bus_refresh_s`"),
+        (("recorder", "bus_send_hwm"), 999, r">= 1000 - at `\$\.recorder\.bus_send_hwm`"),
+        (("recorder", "bus_send_hwm"), 100_001, r"<= 100000 - at `\$\.recorder\.bus_send_hwm`"),
         (("recorder", "surprise"), 1, "unknown field `surprise`"),
         (
             ("recorder.universe", "min_volume_24h"),
@@ -446,3 +466,5 @@ def test_settings_built_in_code_are_validated_too() -> None:
         RecorderSettings(data_dir=Path("data"), book_connections=15)
     with pytest.raises(ValueError, match="whole number of minutes"):
         RecorderSettings(data_dir=Path("data"), keyframe_interval_s=45)
+    with pytest.raises(ValueError, match="tcp://host:port"):
+        RecorderSettings(data_dir=Path("data"), bus_endpoint="tcp://no-port")

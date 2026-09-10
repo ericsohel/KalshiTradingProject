@@ -7,8 +7,10 @@ connection, lists and selects the order-book universe and hands each book connec
 subscription groups every ``universe_refresh_s`` (sooner, on a capped backoff, while a
 refresh is failing), writes keyframes, logs a status line, tapes a ``clock_jump`` record
 when the host slept, and runs auxiliary periodic tasks such as the auditor, which reads books,
-sinks, and book taps through it (:meth:`Recorder.open_book_tap`). Dependencies
-arrive fully built, so the orchestration is tested against a fake exchange in virtual time.
+sinks, and book taps through it (:meth:`Recorder.open_book_tap`). With a bus publisher it also
+publishes every event its supervisors decode and, every ``bus_refresh_s``, a refresh image of
+each book it holds, paced in slices across the interval (ADR 0022). Dependencies arrive fully
+built, so the orchestration is tested against a fake exchange in virtual time.
 
 Connection layout (ADR 0018): connection 0 is live-only and carries the unfiltered
 ``ticker`` channel, whose latest value per market is kept in memory and never written;
@@ -20,12 +22,14 @@ Only connection 0, which always carries traffic, has a data-silence timeout; eve
 connection relies on the transport keepalive for liveness (ADR 0019).
 
 Invariants: a supervisor, sink, or internal loop that fails ends the run with its
-exception after a full shutdown, never silently; a periodic task that fails is logged and
-capture continues; shutdown stops auxiliary work first, writes a final keyframe while the
-books are still live, stops every supervisor, then closes every sink so that every record
-accepted is on disk; shutdown runs once however often it is requested; every wait is raced
-against the stop request; and the module sleeps, draws randomness, and reads time only
-through what was injected.
+exception after a full shutdown, never silently; a periodic task or the bus refresh cycle that
+fails is logged and capture continues, and nothing published can raise into a supervisor or
+wait on a consumer; a refresh image is read and published without an await in between, so it
+reflects exactly the bus messages numbered before it; shutdown stops auxiliary work and the
+refresh cycle first, writes a final keyframe while the books are still live, stops every
+supervisor, closes the bus publisher, then closes every sink so that every record accepted is
+on disk; shutdown runs once however often it is requested; every wait is raced against the stop
+request; and the module sleeps, draws randomness, and reads time only through what was injected.
 """
 
 from __future__ import annotations
@@ -44,11 +48,13 @@ import pyarrow as pa
 
 from tape import __version__
 from tape.book import Book, KeyframeRow
+from tape.bus.envelope import SequencedPublisher
+from tape.bus.ports import Publisher
 from tape.client.ratelimit import BucketLimits, RateLimiter
 from tape.client.rest import KalshiRest
 from tape.client.ws import WsSession
 from tape.errors import FixedPointError, KalshiError, WireError
-from tape.events import MarketEvent, Ticker
+from tape.events import BookRefresh, MarketEvent, Receipt, Side, Ticker
 from tape.recorder.planner import Group, Plan, plan
 from tape.recorder.supervisor import (
     ORDERBOOK_CHANNEL,
@@ -64,8 +70,10 @@ from tape.timeutil import NS_PER_S, Clock, Ns, wall_ns_to_datetime
 
 __all__ = [
     "BOOK_CHANNELS",
+    "BUS_REFRESH_SLICES_PER_S",
     "CLOCK_JUMP_THRESHOLD_NS",
     "CONTROL_CONN_ID",
+    "DEFAULT_BUS_REFRESH_S",
     "DEFAULT_KEYFRAME_WRITE_TIMEOUT_S",
     "DEFAULT_MAX_MARKET_PAGES",
     "DEFAULT_SHUTDOWN_TIMEOUT_S",
@@ -79,6 +87,7 @@ __all__ = [
     "TICKER_CONN_ID",
     "TICKER_RETENTION_NS",
     "UNIVERSE_RETRY_INITIAL_S",
+    "BusStatus",
     "ConnectionStatus",
     "PeriodicTask",
     "Recorder",
@@ -91,6 +100,7 @@ __all__ = [
     "check_keyframe_interval",
     "is_clock_jump",
     "keyframe_path",
+    "refresh_slices",
     "universe_retry_delay_s",
 ]
 
@@ -142,6 +152,12 @@ CLOCK_JUMP_THRESHOLD_NS: Final = 5 * NS_PER_S
 Monotonic clocks stop while macOS and Linux hosts sleep, and wall clocks do not. The margin
 absorbs scheduling delay and NTP slewing, which move the two by milliseconds, not seconds.
 """
+
+DEFAULT_BUS_REFRESH_S: Final = 10
+"""Seconds between two refresh images of the same book on the bus (ADR 0022)."""
+
+BUS_REFRESH_SLICES_PER_S: Final = 10
+"""Most refresh slices per second of the cycle, so many books go out in steps of 100 ms."""
 
 _SECONDS_PER_MINUTE: Final = 60
 _SECONDS_PER_HOUR: Final = 3_600
@@ -267,6 +283,34 @@ def is_clock_jump(
     return wall_ns_delta - mono_ns_delta > threshold_ns
 
 
+def refresh_slices(tickers: Sequence[str], *, interval_s: int) -> tuple[tuple[str, ...], ...]:
+    """Split one bus refresh cycle's markets into slices published one pause apart.
+
+    A cycle publishes a slice, waits ``interval_s / len(slices)``, and moves on, so it lasts
+    ``interval_s`` whatever the number of books and never publishes them in one burst. There
+    is one slice per market up to :data:`BUS_REFRESH_SLICES_PER_S` slices per second; with no
+    markets there is a single empty slice, so an idle cycle still waits out its interval.
+
+    Args:
+        tickers: The markets to refresh, in publishing order.
+        interval_s: Length of the cycle in seconds.
+
+    Returns:
+        Slices whose concatenation is ``tickers`` and whose sizes differ by at most one.
+
+    Raises:
+        ValueError: If ``interval_s`` is not positive.
+    """
+    if interval_s <= 0:
+        raise ValueError(f"interval_s must be positive, got {interval_s}")
+    total = len(tickers)
+    count = max(1, min(total, interval_s * BUS_REFRESH_SLICES_PER_S))
+    return tuple(
+        tuple(tickers[index * total // count : (index + 1) * total // count])
+        for index in range(count)
+    )
+
+
 def keyframe_path(root: Path, wall_ns: int, *, interval_s: int) -> Path:
     """Return where a keyframe taken at ``wall_ns`` belongs (docs/DATA_FORMATS.md 5).
 
@@ -311,6 +355,8 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
         max_market_pages: Page cap on one market listing.
         shutdown_timeout_s: Deadline for each shutdown stage.
         keyframe_write_timeout_s: Deadline for writing one keyframe file.
+        bus_refresh_s: Seconds between refresh images of each book on the bus; used only when
+            the recorder is given a publisher.
 
     Raises:
         ValueError: On a layout over ``max_connections``, a group size outside
@@ -334,6 +380,7 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
     shutdown_timeout_s: int = DEFAULT_SHUTDOWN_TIMEOUT_S
     keyframe_write_timeout_s: int = DEFAULT_KEYFRAME_WRITE_TIMEOUT_S
     ticker_silence_timeout_s: int = DEFAULT_TICKER_SILENCE_TIMEOUT_S
+    bus_refresh_s: int = DEFAULT_BUS_REFRESH_S
 
     def __post_init__(self) -> None:
         check_connection_budget(
@@ -354,6 +401,7 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
             "shutdown_timeout_s",
             "keyframe_write_timeout_s",
             "ticker_silence_timeout_s",
+            "bus_refresh_s",
         ):
             value = getattr(self, name)
             if value <= 0:
@@ -384,6 +432,27 @@ class ConnectionStatus(msgspec.Struct, frozen=True, kw_only=True):
     sink_dropped: int
 
 
+class BusStatus(msgspec.Struct, frozen=True, kw_only=True):
+    """The bus publisher's part of the status log.
+
+    Attributes:
+        bus_epoch: The epoch every message of this run carries.
+        bus_seq: Number of the latest message attempted; ``sent + dropped + errors`` equals it.
+        sent: Messages handed to ZeroMQ. A slow subscriber can still lose its copy, which it
+            alone sees, as a gap in ``bus_seq``.
+        dropped: Messages the transport refused outright.
+        errors: Messages that failed for any other reason.
+        refreshes: Book refresh images published.
+    """
+
+    bus_epoch: int
+    bus_seq: int
+    sent: int
+    dropped: int
+    errors: int
+    refreshes: int
+
+
 class RecorderStatus(msgspec.Struct, frozen=True, kw_only=True):
     """The whole recorder at a glance, logged every ``status_interval_s``.
 
@@ -392,12 +461,14 @@ class RecorderStatus(msgspec.Struct, frozen=True, kw_only=True):
         universe_size: Markets the last universe selection chose.
         subscribed_markets: Markets of book connections whose subscriptions are live now.
         live_tickers: Markets with a latest ``ticker`` value in memory.
+        bus: The bus publisher's counters, or ``None`` when the recorder has no bus.
     """
 
     connections: tuple[ConnectionStatus, ...]
     universe_size: int
     subscribed_markets: int
     live_tickers: int
+    bus: BusStatus | None = None
 
 
 class SessionBuilder(Protocol):
@@ -444,6 +515,9 @@ class Recorder:
         sleep: Waits the given seconds; drives every loop and every reconnect backoff.
         jitter: Returns a draw from ``[0, 1)`` for each reconnect or universe retry backoff.
         periodic_tasks: Auxiliary work; a failure in one is logged and capture continues.
+        publisher: Where every decoded event and each book's refresh image go, or ``None`` for
+            no bus. Its start time is taken now as the bus epoch, and the recorder closes it
+            after the supervisors stop.
         logger: Destination for logs; defaults to this module's logger.
     """
 
@@ -459,6 +533,7 @@ class Recorder:
         sleep: Callable[[float], Awaitable[None]],
         jitter: Callable[[], float],
         periodic_tasks: Sequence[PeriodicTask] = (),
+        publisher: Publisher | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
@@ -469,6 +544,12 @@ class Recorder:
         self._jitter = jitter
         self._periodic = tuple(periodic_tasks)
         self._log = logger if logger is not None else logging.getLogger(__name__)
+        self._bus = (
+            None
+            if publisher is None
+            else SequencedPublisher(publisher, epoch=int(clock.wall_ns()), logger=logger)
+        )
+        self._bus_refreshes = 0
         self._tickers: dict[str, Ticker] = {}
         self._plan = Plan(groups=())
         self._universe: UniverseDecision | None = None
@@ -507,7 +588,7 @@ class Recorder:
                 sleep=sleep,
                 jitter=jitter,
                 sink=sink,
-                on_event=self._remember_ticker if conn_id == TICKER_CONN_ID else None,
+                on_event=self._event_consumer(conn_id),
             )
 
     # ------------------------------------------------------------------- read-only views
@@ -541,13 +622,7 @@ class Recorder:
         Returns:
             A read-only mapping of live, mutable books; check ``is_stale()`` before use.
         """
-        merged: dict[str, Book] = {}
-        for conn_id in self._book_conn_ids():
-            for ticker, book in self._supervisors[conn_id].books.items():
-                held = merged.get(ticker)
-                if held is None or (held.is_stale() and not book.is_stale()):
-                    merged[ticker] = book
-        return MappingProxyType(merged)
+        return MappingProxyType({ticker: book for ticker, (_, book) in self._held_books().items()})
 
     def sink_for(self, ticker: str) -> SegmentSink | None:
         """Return the sink of the book connection that the current plan assigns a market to.
@@ -635,6 +710,18 @@ class Recorder:
             universe_size=0 if self._universe is None else len(self._universe.l2_tickers),
             subscribed_markets=subscribed,
             live_tickers=len(self._tickers),
+            bus=None if self._bus is None else self._bus_status(self._bus),
+        )
+
+    def _bus_status(self, bus: SequencedPublisher) -> BusStatus:
+        stats = bus.stats
+        return BusStatus(
+            bus_epoch=bus.epoch,
+            bus_seq=bus.last_seq,
+            sent=stats.sent,
+            dropped=stats.dropped,
+            errors=stats.errors,
+            refreshes=self._bus_refreshes,
         )
 
     # ------------------------------------------------------------------------ control
@@ -717,6 +804,39 @@ class Recorder:
     def _book_conn_ids(self) -> range:
         return range(FIRST_BOOK_CONN_ID, FIRST_BOOK_CONN_ID + self._config.book_connections)
 
+    def _event_consumer(self, conn_id: int) -> Callable[[MarketEvent], None] | None:
+        """What one connection's supervisor hands each decoded event to.
+
+        The ticker connection's events update the latest-ticker table; with a bus, every
+        connection's events are also published. ``SequencedPublisher.publish`` never raises,
+        and the supervisor would count and log it if it did.
+        """
+        bus = self._bus
+        if conn_id != TICKER_CONN_ID:
+            return None if bus is None else bus.publish
+        if bus is None:
+            return self._remember_ticker
+
+        def remember_and_publish(event: MarketEvent) -> None:
+            self._remember_ticker(event)
+            bus.publish(event)
+
+        return remember_and_publish
+
+    def _held_books(self) -> dict[str, tuple[int, Book]]:
+        """Every book across the book connections, with the connection holding it.
+
+        A market briefly subscribed on two connections while it moves between them is held by
+        whichever copy is not stale, and by the lower connection id when neither or both are.
+        """
+        merged: dict[str, tuple[int, Book]] = {}
+        for conn_id in self._book_conn_ids():
+            for ticker, book in self._supervisors[conn_id].books.items():
+                held = merged.get(ticker)
+                if held is None or (held[1].is_stale() and not book.is_stale()):
+                    merged[ticker] = (conn_id, book)
+        return merged
+
     def _header_factory(self, conn_id: int) -> HeaderFactory:
         """Build the segment header factory of one taped connection.
 
@@ -795,6 +915,10 @@ class Recorder:
             name = f"{type(periodic).__name__}-{index}"
             self._periodic_tasks.append(
                 asyncio.create_task(self._run_periodic(periodic, name), name=name)
+            )
+        if self._bus is not None:
+            self._periodic_tasks.append(
+                asyncio.create_task(self._run_bus_refresh(self._bus), name="bus-refresh")
             )
         critical = [*self._supervisor_tasks.values(), *self._loop_tasks]
         stop_waiter = asyncio.ensure_future(self._stop_requested.wait())
@@ -887,6 +1011,53 @@ class Recorder:
             self._log.warning(
                 "periodic task returned before the recorder stopped", extra={"task": name}
             )
+
+    async def _run_bus_refresh(self, bus: SequencedPublisher) -> None:
+        """Run the bus refresh cycle; as for a periodic task, a failure is logged, not raised."""
+        try:
+            await self._bus_refresh_loop(bus)
+        except Exception as exc:
+            self._log.exception(
+                "bus refresh failed; capture continues without refresh images",
+                extra={"error": repr(exc)},
+            )
+
+    async def _bus_refresh_loop(self, bus: SequencedPublisher) -> None:
+        interval_s = self._config.bus_refresh_s
+        while True:
+            # Markets are fixed per cycle; one that appears mid-cycle waits for the next.
+            slices = refresh_slices(sorted(self._held_books()), interval_s=interval_s)
+            for tickers in slices:
+                self._publish_refreshes(bus, tickers)
+                if not await self._pause(interval_s / len(slices)):
+                    return
+
+    def _publish_refreshes(self, bus: SequencedPublisher, tickers: Iterable[str]) -> None:
+        """Publish the refresh image of each market still held, without awaiting.
+
+        No frame can be applied between reading a book and publishing its image, so the image
+        is the book as of every bus message numbered before it (ADR 0022). A market no longer
+        held is skipped.
+        """
+        held = self._held_books()
+        mono_ns, wall_ns = self._clock.mono_ns(), self._clock.wall_ns()
+        for ticker in tickers:
+            entry = held.get(ticker)
+            if entry is None:
+                continue
+            conn_id, book = entry
+            receipt = Receipt(conn_id=conn_id, recv_mono_ns=mono_ns, recv_wall_ns=wall_ns)
+            bus.publish(
+                BookRefresh(
+                    ticker=ticker,
+                    ts_ms=book.last_ts_ms,
+                    receipt=receipt,
+                    stale=book.is_stale(),
+                    bids=tuple(book.levels(Side.BID)),
+                    asks=tuple(book.levels(Side.ASK)),
+                )
+            )
+            self._bus_refreshes += 1
 
     async def _pause(self, seconds: float) -> bool:
         """Sleep with the injected sleep. Returns ``False`` if a stop came first."""
@@ -1116,6 +1287,9 @@ class Recorder:
         await self._drain(list(self._supervisor_tasks.values()))
         await asyncio.wait({stopping}, timeout=self._config.shutdown_timeout_s)
         await _cancel(stopping)
+        if self._bus is not None:
+            # After the supervisors, whose last events still go out; closing never waits.
+            self._bus.close()
         await self._close_sinks()
         self._log.info("recorder stopped", extra={"failures": len(self._failures)})
 

@@ -1,10 +1,10 @@
 """The ``tape`` command line and the composition root of every process.
 
 Responsibility: parse arguments, configure logging, load settings, and construct the real
-dependencies (clock, signer, rate limiter, REST client, WebSocket sessions, segment sinks)
-that the adapters receive already built (docs/ENGINEERING_STANDARDS.md 2.2). It is the only
-module that constructs ``SystemClock``, reads ``os.environ``, installs signal handlers, or
-writes to standard output.
+dependencies (clock, signer, rate limiter, REST client, WebSocket sessions, segment sinks, the
+bus publisher) that the adapters receive already built (docs/ENGINEERING_STANDARDS.md 2.2). It
+is the only module that constructs ``SystemClock``, reads ``os.environ``, installs signal
+handlers, or writes to standard output.
 
 Invariants: exit status 0 means the command did what it was asked and, for ``record``,
 shut down cleanly; 1 means a configuration error or a failure, with the reason on
@@ -31,6 +31,7 @@ import httpx
 import msgspec
 
 from tape.book import Book
+from tape.bus.sockets import ZmqPublisher
 from tape.client.auth import RsaPssSigner
 from tape.client.ratelimit import BucketRateLimiter
 from tape.client.rest import KalshiRest, build_client
@@ -196,6 +197,7 @@ def recorder_config(settings: Settings, *, host: str) -> RecorderConfig:
         universe_refresh_s=recorder.universe_refresh_s,
         status_interval_s=recorder.status_interval_s,
         ticker_silence_timeout_s=kalshi.ws_silence_timeout_s,
+        bus_refresh_s=recorder.bus_refresh_s,
     )
 
 
@@ -216,6 +218,7 @@ def build_recorder(
 
     Raises:
         ConfigError: If the private key file is not a usable RSA key.
+        BusError: If ``recorder.bus_endpoint`` is set and cannot be bound.
     """
     kalshi = settings.kalshi
     signer = RsaPssSigner(kalshi.key_id, kalshi.private_key_path)
@@ -267,6 +270,12 @@ def build_recorder(
         tap_max_events=settings.recorder.audit_tap_max_events,
         window_sleep=asyncio.sleep,
     )
+    # Bound last, so that a configuration error above leaves no socket behind.
+    endpoint = settings.recorder.bus_endpoint
+    publisher: ZmqPublisher | None = None
+    if endpoint is not None:
+        publisher = ZmqPublisher(endpoint, send_hwm=settings.recorder.bus_send_hwm)
+        _log.info("bus bound", extra={"endpoint": endpoint})
     recorder = Recorder(
         recorder_config(settings, host=host),
         clock=clock,
@@ -277,6 +286,7 @@ def build_recorder(
         sleep=asyncio.sleep,
         jitter=secrets.SystemRandom().random,
         periodic_tasks=(AuditTask(auditor, interval_s=settings.recorder.audit_interval_s),),
+        publisher=publisher,
     )
     return recorder
 

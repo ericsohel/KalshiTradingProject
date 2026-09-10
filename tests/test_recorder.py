@@ -16,11 +16,23 @@ import pytest
 
 from tape import __version__
 from tape.book import Book, books_from_keyframe_rows
+from tape.bus import (
+    BOOK_FRESH,
+    BOOK_UNKNOWN,
+    RESET_GAP,
+    RESET_START,
+    LiveBooks,
+    Observation,
+    Publisher,
+    ZmqPublisher,
+    ZmqSubscriber,
+    decode_bus_envelope,
+)
 from tape.client.ratelimit import Bucket, BucketLimits
 from tape.client.rest import KalshiRest
 from tape.client.ws import WsSession
 from tape.errors import KalshiHttpError
-from tape.events import BookDelta, Level, Side
+from tape.events import BookDelta, BookRefresh, GapEvent, Level, Side
 from tape.fixedpoint import CountE2, PriceE4
 from tape.recorder.planner import Group
 from tape.recorder.recorder import (
@@ -28,12 +40,14 @@ from tape.recorder.recorder import (
     CONTROL_CONN_ID,
     TICKER_CONN_ID,
     TICKER_RETENTION_NS,
+    BusStatus,
     PeriodicTask,
     Recorder,
     RecorderConfig,
     check_connection_budget,
     is_clock_jump,
     keyframe_path,
+    refresh_slices,
     universe_retry_delay_s,
 )
 from tape.recorder.tap import BookImage, TapWindow
@@ -41,7 +55,7 @@ from tape.recorder.universe import UniversePolicy
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.segment import Record, RecordKind, SegmentHeader, SegmentReader, read_keyframe
 from tape.timeutil import NS_PER_MS, NS_PER_S, FrozenClock, Ns
-from tests.fakes import FakeConnection, FakeKalshiWs
+from tests.fakes import FakeConnection, FakeKalshiWs, RecordingPublisher
 
 NOON: Final = int(datetime(2026, 9, 10, 12, tzinfo=UTC).timestamp()) * NS_PER_S
 REST_URL: Final = "https://rest.test/trade-api/v2"
@@ -56,6 +70,9 @@ LIMITS: Final = {
 }
 LOOPS: Final = 3
 """Universe, keyframe, and status loops, each parked in the injected sleep between rounds."""
+
+PROBE: Final = b"ctl.probe"
+"""Topic of the messages a test publishes to learn that its bus subscriber has connected."""
 
 
 def market(ticker: str, volume: str, *, status: str = "active") -> dict[str, object]:
@@ -220,6 +237,7 @@ class Harness:
         *,
         markets: Sequence[Mapping[str, object]] = MARKETS,
         periodic_tasks: Sequence[PeriodicTask] = (),
+        publisher: Publisher | None = None,
         broken_conn: int | None = None,
         broken_headers: bool = False,
         **config: Any,  # RecorderConfig fields under test
@@ -235,6 +253,8 @@ class Harness:
         self.sinks: dict[int, SegmentSink] = {}
         self.broken_conn = broken_conn
         self.broken_headers = broken_headers
+        # With a bus, the refresh cycle is one more loop parked between its slices.
+        self.loops = LOOPS if publisher is None else LOOPS + 1
         settings: dict[str, Any] = {  # Any: RecorderConfig field values of several types
             "env": "demo",
             "ws_url": ws_url,
@@ -255,6 +275,7 @@ class Harness:
             sleep=self.time.sleep,
             jitter=lambda: 0.5,
             periodic_tasks=periodic_tasks,
+            publisher=publisher,
         )
         self.task: asyncio.Task[None] | None = None
 
@@ -307,7 +328,7 @@ class Harness:
         await until(lambda: all(supervisors[conn_id].subscriptions for conn_id in conn_ids))
 
     async def parked(self) -> None:
-        await until(lambda: self.time.sleepers == LOOPS)
+        await until(lambda: self.time.sleepers == self.loops)
 
     def tape(self, conn_id: int) -> list[tuple[SegmentHeader, list[Record], bool]]:
         segments = []
@@ -903,6 +924,7 @@ def test_keyframe_paths_floor_to_the_slot_in_utc() -> None:
         ({"shutdown_timeout_s": 0}, "shutdown_timeout_s must be positive"),
         ({"keyframe_write_timeout_s": 0}, "keyframe_write_timeout_s must be positive"),
         ({"ticker_silence_timeout_s": 0}, "ticker_silence_timeout_s must be positive"),
+        ({"bus_refresh_s": 0}, "bus_refresh_s must be positive"),
     ],
 )
 def test_a_recorder_config_that_cannot_work_is_refused(
@@ -944,3 +966,298 @@ async def test_stop_does_not_wait_for_a_universe_refresh_in_flight(tmp_path: Pat
         harness.time.advance(300)
         await until(lambda: listings() > before)
         await asyncio.wait_for(harness.recorder.stop(), timeout=5.0)
+
+
+def delta_msg(ticker: str, price: str, delta: str) -> dict[str, object]:
+    return {
+        "market_ticker": ticker,
+        "price_dollars": price,
+        "delta_fp": delta,
+        "side": "yes",
+        "ts_ms": 1_789_000_000_000,
+    }
+
+
+def test_refresh_slices_spread_a_cycle_evenly_and_never_leave_it_without_a_pause() -> None:
+    assert refresh_slices([], interval_s=10) == ((),)
+    assert refresh_slices(["A", "B"], interval_s=10) == (("A",), ("B",))
+    tickers = [f"KXM-{index:04d}" for index in range(2005)]
+    slices = refresh_slices(tickers, interval_s=10)
+    assert len(slices) == 100  # 10 slices a second: a step every 100 ms
+    assert [ticker for piece in slices for ticker in piece] == tickers
+    assert {len(piece) for piece in slices} == {20, 21}
+    assert len(refresh_slices(tickers[:150], interval_s=1)) == 10
+    with pytest.raises(ValueError, match="interval_s must be positive"):
+        refresh_slices(["A"], interval_s=0)
+
+
+async def test_the_bus_carries_every_event_in_order_and_paced_refresh_images_of_every_book(
+    tmp_path: Path,
+) -> None:
+    supervisors_stopped: list[bool] = []
+
+    def on_close() -> None:
+        supervisors = harness.recorder.supervisors.values()
+        supervisors_stopped.append(all(not s.subscriptions for s in supervisors))
+
+    publisher = RecordingPublisher(on_close=on_close)
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, publisher=publisher, bus_refresh_s=4) as harness,
+    ):
+        fake.set_book("KXA-1", yes=[("0.4000", "10.00")], no=[("0.6000", "5.00")])
+        fake.set_book("KXSHOW-1", yes=[("0.2000", "1.00")])
+        harness.start()
+        ticker = await harness.connection(fake, TICKER_CONN_ID)
+        control = await harness.connection(fake, CONTROL_CONN_ID)
+        books = await harness.connection(fake, 2)
+        await harness.subscribed(TICKER_CONN_ID, CONTROL_CONN_ID, 2, 3)
+        await until(lambda: fresh(harness.recorder.books(), "KXA-1", "KXSHOW-1"))
+        await ticker.push_message(
+            "ticker", {"market_ticker": "KXA-1", "ts_ms": 5, "volume_fp": "7.00"}, sid=1
+        )
+        await control.push_sequenced(
+            "market_lifecycle_v2", {"event_type": "activated", "market_ticker": "KXNEW-1"}, sid=1
+        )
+        await books.push_sequenced("orderbook_delta", delta_msg("KXA-1", "0.4100", "1.00"), sid=1)
+        await until(lambda: len(publisher.messages) == 5)
+        # Publishing is added to the ticker connection's consumer, not swapped in for it.
+        assert "KXA-1" in harness.recorder.latest_tickers()
+
+        # The first cycle started with no books and waits out its interval; the next spreads
+        # two books over it, one every two seconds.
+        await harness.parked()
+        harness.time.advance(4)
+        await until(lambda: len(publisher.messages) == 6)
+        await harness.parked()
+        harness.time.advance(2)
+        await until(lambda: len(publisher.messages) == 7)
+
+        # A gap stales KXA-1, silently: the snapshot requested is never answered.
+        books.go_silent()
+        books.skip_seq(1)
+        await books.push_sequenced("orderbook_delta", delta_msg("KXA-1", "0.4100", "1.00"), sid=1)
+        await until(lambda: not fresh(harness.recorder.books(), "KXA-1"))
+        await harness.parked()
+        harness.time.advance(2)
+        await until(lambda: len(publisher.messages) == 9)
+        status = harness.recorder.status().bus
+        live = harness.recorder.books()["KXA-1"]
+        await harness.recorder.stop()
+
+    envelopes = publisher.envelopes
+    assert [envelope.bus_seq for envelope in envelopes] == list(range(1, 10))
+    assert {envelope.bus_epoch for envelope in envelopes} == {NOON}
+    events = [envelope.event for envelope in envelopes]
+    assert sorted(type(event).__name__ for event in events[:5]) == [
+        "BookDelta",
+        "BookSnapshot",
+        "BookSnapshot",
+        "Lifecycle",
+        "Ticker",
+    ]
+    assert publisher.topics[5:] == [b"md.KXA-1", b"md.KXSHOW-1", b"ctl.gap", b"md.KXA-1"]
+    first, second, gap, stale = events[5:]
+    assert isinstance(first, BookRefresh)
+    assert isinstance(second, BookRefresh)
+    assert isinstance(gap, GapEvent)
+    assert isinstance(stale, BookRefresh)
+    assert (first.receipt.conn_id, first.receipt.recv_wall_ns, first.stale) == (
+        2,
+        NOON + 4 * NS_PER_S,
+        False,
+    )
+    assert (first.bids, first.asks) == (tuple(live.levels(Side.BID)), tuple(live.levels(Side.ASK)))
+    assert first.bids[0] == Level(PriceE4(4100), CountE2(100))
+    assert first.ts_ms == 1_789_000_000_000
+    assert (second.receipt.conn_id, second.receipt.recv_wall_ns, second.stale) == (
+        3,
+        NOON + 6 * NS_PER_S,
+        False,
+    )
+    assert gap.receipt.conn_id == 2
+    assert (stale.receipt.recv_wall_ns, stale.stale, stale.bids) == (
+        NOON + 8 * NS_PER_S,
+        True,
+        first.bids,
+    )
+    # Slices are paced by the injected sleep: an idle cycle of 4 s, then 2 s per book.
+    assert [s for s in harness.time.requested if s in (2.0, 4.0)] == [4.0, 2.0, 2.0, 2.0]
+    assert status == BusStatus(bus_epoch=NOON, bus_seq=9, sent=9, dropped=0, errors=0, refreshes=3)
+    assert (publisher.closes, supervisors_stopped) == (1, [True])
+
+
+async def test_a_failing_bus_publisher_costs_its_messages_and_never_capture(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+    publisher = RecordingPublisher()
+    publisher.failure = RuntimeError("publisher bug")
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, publisher=publisher) as harness,
+    ):
+        fake.set_book("KXA-1", yes=[("0.4000", "10.00")])
+        harness.start()
+        books = await harness.connection(fake, 2)
+        await harness.subscribed(2)
+        await until(lambda: fresh(harness.recorder.books(), "KXA-1"))
+        await books.push_sequenced("orderbook_delta", delta_msg("KXA-1", "0.4100", "1.00"), sid=1)
+        await until(
+            lambda: (
+                harness.recorder.books()["KXA-1"].best_bid() == Level(PriceE4(4100), CountE2(100))
+            )
+        )
+
+        def refreshed() -> bool:
+            bus = harness.recorder.status().bus
+            return bus is not None and bus.refreshes == 1
+
+        await harness.parked()
+        harness.time.advance(10)
+        await until(refreshed)
+        await harness.parked()
+        harness.time.advance(50)
+        await until(lambda: bool(logged(caplog, "recorder status")))
+        await harness.parked()
+        await harness.recorder.stop()
+        assert harness.task is not None
+        assert harness.task.exception() is None
+
+    bus = logged(caplog, "recorder status")[-1].__dict__["bus"]
+    assert bus["bus_seq"] >= 3  # two snapshots or more, the delta, and a refresh image
+    assert (bus["sent"], bus["dropped"], bus["errors"]) == (0, 0, bus["bus_seq"])
+    assert bus["refreshes"] == 1
+    assert all(s.stats.callback_errors == 0 for s in harness.recorder.supervisors.values())
+    assert len(logged(caplog, "bus message not published")) == 1
+    assert not logged(caplog, "bus refresh failed")
+    ((_, records, _),) = harness.tape(2)
+    assert frame_types(records).count("orderbook_delta") == 1
+    assert publisher.closes == 1
+
+
+class BusConsumer:
+    """A live consumer as ``tape serve`` runs one: every topic, decoded, through ``LiveBooks``.
+
+    Setting :attr:`lose_next` discards the next message as if ZeroMQ had dropped it.
+    """
+
+    def __init__(self, messages: AsyncIterator[tuple[bytes, bytes]]) -> None:
+        self.messages = messages
+        self.live = LiveBooks()
+        self.observations: list[Observation] = []
+        self.last_seen = 0
+        self.lose_next = False
+
+    async def run(self) -> None:
+        async for topic, payload in self.messages:
+            if topic == PROBE:
+                continue
+            envelope = decode_bus_envelope(payload)
+            self.last_seen = envelope.bus_seq
+            if self.lose_next:
+                self.lose_next = False
+                continue
+            self.observations.append(self.live.observe(envelope))
+
+
+def mirrors(live: LiveBooks, books: Mapping[str, Book]) -> bool:
+    """Whether a consumer holds exactly the recorder's books, each fresh and level for level."""
+    held = live.books()
+    return set(held) == set(books) and all(
+        live.status(ticker) == BOOK_FRESH
+        and all(held[ticker].levels(side) == book.levels(side) for side in Side)
+        for ticker, book in books.items()
+    )
+
+
+async def test_a_bus_consumer_rebuilds_the_recorder_s_books_through_loss_and_refresh(
+    tmp_path: Path, ipc_dir: Path
+) -> None:
+    endpoint = f"ipc://{ipc_dir / 'bus.sock'}"
+    publisher = ZmqPublisher(endpoint, send_hwm=10_000)
+    subscriber = ZmqSubscriber(endpoint, receive_hwm=10_000)
+    subscriber.subscribe(b"")
+    messages = subscriber.messages()
+    # Connect before the recorder publishes anything, so that no loss here is accidental.
+    probe = asyncio.ensure_future(anext(messages))
+    async with asyncio.timeout(5):
+        while not probe.done():
+            publisher.publish(PROBE, b"")
+            await asyncio.wait({probe}, timeout=0.01)
+    consumer = BusConsumer(messages)
+    consuming = asyncio.create_task(consumer.run())
+    try:
+        async with (
+            FakeKalshiWs() as fake,
+            recording(fake.url, tmp_path, publisher=publisher, bus_refresh_s=4) as harness,
+        ):
+            recorder = harness.recorder
+
+            def bus_status() -> BusStatus:
+                status = recorder.status().bus
+                assert status is not None
+                return status
+
+            def caught_up() -> bool:
+                return consumer.last_seen == bus_status().bus_seq
+
+            async def advance_until(predicate: Callable[[], bool]) -> None:
+                # Three books over four seconds: every book is refreshed within a dozen seconds
+                # of virtual time, whatever the phase of the cycle.
+                for _ in range(12):
+                    await until(caught_up)
+                    if predicate():
+                        return
+                    await harness.parked()
+                    harness.time.advance(1)
+                await until(caught_up)
+                assert predicate()
+
+            fake.set_book("KXA-1", yes=[("0.4000", "10.00")], no=[("0.6000", "5.00")])
+            fake.set_book("KXA-3", yes=[("0.3000", "2.00")])
+            fake.set_book("KXSHOW-1", yes=[("0.2000", "1.00")])
+            harness.start()
+            books = await harness.connection(fake, 2)
+            await harness.subscribed(2, 3)
+            await until(lambda: fresh(recorder.books(), "KXA-1", "KXA-3", "KXSHOW-1"))
+            await until(caught_up)
+            # Snapshots arrived, but a consumer knows no book before its refresh image.
+            assert consumer.observations[0].reset == RESET_START
+            assert {consumer.live.status(t) for t in recorder.books()} == {BOOK_UNKNOWN}
+
+            await advance_until(lambda: mirrors(consumer.live, recorder.books()))
+            refreshes = bus_status().refreshes
+            await books.push_sequenced(
+                "orderbook_delta", delta_msg("KXA-1", "0.4100", "3.00"), sid=1
+            )
+            await books.push_sequenced(
+                "orderbook_delta", delta_msg("KXA-3", "0.3000", "-1.00"), sid=1
+            )
+            await until(caught_up)
+            await until(lambda: recorder.books()["KXA-3"].size_at(Side.BID, PriceE4(3000)) == 100)
+            await until(caught_up)
+            # Deltas alone keep the copies exact between refresh images.
+            assert bus_status().refreshes == refreshes
+            assert recorder.books()["KXA-1"].best_bid() == Level(PriceE4(4100), CountE2(300))
+            assert mirrors(consumer.live, recorder.books())
+
+            consumer.lose_next = True
+            await books.push_sequenced(
+                "orderbook_delta", delta_msg("KXA-1", "0.4100", "1.00"), sid=1
+            )
+            await until(lambda: not consumer.lose_next)
+            await books.push_sequenced(
+                "orderbook_delta", delta_msg("KXA-3", "0.2900", "1.00"), sid=1
+            )
+            await until(lambda: recorder.books()["KXA-3"].size_at(Side.BID, PriceE4(2900)) == 100)
+            await until(caught_up)
+            lost = consumer.observations[-1]
+            assert (lost.reset, lost.missed, lost.applied) == (RESET_GAP, 1, False)
+            assert dict(consumer.live.books()) == {}
+
+            await advance_until(lambda: mirrors(consumer.live, recorder.books()))
+            assert consumer.live.stats.book_errors == 0
+    finally:
+        subscriber.close()
+        await asyncio.wait_for(consuming, timeout=5)

@@ -29,9 +29,11 @@ from typing import Annotated, Any, Final, Literal
 import msgspec
 import msgspec.inspect
 
+from tape.bus.sockets import DEFAULT_SEND_HWM, check_endpoint
 from tape.errors import ConfigError, FixedPointError
 from tape.fixedpoint import parse_count
 from tape.recorder.recorder import (
+    DEFAULT_BUS_REFRESH_S,
     MAX_GROUP_SIZE,
     check_book_capacity,
     check_connection_budget,
@@ -86,6 +88,20 @@ _MAX_AUDIT_TAP_EVENTS: Final = 50_000
 full batch of 100 markets at the cap holds under a gigabyte; the widest window the allowances
 permit, about eleven seconds, fills under 8,000 at the busiest rate observed (738 a second)."""
 
+_MAX_BUS_REFRESH_S: Final = 60
+"""Ceiling on the bus refresh interval. A consumer that lost a message or has just started
+serves a market again only at that market's next refresh image (ADR 0022), so the interval is
+how long a viewer can wait on a resync; a minute is already long for a live view."""
+
+_MIN_BUS_SEND_HWM: Final = 1_000
+"""Floor on the messages queued for one bus subscriber. Every book connection that reconnects
+sends up to 500 snapshots at once, and a healthy subscriber should absorb that burst."""
+
+_MAX_BUS_SEND_HWM: Final = 100_000
+"""Ceiling on the messages queued for one bus subscriber. The queue lives in the recorder's
+memory; at up to a few kilobytes a refresh image, a stalled subscriber at the cap holds
+hundreds of megabytes, and more would put the recorder's memory budget at a consumer's mercy."""
+
 _INTEGER: Final = re.compile(r"[+-]?[0-9]+")
 _TRUE: Final = frozenset({"true", "1", "yes"})
 _FALSE: Final = frozenset({"false", "0", "no"})
@@ -97,6 +113,8 @@ Word = Annotated[str, msgspec.Meta(pattern=r"^\S+$")]
 KeepaliveSeconds = Annotated[int, msgspec.Meta(ge=1, le=_MAX_KEEPALIVE_S)]
 AuditAllowanceMs = Annotated[int, msgspec.Meta(ge=1, le=_MAX_AUDIT_ALLOWANCE_MS)]
 AuditTapEvents = Annotated[int, msgspec.Meta(ge=1, le=_MAX_AUDIT_TAP_EVENTS)]
+BusRefreshSeconds = Annotated[int, msgspec.Meta(ge=1, le=_MAX_BUS_REFRESH_S)]
+BusSendHwm = Annotated[int, msgspec.Meta(ge=_MIN_BUS_SEND_HWM, le=_MAX_BUS_SEND_HWM)]
 
 
 class KalshiEndpoints(msgspec.Struct, frozen=True, kw_only=True):
@@ -222,12 +240,18 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
         writer_queue_max: Records one segment sink holds before refusing more.
         universe_refresh_s: Seconds between market listings and replans.
         status_interval_s: Seconds between status log lines.
+        bus_endpoint: Where live consumers read the recorder's events and book refresh images
+            (ADR 0008, ADR 0022): ``ipc:///absolute/path`` or ``tcp://host:port``. Absent means
+            no bus.
+        bus_refresh_s: Seconds between refresh images of each book on the bus; 1 to 60.
+        bus_send_hwm: Messages queued for one slow bus subscriber before its copies are
+            dropped; 1000 to 100000.
         universe: The ``[recorder.universe]`` section.
 
     Raises:
         ValueError: If the connection layout does not fit ``max_connections``, the book
-            connections cannot carry ``universe.max_l2_markets``, or the keyframe interval
-            does not tile an hour.
+            connections cannot carry ``universe.max_l2_markets``, the keyframe interval
+            does not tile an hour, or the bus endpoint is malformed.
     """
 
     data_dir: Path
@@ -243,6 +267,9 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
     writer_queue_max: PositiveInt = DEFAULT_MAX_QUEUED_RECORDS
     universe_refresh_s: PositiveInt = 300
     status_interval_s: PositiveInt = 60
+    bus_endpoint: str | None = None
+    bus_refresh_s: BusRefreshSeconds = DEFAULT_BUS_REFRESH_S
+    bus_send_hwm: BusSendHwm = DEFAULT_SEND_HWM
     universe: UniverseSettings = UniverseSettings()
 
     def __post_init__(self) -> None:
@@ -255,6 +282,8 @@ class RecorderSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
             book_connections=self.book_connections,
         )
         check_keyframe_interval(self.keyframe_interval_s)
+        if self.bus_endpoint is not None:
+            check_endpoint(self.bus_endpoint)
 
 
 class Settings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):

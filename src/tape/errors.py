@@ -9,6 +9,7 @@ from __future__ import annotations
 
 __all__ = [
     "BookInvariantError",
+    "BusError",
     "ConfigError",
     "FixedPointError",
     "KalshiError",
@@ -56,6 +57,13 @@ class TapeCorruptionError(TapeError):
 
 class ConfigError(TapeError):
     """Configuration is missing, malformed, or inconsistent."""
+
+
+class BusError(TapeError):
+    """The event bus could not be opened or used: a bad endpoint, one in use, or a socket error.
+
+    Publishing never raises it; a failed send is counted instead (ADR 0022).
+    """
 
 
 class KalshiError(TapeError):

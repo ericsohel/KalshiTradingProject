@@ -1,8 +1,10 @@
 """Enforce the import layer rule from docs/ARCHITECTURE.md section 6.
 
 Core modules may import only the standard library, ``msgspec``, ``numpy``, and other
-core modules. Adapters may import core modules and any third-party library. Shell
-modules may import anything. Exit status 1 on any violation.
+core modules. Adapters may import core modules and any third-party library; leaf adapters,
+each wrapping one I/O mechanism, import no other adapter, so the bus can never reach into
+the recorder or the exchange client. Shell modules may import anything. Exit status 1 on any
+violation.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ CORE = {
     "strategies",
 }
 ADAPTER = {"client", "segment", "recorder", "bus", "bake", "store", "api", "gateway", "probe"}
+LEAF_ADAPTER = {"client", "segment", "bus"}
 SHELL = {"cli", "config", "__init__", "__main__"}
 CORE_THIRD_PARTY = {"msgspec", "numpy"}
 
@@ -93,8 +96,12 @@ def check_file(path: Path) -> list[str]:
                 problems.append(f"{rel}: core module imports {layer_of(sub)} module '{sub}'")
     elif layer == "adapter":
         for sub in sorted(package_imports(tree, top)):
-            if sub != top and layer_of(sub) == "shell":
+            if sub == top:
+                continue
+            if layer_of(sub) == "shell":
                 problems.append(f"{rel}: adapter imports shell module '{sub}'")
+            elif top in LEAF_ADAPTER and layer_of(sub) == "adapter":
+                problems.append(f"{rel}: leaf adapter imports adapter module '{sub}'")
     return problems
 
 

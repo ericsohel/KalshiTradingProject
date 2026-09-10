@@ -15,6 +15,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from tape.bus import ZmqPublisher
 from tape.cli import (
     AuditTask,
     JsonLogFormatter,
@@ -25,8 +26,9 @@ from tape.cli import (
     recorder_config,
 )
 from tape.config import ENDPOINTS, load_settings
-from tape.errors import ConfigError
+from tape.errors import BusError, ConfigError
 from tape.recorder.auditor import Auditor
+from tape.recorder.recorder import BusStatus
 from tape.recorder.tap import CompositeBookTap, TapWindow
 from tape.timeutil import NS_PER_MS, NS_PER_S, FrozenClock
 
@@ -165,6 +167,9 @@ async def test_build_recorder_wires_the_environment_and_the_connection_layout(
         assert recorder.config.ws_url == ENDPOINTS["demo"].ws_url
         assert recorder.config.universe == settings.recorder.universe.policy()
         assert recorder.config.ticker_silence_timeout_s == settings.kalshi.ws_silence_timeout_s
+        assert recorder.config.bus_refresh_s == settings.recorder.bus_refresh_s
+        # No endpoint, no bus.
+        assert recorder.status().bus is None
         supervisors = recorder.supervisors
         assert sorted(supervisors) == [0, 1, 2, 3, 4]
         assert (supervisors[0].config.persist, supervisors[0].config.firehose_channels) == (
@@ -263,6 +268,27 @@ async def test_build_recorder_gives_the_auditor_its_window_and_the_recorder_s_bo
         arguments["open_tap"](["KXA-2"], max_events=3)
         assert opened == [(["KXA-2"], 3)]
         await recorder.stop()
+
+
+async def test_build_recorder_binds_the_bus_and_the_recorder_closes_it(
+    tmp_path: Path, ipc_dir: Path
+) -> None:
+    endpoint = f"ipc://{ipc_dir / 'bus.sock'}"
+    settings = load_settings(
+        write_settings(tmp_path),
+        environ={"TAPE_RECORDER__BUS_ENDPOINT": endpoint, "TAPE_RECORDER__BUS_REFRESH_S": "3"},
+    )
+    async with httpx.AsyncClient() as http:
+        recorder = build_recorder(settings, http=http, clock=FrozenClock(wall_ns=7), host="box")
+        assert recorder.config.bus_refresh_s == 3
+        assert recorder.status().bus == BusStatus(
+            bus_epoch=7, bus_seq=0, sent=0, dropped=0, errors=0, refreshes=0
+        )
+        with pytest.raises(BusError, match="in use by a running publisher"):
+            build_recorder(settings, http=http, clock=FrozenClock(), host="box")
+        await recorder.stop()
+    # Stopping the recorder closed its socket, so the endpoint is free again.
+    ZmqPublisher(endpoint, send_hwm=1000).close()
 
 
 async def test_build_recorder_refuses_a_key_that_is_not_rsa(tmp_path: Path) -> None:

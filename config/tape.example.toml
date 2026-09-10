@@ -44,6 +44,16 @@ audit_tap_max_events = 5000
 writer_queue_max = 200000
 universe_refresh_s = 300
 status_interval_s = 60
+# Live consumers such as `tape serve` read every event and a refresh image of every book from
+# a ZeroMQ bus (ADR 0008, ADR 0022). Unset, there is no bus. An ipc path must be absolute, at
+# most 103 bytes on macOS, and in an existing directory that only this user can write, such
+# as a run/ directory beside the data directory.
+# bus_endpoint = "ipc:///srv/tape/run/bus.sock"
+# Each book is republished once per bus_refresh_s (1 to 60), paced across the interval, so a
+# consumer that lost messages or just started has every book back within that long.
+bus_refresh_s = 10
+# Messages queued for one slow subscriber before its copies are dropped (1000 to 100000).
+bus_send_hwm = 10000
 
 [recorder.universe]
 # A fixed-point string, never a float.

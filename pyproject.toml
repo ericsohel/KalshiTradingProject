@@ -21,6 +21,8 @@ dependencies = [
   "websockets>=13",
   # RSA-PSS request signing.
   "cryptography>=43",
+  # The recorder's lossy, non-blocking event bus over ipc (ADR 0008, ADR 0022).
+  "pyzmq>=26",
 ]
 
 [project.scripts]

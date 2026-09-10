@@ -1,6 +1,7 @@
 """Market-data event structs shared by the recorder, bus, API, and engine.
 
-These are the typed, fixed-point form of what Kalshi sends. They are frozen, tagged
+These are the typed, fixed-point form of what Kalshi sends, plus the recorder's own
+periodic image of a live book (:class:`BookRefresh`, ADR 0022). They are frozen, tagged
 for encoding on the bus, and carry both the exchange timestamp and the local receipt.
 Private events (fills, order updates, acknowledgements, timers) live in
 ``tape.engine`` because only the engine consumes them.
@@ -17,7 +18,9 @@ from tape.fixedpoint import CountE2, PriceE4
 from tape.timeutil import Ms, Ns
 
 __all__ = [
+    "MARKET_EVENT_TYPES",
     "BookDelta",
+    "BookRefresh",
     "BookSnapshot",
     "GapEvent",
     "Level",
@@ -120,6 +123,30 @@ class Lifecycle(msgspec.Struct, frozen=True, kw_only=True, tag=True):
     payload_json: str
 
 
+class BookRefresh(msgspec.Struct, frozen=True, kw_only=True, tag=True):
+    """The recorder's image of one live book, published on the bus (ADR 0022).
+
+    Unlike a snapshot it comes from the recorder, not the exchange: it is the book as the
+    recorder holds it between two frames, so it reflects exactly the bus messages published
+    before it. It carries no ``sid`` or ``seq`` because it answers no subscription.
+
+    Attributes:
+        ticker: Market ticker.
+        ts_ms: Exchange time of the last snapshot or delta applied to the book, if known.
+        receipt: The connection holding the book, and when the image was taken.
+        stale: Whether the book awaited a snapshot when the image was taken.
+        bids: YES bids, highest price first.
+        asks: YES asks, lowest price first.
+    """
+
+    ticker: str
+    ts_ms: Ms | None
+    receipt: Receipt
+    stale: bool
+    bids: tuple[Level, ...]
+    asks: tuple[Level, ...]
+
+
 class GapEvent(msgspec.Struct, frozen=True, kw_only=True, tag=True):
     """A sequence discontinuity on one subscription."""
 
@@ -129,7 +156,16 @@ class GapEvent(msgspec.Struct, frozen=True, kw_only=True, tag=True):
     got_seq: int
 
 
-MarketEvent = BookSnapshot | BookDelta | Trade | Ticker | Lifecycle | GapEvent
+MarketEvent = BookSnapshot | BookDelta | Trade | Ticker | Lifecycle | GapEvent | BookRefresh
 """Union of every event published on the ``md.`` and ``ctl.`` bus topics."""
 
-MARKET_EVENT_TYPES: Final = (BookSnapshot, BookDelta, Trade, Ticker, Lifecycle, GapEvent)
+MARKET_EVENT_TYPES: Final = (
+    BookSnapshot,
+    BookDelta,
+    Trade,
+    Ticker,
+    Lifecycle,
+    GapEvent,
+    BookRefresh,
+)
+"""The members of :data:`MarketEvent`, for ``isinstance`` checks."""

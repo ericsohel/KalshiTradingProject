@@ -45,7 +45,13 @@ the process moves to the cloud host once it has run cleanly for a week.
 
 ## 5. Storage and retention
 
-Measured in week one and revisited monthly. Policy from day one:
+Measured in week one and revisited monthly. A first 65-second production sample
+extrapolated to about 1.7 GB per day compressed, 99% of it from the unfiltered
+`ticker` channel, which would fill the 200 GB free-tier disk in roughly four months
+and the 10 GB R2 free tier in under a week. Order books and trades for the 50
+busiest markets were a small fraction of that. The `ticker` channel is therefore
+live-only and never taped (ADR 0018), so the taped volume is the order-book, trade, and
+lifecycle traffic. Policy from day one:
 
 | Data | Retention on host | Backup |
 |---|---|---|

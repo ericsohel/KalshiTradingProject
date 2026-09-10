@@ -15,7 +15,7 @@ is not merged, regardless of whether it works.
 | Tests | `pytest`, `hypothesis`, `pytest-asyncio`, `pytest-cov` | see [TESTING.md](TESTING.md) |
 | Serialization | `msgspec` for wire structs and bus payloads | no `pydantic` on hot paths |
 | Async | `asyncio` with `uvloop` in production | one loop per process |
-| Logging | `structlog`, JSON in production, console in development | |
+| Logging | standard library `logging`, structured fields passed through `extra`, a JSON formatter in production | no extra dependency; revisit if log processing outgrows it |
 | Pre-commit | `ruff`, `ruff format`, `mypy`, a secrets scanner, and the import-layer check | runs on every commit |
 | CI | GitHub Actions on every push and pull request | all gates must pass before merge |
 

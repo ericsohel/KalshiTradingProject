@@ -91,8 +91,9 @@ implemented after the simulator is calibrated (see [ROADMAP.md](ROADMAP.md)).
    `GET /series` at start and every five minutes, and subscribes to
    `market_lifecycle_v2` (no ticker filter) for immediate created/activated/settled
    notifications. The L2 universe is every active market above a configurable 24-hour
-   volume floor plus an always-on showcase list, capped by count; the ticker channel
-   covers every market regardless.
+   volume floor plus an always-on showcase list, capped by count. The unfiltered ticker
+   channel covers every market on a live-only connection whose frames are held in memory
+   and published but never taped (ADR 0018).
 2. **Subscriptions.** Markets are partitioned into groups of at most 500 tickers by
    exchange shard (`exchange_index`) and observed message rate. Each group is one
    `subscribe` command for `orderbook_delta` and `trade` on one WebSocket connection,
@@ -156,8 +157,10 @@ modules may import anything. A lint check enforces this (see
 
 ### 7.1 Recorder
 
-- **Connections.** One "control" connection carries `market_lifecycle_v2` and the
-  unfiltered `ticker` channel. N "book" connections carry `orderbook_delta` and
+- **Connections.** Every connection is either *taped* or *live-only* (ADR 0018). One
+  live-only connection carries the unfiltered `ticker` channel, 99% of all traffic; its
+  frames are decoded and published but never stored. One taped control connection
+  carries `market_lifecycle_v2`, which is small and essential for replay. N "book" connections carry `orderbook_delta` and
   `trade` groups. N starts at 4 and grows when a connection's message rate or the
   server's buffer-overflow error (code 25) indicates saturation. The default account
   limit is 200 connections; the recorder never exceeds a configured ceiling (default 16).
@@ -168,15 +171,24 @@ modules may import anything. A lint check enforces this (see
   header. (ADR 0006)
 - **Heartbeat.** The server pings `heartbeat` every 10 seconds; the client library
   answers pongs automatically. Thirty seconds of silence marks the connection dead.
-- **Sequence gaps.** Each sequenced channel carries `seq` per `sid`. On a gap the
-  recorder writes a gap record, issues `update_subscription` with `action=get_snapshot`
-  for that `sid`, and marks affected books stale until the snapshot arrives.
+- **Sequence gaps.** Each sequenced channel carries `seq` per `sid`. Every gap writes a
+  GAP record and emits a `GapEvent`. On an `orderbook_delta` subscription it also marks
+  that group's books stale and sends `update_subscription` with `action=get_snapshot`,
+  naming the group's markets; stale books ignore deltas until the snapshot arrives. A gap
+  on `trade` or `market_lifecycle_v2` cannot be repaired and does not corrupt a book, so
+  it is recorded and nothing more. A repeated or decreasing `seq` is counted, logged, and
+  answered with a resnapshot, because applying a replayed delta would silently corrupt
+  the book. When a requested snapshot arrives, the sequence baseline for that `sid`
+  resets, since whether a resnapshot continues or restarts `seq` is still unobserved.
 - **Reconnect.** Exponential backoff with jitter, capped at 30 seconds. A reconnect
   re-subscribes from the recorder's own subscription table (not from memory of `sid`s,
   which are connection-scoped) and treats the resulting snapshots as authoritative.
 - **Backpressure.** Frames enter a bounded in-memory queue drained by one writer
-  thread. If the queue is full the recorder logs at error level and keeps the newest
-  frames; it never blocks the socket reader, which would cause server-side overflow.
+  thread. If the queue is full, the new record is refused and counted rather than
+  blocking the socket reader, which would make the server overflow its own buffer and
+  lose far more. When the queue has room again, the writer records a `writer_overflow`
+  connection event with the number dropped, so the hole is visible in the tape itself
+  and not only in a metric.
 - **Universe churn.** Lifecycle `created`/`activated` events add markets to the
   smallest group on the least-loaded connection via `update_subscription add_markets`;
   `settled` events remove them after a grace period.
@@ -260,8 +272,15 @@ API bind to localhost and `ipc://` sockets only. See [OPERATIONS.md](OPERATIONS.
 
 ## 12. Open questions
 
-- Message volume per shard is unmeasured; the first week of recording decides
-  connection count and storage policy.
+- Message volume is only sampled so far. A 65-second production capture on
+  2026-09-10 at 02:15 ET (a quiet hour) with the unfiltered `ticker` channel plus
+  order books and trades for the 50 highest-volume markets delivered 510 frames per
+  second with zero gaps and zero drops. The unfiltered `ticker` channel was 99% of
+  frames and 99% of bytes; order-book traffic for those 50 markets was 3.3 deltas per
+  second. Raw JSON compressed 11.8x with zstd level 3, extrapolating to about 1.7 GB
+  per day, almost all of it `ticker`. Peak sports hours will be several times busier,
+  so the first week of recording still decides connection count and storage policy. The `ticker` firehose is live-only and not written to
+  the tape (ADR 0018).
 - Resolved 2026-09-10 against the demo exchange: `seq` starts at 1 per `sid` and the
   initial `orderbook_snapshot` messages are part of the same sequence as the deltas
   that follow (five snapshots and 1,240 deltas arrived as `seq` 1 to 1,245 with no

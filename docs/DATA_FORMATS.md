@@ -137,6 +137,9 @@ pong. Limits: 200 connections per user by default, 500,000 markets per session,
 {"id": 2, "cmd": "update_subscription",
  "params": {"sid": 7, "action": "add_markets", "market_tickers": ["..."]}}
                                     # actions: add_markets | delete_markets | get_snapshot
+{"id": 9, "cmd": "update_subscription",
+ "params": {"sid": 7, "action": "get_snapshot", "market_tickers": ["..."]}}
+                                    # get_snapshot names its markets too; the subscription is unchanged
 {"id": 3, "cmd": "unsubscribe", "params": {"sids": [7]}}
 {"id": 4, "cmd": "list_subscriptions"}
 ```
@@ -241,6 +244,7 @@ Data record
                       kind 2: the command JSON as sent
                       kind 3: JSON {"sid", "expected_seq", "got_seq"}
                       kind 4: JSON {"event": "open"|"close"|"error", "detail"}
+                              or {"event": "writer_overflow", "dropped": N}
                       kind 5: JSON {"ticker", "rest_snapshot", "local_snapshot", "mismatched_levels"}
 ```
 
@@ -275,7 +279,7 @@ Path: `data/baked/<table>/dt=YYYY-MM-DD/hour=HH/part-<n>.parquet`, zstd, sorted 
 | `deltas` | `ticker`, `ts_ms` i64, `recv_mono_ns` i64, `recv_wall_ns` i64, `conn_id` i16, `sid` i32, `seq` i64, `side` i8, `price_e4` i32, `delta_e2` i64, `own_client_order_id` string? |
 | `snapshots` | `ticker`, `recv_wall_ns`, `sid`, `seq`, `side`, `price_e4`, `count_e2`, `reason` i8 (0 initial, 1 gap resync, 2 reconnect) |
 | `trades` | `ticker`, `trade_id` string, `ts_ms`, `recv_wall_ns`, `sid`, `seq`, `price_e4`, `count_e2`, `taker_side` i8 (0 bid, 1 ask), `is_block` bool |
-| `tickers` | `ticker`, `ts_ms`, `recv_wall_ns`, `last_e4` i32?, `bid_e4` i32?, `ask_e4` i32?, `bid_size_e2` i64?, `ask_size_e2` i64?, `volume_e2` i64, `open_interest_e2` i64 |
+| `tickers` | Not produced. The unfiltered `ticker` channel is live-only (ADR 0018); top-of-book for recorded markets is derived from `deltas` and `snapshots` |
 | `lifecycle` | `ticker`, `ts_s` i64, `recv_wall_ns`, `event_type` string, `payload_json` string |
 | `gaps` | `conn_id`, `sid`, `recv_wall_ns`, `expected_seq`, `got_seq`, `resolved_recv_wall_ns` i64? |
 | `audits` | `ticker`, `recv_wall_ns`, `levels_rest` i32, `levels_local` i32, `mismatched_levels` i32, `max_abs_diff_e2` i64 |

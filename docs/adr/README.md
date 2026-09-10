@@ -27,3 +27,4 @@ choose and why, you have not made a decision; you have made a default.
 | [0015](0015-market-making-first-strategy.md) | Passive market making as the first strategy | accepted |
 | [0016](0016-client-side-rate-limit-mirror.md) | Mirror Kalshi's token buckets client-side | accepted |
 | [0017](0017-tolerant-inbound-taxonomies.md) | Inbound taxonomies decode as strings; directional bits stay closed | accepted |
+| [0018](0018-live-only-ticker-firehose.md) | The unfiltered ticker channel is live-only, not taped | accepted |

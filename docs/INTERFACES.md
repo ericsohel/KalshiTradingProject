@@ -246,7 +246,7 @@ class RawFrame(Struct): payload: bytes; recv_mono_ns: Ns; recv_wall_ns: Ns
 
 # Frozen command structs; each validates in __post_init__ what the server would reject.
 SubscribeCommand(channels, market_tickers=None, use_yes_price=None, send_initial_snapshot=None)
-UpdateSubscriptionCommand(sid, action: "add_markets"|"delete_markets"|"get_snapshot", market_tickers=None)
+UpdateSubscriptionCommand(sid, action: "add_markets"|"delete_markets"|"get_snapshot", market_tickers)  # tickers required for every action
 UnsubscribeCommand(sids); ListSubscriptionsCommand()
 Command = SubscribeCommand | UpdateSubscriptionCommand | UnsubscribeCommand | ListSubscriptionsCommand
 def encode_command(command: Command, command_id: int) -> bytes   # {"id","cmd","params"?}
@@ -370,12 +370,52 @@ equal or smaller is a `Duplicate` (suspicious, never fatal). `seq is None`, on u
 channels such as `ticker` and `fill`, is `Ok` and leaves the baseline alone. After a gap
 the baseline moves to the observed value, so one hole is reported once.
 
-### 8.4 Adapters (next)
+### 8.4 `tape.recorder.writer` and `tape.recorder.supervisor`
 
 ```python
-class ConnectionSupervisor:   # one per WS connection: WsSession, segment writer feed, GapTracker, books
-class Auditor:                # samples markets, fetches REST books, diffs against local books
-class Recorder:               # composition root for `tape record`
+class SegmentSink:                 # owns SegmentWriters on a dedicated thread; asyncio never touches disk
+    def __init__(self, root: Path, conn_id: int, clock: Clock, header_factory: HeaderFactory,
+                 *, queue_max: int, ...)
+    def start(self) -> None
+    def put(self, record: Record) -> bool        # non-blocking, thread-safe; False when the queue is full
+    def rotate(self) -> None                     # new file; called on every reconnect
+    def close(self) -> None                      # drains, flushes, joins; idempotent
+    stats: SinkStats; failure: BaseException | None
+def segment_path(root, conn_id, wall_ns, counter) -> Path   # raw/YYYY-MM-DD/HH/conn-NN-UUUU.tape.zst
+
+class SupervisorConfig(Struct):
+    conn_id: int
+    book_channels: tuple[str, ...] = ("orderbook_delta", "trade")   # one sid per channel per group
+    firehose_channels: tuple[str, ...] = ()      # unfiltered, e.g. ("ticker",) on the live-only connection
+    use_yes_price: bool = True
+    persist: bool = True                         # False = live-only (ADR 0018)
+    backoff_initial_ns: int; backoff_max_ns: int; max_consecutive_failures: int | None = None
+
+class ConnectionSupervisor:
+    def __init__(self, config: SupervisorConfig, session_factory: Callable[[], WsSession],
+                 clock: Clock, *, sink: SegmentSink | None, on_event: Callable[[MarketEvent], None] | None,
+                 sleep: Callable[[float], Awaitable[None]], jitter: Callable[[], float])
+    async def run(self) -> None                  # until stop(); raises past max_consecutive_failures
+    async def stop(self) -> None                 # idempotent
+    async def set_groups(self, groups: Sequence[Group]) -> None   # diffed and applied live, replayed on reconnect
+    books: Mapping[str, Book]; groups; subscriptions; last_errors; stats: SupervisorStats
+def backoff_delay_s(failures, initial_ns, max_ns, jitter) -> float
+```
+
+Sessions are single-use, so every connection attempt builds a new one from the factory.
+Sleep and jitter are injected so reconnect behavior is deterministic under test. On
+disconnect the supervisor writes a close record, marks every book stale, rotates the
+segment, waits `min(max, initial * 2**failures) * (0.5 + jitter/2)`, then reconnects and
+resubscribes every group from its own table, never from old `sid`s. Error codes 25, 26,
+and 27 are counted and exposed in `last_errors` for the recorder to act on. Gap,
+duplicate, and backpressure behavior is described in docs/ARCHITECTURE.md 7.1.
+
+`on_event` receives every trade, ticker, lifecycle event, and gap, and every snapshot
+and delta that was actually applied to a book.
+
+```python
+class Auditor:                # next: samples markets, fetches REST books, diffs against local books
+class Recorder:               # next: composition root for `tape record`
 ```
 
 The recorder's hot path per frame: read, enqueue raw bytes for the writer,

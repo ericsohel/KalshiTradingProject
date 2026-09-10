@@ -1,6 +1,6 @@
 # 0001. Record raw frames before decoding
 
-Status: accepted. Date: 2026-09-09.
+Status: accepted, scope refined by ADR 0018. Date: 2026-09-09.
 
 ## Context
 
@@ -39,3 +39,9 @@ re-recording. The tape format is trivially simple, which is what makes it durabl
 Kalshi shipping a historical depth API, or storage becoming the binding constraint
 after decoders have been proven correct for months. Even then, raw retention for
 showcase markets would stay.
+
+## Refinement
+
+ADR 0018 makes the rule a property of a connection: a taped connection writes
+every frame before decoding it, and a live-only connection (the unfiltered
+`ticker` channel) stores nothing. There is no connection that stores some frames.

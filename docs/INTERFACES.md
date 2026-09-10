@@ -24,9 +24,12 @@ DollarsE6 = NewType("DollarsE6", int) # signed
 def parse_price(s: str) -> PriceE4          # "0.5600" -> 5600; raises FixedPointError
 def parse_count(s: str) -> CountE2          # "12.50" -> 1250
 def parse_dollars(s: str) -> DollarsE6      # "0.010000" -> 10_000
+def parse_signed_count(s: str) -> int       # "-54.00" -> -5400; deltas only
 def format_price(p: PriceE4) -> str         # 5600 -> "0.5600"
 def format_count(c: CountE2) -> str         # 1250 -> "12.50"
 def complement(p: PriceE4) -> PriceE4       # 10_000 - p
+def notional_e6(p: PriceE4, c: CountE2) -> DollarsE6   # exact: e4 * e2 = e6
+def div_ceil(n: int, d: int) -> int; def div_floor(n: int, d: int) -> int
 ```
 
 Invariants: parse/format round-trip exactly; parsing rejects excess precision,
@@ -35,12 +38,19 @@ negative prices, and prices above 1.0000. Property-tested.
 ## 2. `tape.timeutil`
 
 ```python
-Ms = NewType("Ms", int); Ns = NewType("Ns", int)
+Ms = NewType("Ms", int)
+Ns = NewType("Ns", int)
+
+
 class Clock(Protocol):
     def mono_ns(self) -> Ns: ...
     def wall_ns(self) -> Ns: ...
-class SystemClock(Clock): ...     # adapter; the only place time.* is called
-class FrozenClock(Clock): ...     # tests and replay; advanced explicitly
+
+
+class SystemClock(Clock): ...  # adapter; the only place time.* is called
+
+
+class FrozenClock(Clock): ...  # tests and replay; advanced explicitly
 ```
 
 ## 3. `tape.wire`
@@ -53,46 +63,70 @@ REST response and WebSocket message used, named after the spec (`MarketV1`,
 conversion to fixed-point happens in `tape.wire.convert`:
 
 ```python
-def to_book_delta(m: OrderbookDeltaMsg, recv: Receipt) -> BookDelta
-def to_book_snapshot(m: OrderbookSnapshotMsg, recv: Receipt, use_yes_price: bool) -> BookSnapshot
-def to_trade(m: TradeMsg, recv: Receipt) -> Trade
-def to_ticker(m: TickerMsg, recv: Receipt) -> Ticker
-def to_lifecycle(m: MarketLifecycleV2Msg, recv: Receipt) -> Lifecycle
-def decode_envelope(raw: bytes) -> Envelope   # {"type","sid","seq"?,"msg"} with msg left raw
+def decode_envelope(raw: bytes | str) -> Envelope          # type, sid?, seq?, id?; msg left raw
+def decode_msg[T: msgspec.Struct](env: Envelope, struct_type: type[T]) -> T
+def to_book_snapshot(m: OrderbookSnapshotMsg, env: Envelope, recv: Receipt, *, use_yes_price: bool) -> BookSnapshot
+def to_book_delta(m: OrderbookDeltaMsg, env: Envelope, recv: Receipt, *, use_yes_price: bool) -> BookDelta
+def to_trade(m: TradeMsg, env: Envelope, recv: Receipt) -> Trade
+def to_ticker(m: TickerMsg, env: Envelope, recv: Receipt) -> Ticker
+def to_lifecycle(m: MarketLifecycleV2Msg, env: Envelope, recv: Receipt) -> Lifecycle
 ```
 
 `decode_envelope` is the only decoder allowed on the recorder's hot path; it reads
-`type`, `sid`, and `seq` without materializing `msg`.
+`type`, `sid`, `seq`, and `id` without materializing `msg`. Conversions take the
+envelope for `sid` and `seq`, raise `WireError` when `sid` is absent, and raise
+`FixedPointError` on malformed numbers. Zero-count snapshot levels are dropped.
 
-## 4. `tape.book`
+## 4. `tape.events`
+
+Frozen, tagged `msgspec.Struct`s shared by recorder, bus, API, and engine:
 
 ```python
 class Side(IntEnum): BID = 0; ASK = 1
-
-@dataclass(frozen=True, slots=True)
-class Level: price: PriceE4; count: CountE2
-
-class Book:                       # mutable, single-owner, not thread-safe
-    ticker: str
-    def apply_snapshot(self, bids: Sequence[Level], asks: Sequence[Level], *, ts_ms: Ms) -> None
-    def apply_delta(self, side: Side, price: PriceE4, delta: int, *, ts_ms: Ms) -> None
-    def best_bid(self) -> Level | None
-    def best_ask(self) -> Level | None
-    def depth(self, side: Side, n: int) -> list[Level]     # best first
-    def size_at(self, side: Side, price: PriceE4) -> CountE2
-    def is_stale(self) -> bool; def mark_stale(self) -> None
-    def to_keyframe(self) -> KeyframeRows
-    def checksum(self) -> int          # order-independent hash of all levels; used by audits and tests
-
-def from_keyframe(rows: KeyframeRows) -> Book
-def diff(a: Book, b: Book) -> BookDiff   # levels present in one and not the other, or with different counts
+Receipt(conn_id, recv_mono_ns, recv_wall_ns)
+Level(price: PriceE4, count: CountE2)                     # array-encoded on the bus
+BookSnapshot(ticker, ts_ms, receipt, sid, seq, bids: tuple[Level, ...], asks: tuple[Level, ...])
+BookDelta(ticker, ts_ms, receipt, sid, seq, side, price, delta: int, own_client_order_id)
+Trade(ticker, ts_ms, receipt, sid, seq, trade_id, price, count, taker_side, is_block)
+Ticker(ticker, ts_ms, receipt, sid, last, bid, ask, bid_size, ask_size, volume, open_interest)
+Lifecycle(ticker, receipt, sid, seq, event_type, payload_json)
+GapEvent(receipt, sid, expected_seq, got_seq)
+MarketEvent = BookSnapshot | BookDelta | Trade | Ticker | Lifecycle | GapEvent
 ```
 
-Invariants (asserted in debug builds, property-tested): counts never negative
-(a delta that would go negative raises `BookInvariantError` and marks the book stale);
-`best_bid < best_ask` whenever both exist; a snapshot fully replaces prior levels.
+Private events (fills, order updates, acknowledgements, timers) are defined in
+`tape.engine` because only the engine consumes them.
 
-## 5. `tape.client`
+## 5. `tape.book`
+
+```python
+class KeyframeRow(Struct): ticker; side: int (-1 = empty book); price_e4; count_e2; as_of_recv_ns; last_ts_ms | None; stale
+class LevelDiff(Struct): side; price; count_a; count_b
+class BookDiff(Struct): ticker; differences: tuple[LevelDiff, ...]; is_empty
+
+class Book:                       # mutable, single-owner, not thread-safe; stale until first snapshot
+    ticker: str; last_ts_ms: Ms | None
+    def apply_snapshot(self, bids: Iterable[Level], asks: Iterable[Level], *, ts_ms: Ms | None) -> None
+    def apply_delta(self, side: Side, price: PriceE4, delta: int, *, ts_ms: Ms | None) -> bool  # False if stale
+    def mark_stale(self) -> None; def is_stale(self) -> bool
+    def best_bid(self) -> Level | None; def best_ask(self) -> Level | None
+    def size_at(self, side: Side, price: PriceE4) -> CountE2
+    def depth(self, side: Side, n: int) -> list[Level]          # best first
+    def levels(self, side: Side) -> list[Level]; def level_count(self, side: Side) -> int
+    def checksum(self) -> int                                   # order-independent 64-bit; audits and tests
+    def to_keyframe(self, *, as_of_recv_ns: Ns) -> list[KeyframeRow]
+
+def diff(a: Book, b: Book) -> BookDiff                          # ValueError on different tickers
+def books_from_keyframe_rows(rows: Iterable[KeyframeRow]) -> dict[str, Book]
+```
+
+Invariants (asserted in code, property-tested): counts are positive (a delta that
+would go negative raises `BookInvariantError` and marks the book stale); `best_bid <
+best_ask` whenever both exist (a crossing snapshot or delta raises and marks stale);
+a snapshot fully replaces prior levels; deltas on a stale book are ignored and
+reported by the `False` return, because their base is unknown.
+
+## 6. `tape.client`
 
 ### 5.1 `tape.client.auth`
 
@@ -163,24 +197,32 @@ class SubscribeCommand / UpdateSubscriptionCommand / UnsubscribeCommand / ListSu
 `WsSession` does not decode. It answers pings, raises `WsClosedError` on close, and
 exposes `RawFrame`s in receive order. Reconnect policy lives in the recorder, not here.
 
-## 6. `tape.segment` (segment I/O)
+## 7. `tape.segment` (segment and keyframe I/O)
 
 ```python
-class SegmentWriter:            # one per connection; owns one open file
-    def __init__(self, root: Path, header: SegmentHeader, *, rotate_every: timedelta) -> None
-    def append(self, kind: RecordKind, conn_id: int, recv_mono_ns: Ns, recv_wall_ns: Ns, payload: bytes) -> None
-    def flush(self) -> None; def rotate(self) -> None; def close(self) -> None
+class RecordKind(IntEnum): FRAME = 1; COMMAND = 2; GAP = 3; CONNECTION = 4; AUDIT = 5
+SubscriptionInfo(sid, channel, group_id)
+SegmentHeader(created_wall_ns, host, env, conn_id, ws_url, use_yes_price, subscriptions, software_version, spec_versions)
+Record(kind, conn_id, recv_mono_ns, recv_wall_ns, payload: bytes)
+
+class SegmentWriter:            # one file; rotation policy belongs to the recorder
+    def __init__(self, path: Path, header: SegmentHeader, *, level: int = 3) -> None
+    def append(self, record: Record) -> None      # ValueError after close or on payload > 2**32 - 1
+    def flush(self) -> None                       # complete zstd block + OS flush
+    def close(self) -> None                       # idempotent; context manager supported
+    records_written: int; bytes_written: int
 class SegmentReader:
-    def __init__(self, path: Path) -> None
-    @property header(self) -> SegmentHeader
-    def records(self) -> Iterator[Record]      # tolerates a truncated tail; raises TapeCorruptionError otherwise
-class KeyframeWriter / KeyframeReader           # Parquet per DATA_FORMATS.md section 5
+    def __init__(self, path: Path) -> None        # parses the header; TapeCorruptionError if malformed
+    header: SegmentHeader; truncated: bool        # truncated is final after records() is exhausted
+    def records(self) -> Iterator[Record]         # stops cleanly at a truncated tail or unfinished frame
+def write_keyframe(path: Path, rows: Iterable[KeyframeRow]) -> int    # atomic (temp file + rename)
+def read_keyframe(path: Path) -> list[KeyframeRow]                    # TapeCorruptionError on schema mismatch
 ```
 
 `SegmentWriter.append` is called from a single writer thread fed by a bounded
 `queue.Queue`; the asyncio side never blocks on disk.
 
-## 7. `tape.recorder`
+## 8. `tape.recorder`
 
 ```python
 class UniverseSelector(Protocol):
@@ -201,7 +243,7 @@ The recorder's hot path per frame: read → enqueue raw bytes for the writer →
 `decode_envelope` → `GapTracker.observe` → (off hot path) full decode → book apply →
 bus publish. The writer queue is enqueued first so nothing downstream can lose a frame.
 
-## 8. `tape.bus`
+## 9. `tape.bus`
 
 ```python
 class Publisher(Protocol):
@@ -215,7 +257,7 @@ Topics: `md.<ticker>` for market data events (msgspec-encoded `Event` union),
 `ctl.lifecycle`, `ctl.gap`, `ctl.audit`, `ctl.heartbeat`. Private events never use the
 `md.` prefix. Transport: ZeroMQ PUB/SUB over `ipc://` (ADR 0008).
 
-## 9. `tape.bake` and `tape.store`
+## 10. `tape.bake` and `tape.store`
 
 ```python
 def bake_hour(raw_dir: Path, out_dir: Path, *, date: date, hour: int, spec: DecoderSpec) -> BakeReport   # idempotent
@@ -227,7 +269,7 @@ class Catalog:                      # DuckDB views over data/baked and data/keyf
     def integrity(self, day: date) -> Manifest
 ```
 
-## 10. `tape.engine`
+## 11. `tape.engine`
 
 ```python
 # Events (frozen structs, tagged union)
@@ -267,7 +309,7 @@ class Engine:                       # single loop: source -> strategy -> gateway
 Determinism rule: `Strategy` implementations import nothing from `tape.client`, `time`,
 `random`, or `os`. A test replays a recorded day twice and asserts identical hashes.
 
-## 11. `tape.fees`
+## 12. `tape.fees`
 
 ```python
 class FeeType(StrEnum): QUADRATIC, QUADRATIC_WITH_MAKER_FEES, QUADRATIC_WITH_COMBO_MAKER_FEES, FLAT
@@ -283,7 +325,7 @@ with combo makers at 50% of taker, computed in exact integer arithmetic to
 micro-dollars and rounded per Kalshi's fee-rounding rules. The constants are verified
 against `fee_cost` on real fills (see [TESTING.md](TESTING.md)).
 
-## 12. `tape.sim`
+## 13. `tape.sim`
 
 ```python
 class FillModel(Protocol):
@@ -301,7 +343,7 @@ unless reducing; `decrease` keeps queue; every operation rejected after `close_t
 settlement at `determined`; token buckets for reads and writes; latency sampled from
 recorded ack distributions.
 
-## 13. `tape.probe`
+## 14. `tape.probe`
 
 ```python
 class ProbePlan: markets: Sequence[str]; count: CountE2; ttl: timedelta; side_rule: Literal["join_best_bid"]
@@ -310,17 +352,18 @@ class QueueTracker:                 # pure; estimates queue-ahead from own-tagge
 def fit_fill_model(samples: Sequence[ProbeSample]) -> Calibrated
 ```
 
-## 14. `tape.api`
+## 15. `tape.api`
 
 FastAPI application. Routes in [FRONTEND.md](FRONTEND.md). Dependencies injected at
 startup: `Catalog`, `Subscriber`, settings. No route touches Kalshi directly.
 
-## 15. Errors
+## 16. Errors
 
 ```
 TapeError
-  FixedPointError
-  BookInvariantError
+  FixedPointError          # also a ValueError
+  WireError                # also a ValueError
+  BookInvariantError(ticker, detail)
   TapeCorruptionError
   ConfigError
   KalshiError
@@ -332,7 +375,7 @@ TapeError
   SequenceGapError        # internal signal, converted to GapEvent
 ```
 
-## 16. Configuration (`tape.config`)
+## 17. Configuration (`tape.config`)
 
 Loaded from a TOML file plus environment overrides, validated into a frozen struct:
 

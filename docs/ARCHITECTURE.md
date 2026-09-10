@@ -126,6 +126,8 @@ implemented after the simulator is calibrated (see [ROADMAP.md](ROADMAP.md)).
 src/tape/
   fixedpoint.py      exact codecs: PriceE4, CountE2, DollarsE6  (core)
   timeutil.py        typed timestamps and conversions           (core)
+  errors.py          the TapeError hierarchy                    (core)
+  events.py          market-data event structs                  (core)
   wire/              msgspec structs for every REST/WS payload   (core)
   book/              YES-space order book                       (core)
   fees/              fee model with scheduled changes           (core)

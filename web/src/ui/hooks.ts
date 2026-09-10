@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { browserSocketFactory, type ConnectionState } from "../api/live";
+import { startPolling } from "../api/poll";
 import { ApiRequestError } from "../api/rest";
 import { LiveFeed } from "../state/liveFeed";
 import type { PriceGrid } from "../state/priceGrid";
@@ -22,7 +23,7 @@ interface PollState<T> extends Polled<T> {
 }
 
 /**
- * Calls `load` now and every `intervalMs` after the previous call settles. A new `load`
+ * Calls `load` now and every `intervalMs` after the previous call settles (`startPolling`). A new `load`
  * (keep it stable with `useCallback`) restarts polling and hides the previous data.
  * Errors keep the last good data alongside the error.
  */
@@ -31,37 +32,30 @@ export function usePolling<T>(
   intervalMs: number,
 ): Polled<T> {
   const [state, setState] = useState<PollState<T>>({ load, data: null, error: null });
-  useEffect(() => {
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const run = async (): Promise<void> => {
-      try {
-        const data = await load(controller.signal);
-        if (!controller.signal.aborted) setState({ load, data, error: null });
-      } catch (error: unknown) {
-        if (controller.signal.aborted) return;
-        const failure =
-          error instanceof ApiRequestError
-            ? error
-            : new ApiRequestError(
-                "network",
-                null,
-                error instanceof Error ? error.message : "failed",
-              );
-        setState((previous) => ({
-          load,
-          data: previous.load === load ? previous.data : null,
-          error: failure,
-        }));
-      }
-      if (!controller.signal.aborted) timer = setTimeout(() => void run(), intervalMs);
-    };
-    void run();
-    return () => {
-      controller.abort();
-      clearTimeout(timer);
-    };
-  }, [load, intervalMs]);
+  useEffect(
+    () =>
+      startPolling({
+        load,
+        intervalMs,
+        onData: (data) => setState({ load, data, error: null }),
+        onError: (error) => {
+          const failure =
+            error instanceof ApiRequestError
+              ? error
+              : new ApiRequestError(
+                  "network",
+                  null,
+                  error instanceof Error ? error.message : "failed",
+                );
+          setState((previous) => ({
+            load,
+            data: previous.load === load ? previous.data : null,
+            error: failure,
+          }));
+        },
+      }),
+    [load, intervalMs],
+  );
   return state.load === load ? state : { data: null, error: null };
 }
 

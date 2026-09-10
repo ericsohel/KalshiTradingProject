@@ -1,13 +1,16 @@
 /** Markets ranked by 24-hour volume, filterable, navigable with arrow keys. */
 
 import { useId, useState, type KeyboardEvent } from "react";
-import type { BookStatus, MarketRow } from "../api/protocol";
+import type { BookState, MarketRow } from "../api/protocol";
 import type { ApiRequestError } from "../api/rest";
 import type { MarketSummary } from "../state/tapeStore";
+import { marketListNotice } from "./availability";
 import { formatCompactContracts, marketLabel } from "./format";
 
 export interface MarketPickerProps {
   readonly rows: readonly MarketRow[];
+  /** Rows in the latest list the API answered with, or `null` before one arrived. */
+  readonly listed: number | null;
   readonly loading: boolean;
   readonly error: ApiRequestError | null;
   readonly selectedTicker: string | null;
@@ -16,7 +19,7 @@ export interface MarketPickerProps {
   readonly onSelect: (ticker: string) => void;
 }
 
-const BOOK_TEXT: Record<BookStatus, string> = {
+const BOOK_TEXT: Record<BookState, string> = {
   fresh: "Fresh",
   stale: "Stale",
   unknown: "Unknown",
@@ -51,6 +54,7 @@ function moveFocus(event: KeyboardEvent<HTMLUListElement>): void {
 
 export function MarketPicker({
   rows,
+  listed,
   loading,
   error,
   selectedTicker,
@@ -60,6 +64,7 @@ export function MarketPicker({
   const [query, setQuery] = useState("");
   const filterId = useId();
   const visible = rows.filter((row) => matches(row, query));
+  const listNotice = marketListNotice(listed, error !== null);
   return (
     <nav className="picker" aria-label="Markets">
       <div className="picker-head">
@@ -85,8 +90,10 @@ export function MarketPicker({
         </p>
       ) : null}
       {loading ? <p className="picker-message">Loading markets…</p> : null}
-      {!loading && error === null && rows.length === 0 ? (
-        <p className="picker-message">No recorded markets yet.</p>
+      {listNotice !== null ? (
+        <p className="picker-message" role="status">
+          {listNotice.text}
+        </p>
       ) : null}
       <ul className="picker-list" onKeyDown={moveFocus}>
         {visible.map((row, index) => {

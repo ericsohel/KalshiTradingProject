@@ -1,18 +1,22 @@
 /**
  * The page's URL state: `?market=TICKER&range=full`. Parsing is strict, so a hand-edited
- * URL can never inject anything into an API path.
+ * URL can never inject anything into an API path: a ticker must match the documented
+ * pattern, which also rules out `.` and `..` path segments.
  */
+
+import { TICKER_PATTERN } from "../api/protocol";
 
 export type PriceRangeMode = "follow" | "full";
 
 const MARKET_PARAM = "market";
 const RANGE_PARAM = "range";
-/** Kalshi tickers are upper-case letters, digits, hyphens, and (in strikes) dots. */
-const TICKER_PATTERN = /^[A-Za-z0-9._-]{1,96}$/;
+/** Longest ticker accepted from a URL; recorded tickers are under 50 characters. */
+const MAX_TICKER_LENGTH = 96;
 
 export function tickerFromSearch(search: string): string | null {
   const ticker = new URLSearchParams(search).get(MARKET_PARAM);
-  return ticker !== null && TICKER_PATTERN.test(ticker) ? ticker : null;
+  if (ticker === null || ticker.length > MAX_TICKER_LENGTH) return null;
+  return TICKER_PATTERN.test(ticker) ? ticker : null;
 }
 
 export function rangeFromSearch(search: string): PriceRangeMode {

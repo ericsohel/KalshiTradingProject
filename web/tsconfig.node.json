@@ -7,5 +7,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "eslint.config.js", "dev"]
+  "include": ["vite.config.ts", "eslint.config.js", "dev", "scripts"]
 }

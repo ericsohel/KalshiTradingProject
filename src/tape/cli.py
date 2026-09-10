@@ -51,7 +51,7 @@ from tape.client.auth import RsaPssSigner
 from tape.client.ratelimit import BucketRateLimiter
 from tape.client.rest import KalshiRest, build_client
 from tape.client.ws import WsSession
-from tape.config import Settings, load_settings, redacted
+from tape.config import Settings, load_settings, redacted, signing_credentials
 from tape.errors import ConfigError
 from tape.recorder.auditor import Auditor
 from tape.recorder.recorder import Recorder, RecorderConfig
@@ -60,6 +60,7 @@ from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.timeutil import NS_PER_MS, NS_PER_S, Clock, SystemClock
 
 __all__ = [
+    "CHECK_TARGETS",
     "LOG_FORMATS",
     "SERVE_SHUTDOWN_TIMEOUT_S",
     "AuditTask",
@@ -78,6 +79,10 @@ __all__ = [
 
 LOG_FORMATS: Final = ("text", "json")
 """``--log-format`` choices: human-readable lines, or one JSON object per line."""
+
+CHECK_TARGETS: Final = ("record", "serve")
+"""``config check --for`` choices: the command whose requirements are checked. ``record`` needs
+the signing credentials; ``serve`` holds none and needs ``recorder.bus_endpoint``."""
 
 _LOG_LEVELS: Final = ("DEBUG", "INFO", "WARNING", "ERROR")
 _EXIT_OK: Final = 0
@@ -127,6 +132,13 @@ def _parser() -> argparse.ArgumentParser:
     check = config_commands.add_parser(
         "check", parents=[common], help="validate and print the effective settings"
     )
+    check.add_argument(
+        "--for",
+        dest="target",
+        choices=CHECK_TARGETS,
+        default="record",
+        help="also check what this command needs (default: record, which needs credentials)",
+    )
     check.set_defaults(command=_config_check)
     record = commands.add_parser(
         "record", parents=[common], help="record market data until SIGINT or SIGTERM"
@@ -143,6 +155,14 @@ def _config_check(args: argparse.Namespace) -> int:
     settings = _load(args.config)
     if settings is None:
         return _EXIT_FAILURE
+    try:
+        if args.target == "serve":
+            _require_bus_endpoint(settings)
+        else:
+            signing_credentials(settings)
+    except ConfigError as exc:
+        _report_config_error(exc)
+        return _EXIT_FAILURE
     shown = msgspec.json.format(msgspec.json.encode(redacted(settings)), indent=2)
     sys.stdout.write(f"{shown.decode()}\n")
     return _EXIT_OK
@@ -152,6 +172,11 @@ def _record(args: argparse.Namespace) -> int:
     configure_logging(log_format=args.log_format, level=args.log_level)
     settings = _load(args.config)
     if settings is None:
+        return _EXIT_FAILURE
+    try:
+        signing_credentials(settings)
+    except ConfigError as exc:
+        _report_config_error(exc)
         return _EXIT_FAILURE
     try:
         asyncio.run(_run_recorder(settings))
@@ -169,8 +194,10 @@ def _serve(args: argparse.Namespace) -> int:
     settings = _load(args.config)
     if settings is None:
         return _EXIT_FAILURE
-    if settings.recorder.bus_endpoint is None:
-        _report_config_error(ConfigError(_NO_BUS_ENDPOINT))
+    try:
+        _require_bus_endpoint(settings)
+    except ConfigError as exc:
+        _report_config_error(exc)
         return _EXIT_FAILURE
     try:
         asyncio.run(_run_api(settings))
@@ -186,6 +213,18 @@ def _serve(args: argparse.Namespace) -> int:
 _NO_BUS_ENDPOINT: Final = (
     "recorder.bus_endpoint is not set; tape serve follows the recorder's bus at that endpoint"
 )
+
+
+def _require_bus_endpoint(settings: Settings) -> str:
+    """The bus endpoint ``tape serve`` follows.
+
+    Raises:
+        ConfigError: If ``recorder.bus_endpoint`` is not set.
+    """
+    endpoint = settings.recorder.bus_endpoint
+    if endpoint is None:
+        raise ConfigError(_NO_BUS_ENDPOINT)
+    return endpoint
 
 
 def _load(path: Path) -> Settings | None:
@@ -205,7 +244,7 @@ async def _run_recorder(settings: Settings) -> None:
     """Build the recorder on real I/O and run it until a stop signal.
 
     Raises:
-        ConfigError: If the private key cannot be loaded.
+        ConfigError: If the signing credentials are not set or the private key cannot be loaded.
         Exception: Whatever :meth:`Recorder.run` raised.
     """
     clock = SystemClock()
@@ -313,9 +352,7 @@ async def serve_api(
         RuntimeError: If the server or the bus follower ended before ``stop`` was set.
         Exception: Whatever else ended the server, the hub, or the resolver.
     """
-    endpoint = settings.recorder.bus_endpoint
-    if endpoint is None:
-        raise ConfigError(_NO_BUS_ENDPOINT)
+    endpoint = _require_bus_endpoint(settings)
     subscriber = ZmqSubscriber(endpoint, receive_hwm=settings.serve.bus_receive_hwm)
     try:
         api = build_api(settings, http=http, clock=clock, subscriber=subscriber)
@@ -496,11 +533,13 @@ def build_recorder(
         A recorder ready to :meth:`Recorder.run`.
 
     Raises:
-        ConfigError: If the private key file is not a usable RSA key.
+        ConfigError: If the signing credentials are not set, or the private key file fails its
+            check or is not a usable RSA key.
         BusError: If ``recorder.bus_endpoint`` is set and cannot be bound.
     """
     kalshi = settings.kalshi
-    signer = RsaPssSigner(kalshi.key_id, kalshi.private_key_path)
+    credentials = signing_credentials(settings)
+    signer = RsaPssSigner(credentials.key_id, credentials.private_key_path)
     limiter = BucketRateLimiter(clock)
     rest = KalshiRest(kalshi.endpoints.rest_url, http, limiter, clock, signer)
     ping_interval_ns = kalshi.ws_ping_interval_s * NS_PER_S

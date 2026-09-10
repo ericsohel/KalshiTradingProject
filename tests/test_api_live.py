@@ -375,7 +375,7 @@ async def test_bus_loss_resyncs_followed_books_until_refresh_images_bring_them_b
         snapshot_of("KXA", [(4000, 101)]),
     ]
     health = live.hub.bus_health()
-    assert (health.epoch, health.last_seq, health.resets, health.missed) == (EPOCH, 8, 2, 1)
+    assert (health.epoch, health.last_seq, health.resets, health.missed) == (str(EPOCH), 8, 2, 1)
     assert health.books_known == 1
 
     live.publish(refresh("KXB"), epoch=EPOCH + 1)

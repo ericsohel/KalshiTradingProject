@@ -257,6 +257,108 @@ describe("LiveClient subscription pacing", () => {
   });
 });
 
+describe("LiveClient before the recorder's market list reaches the server", () => {
+  const unknown = (...tickers: string[]) => ({
+    t: "subscribed",
+    tickers: [],
+    rejected: tickers.map((ticker) => ({ ticker, code: "unknown_ticker" })),
+  });
+
+  it("asks again for markets rejected as unknown after bus_refresh_s, until accepted", () => {
+    const { client, goLive } = setup();
+    client.setSubscription(["KXA"]);
+    client.start();
+    const socket = goLive();
+    socket.receive(unknown("KXA"));
+    expect(client.state.rejectionRetryAtMs).toBe(Date.now() + 10_000);
+    vi.advanceTimersByTime(9_999);
+    expect(socket.subscriptions()).toEqual([["KXA"]]);
+    vi.advanceTimersByTime(1);
+    expect(socket.subscriptions()).toEqual([["KXA"], ["KXA"]]);
+    socket.receive(unknown("KXA"));
+    vi.advanceTimersByTime(10_000);
+    expect(socket.subscriptions()).toHaveLength(3);
+    socket.receive({ t: "subscribed", tickers: ["KXA"], rejected: [] });
+    expect(client.state).toMatchObject({
+      subscribed: ["KXA"],
+      rejected: [],
+      rejectionRetryAtMs: null,
+    });
+    vi.advanceTimersByTime(120_000);
+    expect(socket.subscriptions()).toHaveLength(3);
+  });
+
+  it("gives up after the retry budget, and a new subscription set renews it", () => {
+    const { client, goLive } = setup({ unknownTickerRetries: 2 });
+    client.setSubscription(["KXA"]);
+    client.start();
+    const socket = goLive();
+    for (let reply = 0; reply < 3; reply += 1) {
+      socket.receive(unknown("KXA"));
+      vi.advanceTimersByTime(10_000);
+    }
+    expect(socket.subscriptions()).toEqual([["KXA"], ["KXA"], ["KXA"]]);
+    expect(client.state.rejectionRetryAtMs).toBeNull();
+    expect(client.state.rejected).toEqual([{ ticker: "KXA", code: "unknown_ticker" }]);
+    vi.advanceTimersByTime(120_000);
+    expect(socket.subscriptions()).toHaveLength(3);
+
+    client.setSubscription(["KXB"]);
+    vi.advanceTimersByTime(300);
+    socket.receive(unknown("KXB"));
+    vi.advanceTimersByTime(10_000);
+    expect(socket.subscriptions().slice(3)).toEqual([["KXB"], ["KXB"]]);
+  });
+
+  it("does not retry markets refused for being too many", () => {
+    const { client, goLive } = setup();
+    client.setSubscription(["KXA", "KXB"]);
+    client.start();
+    const socket = goLive();
+    socket.receive({
+      t: "subscribed",
+      tickers: ["KXA"],
+      rejected: [{ ticker: "KXB", code: "too_many_tickers" }],
+    });
+    expect(client.state.rejectionRetryAtMs).toBeNull();
+    vi.advanceTimersByTime(120_000);
+    expect(socket.subscriptions()).toEqual([["KXA", "KXB"]]);
+  });
+
+  it("uses the server's refresh interval and starts over on a new connection", () => {
+    const { client, socket } = setup({ unknownTickerRetries: 1 });
+    client.setSubscription(["KXA"]);
+    client.start();
+    const first = socket();
+    first.open();
+    first.receive({ ...HELLO, bus_refresh_s: 3 });
+    first.receive(unknown("KXA"));
+    vi.advanceTimersByTime(3_000);
+    first.receive(unknown("KXA"));
+    expect(first.subscriptions()).toEqual([["KXA"], ["KXA"]]);
+    expect(client.state.rejectionRetryAtMs).toBeNull();
+    first.serverClose(1006);
+    vi.advanceTimersByTime(1_000);
+    const second = socket();
+    second.open();
+    second.receive(HELLO);
+    second.receive(unknown("KXA"));
+    expect(client.state.rejectionRetryAtMs).toBe(Date.now() + 10_000);
+  });
+
+  it("cancels a pending retry on stop", () => {
+    const { client, goLive } = setup();
+    client.setSubscription(["KXA"]);
+    client.start();
+    const socket = goLive();
+    socket.receive(unknown("KXA"));
+    client.stop();
+    expect(client.state.rejectionRetryAtMs).toBeNull();
+    vi.advanceTimersByTime(120_000);
+    expect(socket.subscriptions()).toEqual([["KXA"]]);
+  });
+});
+
 describe("LiveClient reconnects", () => {
   it("reports the loss once, backs off, reconnects, and resubscribes", () => {
     const { client, goLive, sockets, lost } = setup();

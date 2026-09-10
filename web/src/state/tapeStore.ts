@@ -13,7 +13,7 @@
  * local receive time on a monotonic clock, binned from `originMs`.
  */
 
-import type { BookStatus, MarketMessage, PriceLevel, TickerMessage } from "../api/protocol";
+import type { BookState, MarketMessage, PriceLevel, TickerMessage } from "../api/protocol";
 import { ColumnStatus, type ColumnStatusCode, type HeatmapSource } from "../render/source";
 import { Book } from "./book";
 import { DepthHistory } from "./depthHistory";
@@ -75,7 +75,7 @@ export interface MarketSummary {
   readonly version: number;
   readonly grid: PriceGrid;
   /** The local book: `unknown` until a snapshot, and again after it is discarded. */
-  readonly book: BookStatus;
+  readonly book: BookState;
   /** A known book was lost and no snapshot has restored it yet. */
   readonly gap: boolean;
   readonly resync: ResyncState | null;
@@ -109,7 +109,7 @@ export class TapeStore implements HeatmapSource {
   #rowTotals: Float64Array;
   #maxRowE2 = 0;
 
-  #status: BookStatus = "unknown";
+  #status: BookState = "unknown";
   #gap = false;
   #resync: ResyncState | null = null;
   #ticker: TickerState | null = null;
@@ -353,6 +353,7 @@ export class TapeStore implements HeatmapSource {
   }
 
   #changed(): void {
+    this.#history.setEdgeStatus(this.#statusCode());
     this.#version += 1;
   }
 }

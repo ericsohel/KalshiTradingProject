@@ -32,7 +32,7 @@ from tape.fixedpoint import CountE2, PriceE4
 from tape.timeutil import NS_PER_S, Ms, Ns
 
 RECEIPT: Final = Receipt(conn_id=0, recv_mono_ns=Ns(1), recv_wall_ns=Ns(1))
-BUS: Final = BusHealth(epoch=7, last_seq=9, messages=9, resets=1, missed=0, books_known=2)
+BUS: Final = BusHealth(epoch="7", last_seq=9, messages=9, resets=1, missed=0, books_known=2)
 CLOSE_TS: Final = 1_800_000_000
 METADATA: Final = MarketMetadata(
     title="Highest temperature in NYC today?",

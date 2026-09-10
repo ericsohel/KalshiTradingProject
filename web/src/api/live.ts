@@ -6,6 +6,12 @@
  * jittered exponential backoff. Close codes pick the pause: 1013 (server full) and 1008
  * (policy violation) wait longer than an ordinary drop, 4000 (too slow) a little.
  *
+ * Until the recorder's first catalog reaches the server, every market is rejected with
+ * `unknown_ticker`. A wanted market rejected that way is asked for again every
+ * `hello.bus_refresh_s`, the longest the catalog takes to arrive, at most
+ * `unknownTickerRetries` times per connection and subscription set, so the page recovers
+ * without a reload and a market that is really not recorded is eventually left alone.
+ *
  * Invariants: at most one socket is current, and events from a replaced socket are
  * ignored; subscribe messages are coalesced and spaced by `minSubscribeIntervalMs`, which
  * keeps the client under the server's 10-per-second limit; a subscribe message never
@@ -21,7 +27,7 @@ import {
   PROTOCOL_VERSION,
   type HelloMessage,
   type MarketMessage,
-  type RejectedTicker,
+  type Rejection,
   type SubscribeRequest,
 } from "./protocol";
 
@@ -89,7 +95,12 @@ export interface ConnectionState {
   readonly hello: HelloMessage | null;
   /** Tickers the server confirmed in its latest `subscribed` reply. */
   readonly subscribed: readonly string[];
-  readonly rejected: readonly RejectedTicker[];
+  readonly rejected: readonly Rejection[];
+  /**
+   * When the markets rejected with `unknown_ticker` are asked for again; `null` when no
+   * retry is pending (none is rejected that way, or the retries ran out).
+   */
+  readonly rejectionRetryAtMs: number | null;
   readonly lastServerError: { readonly code: string; readonly message: string } | null;
   /** Frames that failed to decode, over the client's lifetime. */
   readonly malformedFrames: number;
@@ -122,7 +133,12 @@ export interface LiveClientOptions {
   readonly stableAfterMs?: number;
   /** Minimum spacing of subscribe messages; default 250 ms (at most 4 per second). */
   readonly minSubscribeIntervalMs?: number;
+  /** Resubscriptions for markets rejected with `unknown_ticker`; default 12. */
+  readonly unknownTickerRetries?: number;
 }
+
+/** Twelve retries at the default 10 s refresh give the recorder's catalog two minutes. */
+const DEFAULT_UNKNOWN_TICKER_RETRIES = 12;
 
 interface ClosePolicy {
   readonly floorMs: number;
@@ -181,6 +197,7 @@ export class LiveClient {
   readonly #helloTimeoutMs: number;
   readonly #stableAfterMs: number;
   readonly #minSubscribeIntervalMs: number;
+  readonly #unknownTickerRetries: number;
 
   #state: ConnectionState = {
     phase: "idle",
@@ -190,6 +207,7 @@ export class LiveClient {
     hello: null,
     subscribed: [],
     rejected: [],
+    rejectionRetryAtMs: null,
     lastServerError: null,
     malformedFrames: 0,
     ignoredFrames: 0,
@@ -202,6 +220,11 @@ export class LiveClient {
   #reconnectTimer: Timer | null = null;
   #helloTimer: Timer | null = null;
   #subscribeTimer: Timer | null = null;
+  #rejectionRetryTimer: Timer | null = null;
+  /** Retries used for `unknown_ticker` rejections on this connection and subscription set. */
+  #rejectionRetries = 0;
+  /** Send the desired set at the next flush even if this connection was already told it. */
+  #resend = false;
 
   #desired: string[] = [];
   /** What the current connection was last told; `null` before the first subscribe. */
@@ -216,6 +239,7 @@ export class LiveClient {
     this.#helloTimeoutMs = options.helloTimeoutMs ?? 10_000;
     this.#stableAfterMs = options.stableAfterMs ?? 30_000;
     this.#minSubscribeIntervalMs = options.minSubscribeIntervalMs ?? 250;
+    this.#unknownTickerRetries = options.unknownTickerRetries ?? DEFAULT_UNKNOWN_TICKER_RETRIES;
   }
 
   get state(): ConnectionState {
@@ -236,7 +260,13 @@ export class LiveClient {
     this.#dropSocket(CloseCode.normal, "client stopped");
     this.#reconnectTimer = cancel(this.#reconnectTimer);
     if (wasLive) this.#options.listener.onConnectionLost(this.#options.now());
-    this.#update({ phase: "stopped", retryAtMs: null, subscribed: [], rejected: [] });
+    this.#update({
+      phase: "stopped",
+      retryAtMs: null,
+      subscribed: [],
+      rejected: [],
+      rejectionRetryAtMs: null,
+    });
   }
 
   /**
@@ -244,7 +274,9 @@ export class LiveClient {
    * rule, later otherwise, and again after every reconnect.
    */
   setSubscription(tickers: readonly string[]): void {
-    this.#desired = uniqueTickers(tickers);
+    const desired = uniqueTickers(tickers);
+    if (!sameList(desired, this.#desired)) this.#rejectionRetries = 0;
+    this.#desired = desired;
     for (const ticker of this.#refresh) {
       if (!this.#desired.includes(ticker)) this.#refresh.delete(ticker);
     }
@@ -314,6 +346,7 @@ export class LiveClient {
         return;
       case "subscribed":
         this.#update({ subscribed: message.tickers, rejected: message.rejected });
+        this.#retryUnknownTickers(message.rejected);
         return;
       case "error":
         this.#update({ lastServerError: { code: message.code, message: message.message } });
@@ -352,7 +385,15 @@ export class LiveClient {
     this.#sent = null;
     this.#lastSubscribeAtMs = Number.NEGATIVE_INFINITY;
     this.#refresh.clear();
-    this.#update({ phase: "live", hello, subscribed: [], rejected: [] });
+    this.#rejectionRetries = 0;
+    this.#resend = false;
+    this.#update({
+      phase: "live",
+      hello,
+      subscribed: [],
+      rejected: [],
+      rejectionRetryAtMs: null,
+    });
     this.#scheduleSubscribe();
   }
 
@@ -364,6 +405,7 @@ export class LiveClient {
     this.#liveSinceMs = null;
     this.#helloTimer = cancel(this.#helloTimer);
     this.#subscribeTimer = cancel(this.#subscribeTimer);
+    this.#rejectionRetryTimer = cancel(this.#rejectionRetryTimer);
     if (wasLive) this.#options.listener.onConnectionLost(atMs);
     const attempt = stable ? 0 : this.#state.attempt;
     const policy = closePolicy(code);
@@ -375,6 +417,7 @@ export class LiveClient {
       lastClose: { code, reason, atMs, explanation: policy.explanation },
       subscribed: [],
       rejected: [],
+      rejectionRetryAtMs: null,
     });
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = null;
@@ -395,12 +438,39 @@ export class LiveClient {
     this.#liveSinceMs = null;
     this.#helloTimer = cancel(this.#helloTimer);
     this.#subscribeTimer = cancel(this.#subscribeTimer);
+    this.#rejectionRetryTimer = cancel(this.#rejectionRetryTimer);
     if (socket === null) return;
     try {
       socket.close(code, reason);
     } catch {
       // Closing a socket that never opened can throw; it is discarded either way.
     }
+  }
+
+  /**
+   * After a `subscribed` reply: while a wanted market is rejected as unknown and retries
+   * remain, sends the same set again after `hello.bus_refresh_s`; otherwise clears the retry.
+   */
+  #retryUnknownTickers(rejected: readonly Rejection[]): void {
+    const unknown = rejected.some(
+      (entry) => entry.code === "unknown_ticker" && this.#desired.includes(entry.ticker),
+    );
+    const hello = this.#state.hello;
+    if (!unknown) this.#rejectionRetries = 0;
+    if (!unknown || hello === null || this.#rejectionRetries >= this.#unknownTickerRetries) {
+      this.#rejectionRetryTimer = cancel(this.#rejectionRetryTimer);
+      if (this.#state.rejectionRetryAtMs !== null) this.#update({ rejectionRetryAtMs: null });
+      return;
+    }
+    if (this.#rejectionRetryTimer !== null) return;
+    this.#rejectionRetries += 1;
+    const delayMs = hello.bus_refresh_s * 1000;
+    this.#rejectionRetryTimer = setTimeout(() => {
+      this.#rejectionRetryTimer = null;
+      this.#resend = true;
+      this.#scheduleSubscribe();
+    }, delayMs);
+    this.#update({ rejectionRetryAtMs: this.#options.now() + delayMs });
   }
 
   #scheduleSubscribe(): void {
@@ -424,7 +494,9 @@ export class LiveClient {
       ? this.#desired.filter((ticker) => !this.#refresh.has(ticker))
       : this.#desired;
     this.#refresh.clear();
-    if (this.#sent !== null && sameList(this.#sent, tickers)) return;
+    const resend = this.#resend;
+    this.#resend = false;
+    if (!resend && this.#sent !== null && sameList(this.#sent, tickers)) return;
     if (this.#sent === null && tickers.length === 0) return;
     const request: SubscribeRequest = { op: "subscribe", tickers };
     const payload = JSON.stringify(request);

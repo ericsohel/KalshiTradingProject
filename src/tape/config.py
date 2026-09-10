@@ -6,9 +6,10 @@ later (docs/INTERFACES.md 17). This is a shell module: it reads the file system,
 takes the environment as an argument, so nothing here reads ``os.environ`` behind the
 caller's back.
 
-Invariants: a returned ``Settings`` has passed every check in this module, so consumers
-never re-validate it; Kalshi endpoints derive only from ``kalshi.env``, never from free
-text, so a demo key cannot be pointed at production by a typo; every path is absolute,
+Invariants: a returned ``Settings`` has passed every check in this module, so consumers never
+re-validate it, except the signing credentials, which only a command that signs requests needs
+and :func:`signing_credentials` checks; Kalshi endpoints derive only from ``kalshi.env``, never
+from free text, so a demo key cannot be pointed at production by a typo; every path is absolute,
 with ``~`` expanded from the injected ``HOME`` and relative paths resolved against the
 configuration file's directory, so the result does not depend on the working directory;
 and secrets are never values, only paths to files that no other user can read
@@ -53,9 +54,11 @@ __all__ = [
     "RecorderSettings",
     "ServeSettings",
     "Settings",
+    "SigningCredentials",
     "UniverseSettings",
     "load_settings",
     "redacted",
+    "signing_credentials",
 ]
 
 Env = Literal["prod", "demo"]
@@ -72,6 +75,8 @@ DEFAULT_SHOWCASE_SERIES: Final = ("KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDE
 
 _PRIVATE_KEY_FORBIDDEN_BITS: Final = stat.S_IRWXG | stat.S_IRWXO
 """A private key readable, writable, or executable by anyone but its owner is refused."""
+
+_SIGNING_NEEDS_IT: Final = "tape record signs every Kalshi request with it; tape serve does not"
 
 _MAX_KEEPALIVE_S: Final = 60
 """Ceiling on the keepalive interval and pong timeout. A dead peer goes unnoticed for up to
@@ -185,8 +190,10 @@ class KalshiSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_f
 
     Attributes:
         env: ``"prod"`` or ``"demo"``; the endpoints follow from it.
-        key_id: API key id shown when the key was created. Not a secret on its own.
-        private_key_path: PEM file holding the private key; readable by its owner only.
+        key_id: API key id shown when the key was created. Not a secret on its own. Only commands
+            that sign requests need it (:func:`signing_credentials`); ``None`` when not set.
+        private_key_path: PEM file holding the private key; readable by its owner only. Only
+            commands that sign requests need it and check the file; ``None`` when not set.
         rest_timeout_s: Timeout for each REST request.
         ws_ping_interval_s: Seconds between keepalive pings on every WebSocket (ADR 0019).
         ws_ping_timeout_s: Seconds to wait for a keepalive pong before closing the socket.
@@ -197,8 +204,8 @@ class KalshiSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_f
     """
 
     env: Env
-    key_id: Word
-    private_key_path: Path
+    key_id: Word | None = None
+    private_key_path: Path | None = None
     rest_timeout_s: PositiveInt = 10
     ws_ping_interval_s: KeepaliveSeconds = 10
     ws_ping_timeout_s: KeepaliveSeconds = 20
@@ -349,6 +356,7 @@ class ServeSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fi
     listen_port: ListenPort = 8080
     allowed_origins: Annotated[tuple[Origin, ...], msgspec.Meta(min_length=1)] = (
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
     )
     max_clients: ServeClients = 200
     max_tickers_per_client: TickersPerClient = 10
@@ -372,6 +380,18 @@ class Settings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
     serve: ServeSettings = ServeSettings()
 
 
+class SigningCredentials(msgspec.Struct, frozen=True, kw_only=True):
+    """What a command that signs Kalshi requests needs, checked by :func:`signing_credentials`.
+
+    Attributes:
+        key_id: API key id.
+        private_key_path: Absolute path of a regular file that only its owner can access.
+    """
+
+    key_id: str
+    private_key_path: Path
+
+
 def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings:
     """Read, override, and validate the settings in a TOML file.
 
@@ -388,10 +408,13 @@ def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings:
     Returns:
         The validated settings, with absolute paths.
 
+    The signing credentials are not required here: ``tape serve`` signs nothing and holds no
+    credentials (ADR 0023). A command that signs calls :func:`signing_credentials`.
+
     Raises:
         ConfigError: If the file cannot be read or parsed, an override names no setting
-            or does not parse, a value has the wrong type or range, or the private key
-            or data directory fails its file-system check. The message names the setting.
+            or does not parse, a value has the wrong type or range, or the data directory
+            fails its file-system check. The message names the setting.
     """
     raw = _read_toml(path)
     applied = _apply_overrides(raw, environ)
@@ -403,28 +426,54 @@ def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings:
     base = path.absolute().parent
     kalshi = parsed.kalshi
     recorder = parsed.recorder
+    key_path = kalshi.private_key_path
     settings = Settings(
         kalshi=msgspec.structs.replace(
             kalshi,
-            private_key_path=_resolve(
-                kalshi.private_key_path, base, environ, "kalshi.private_key_path"
-            ),
+            private_key_path=None
+            if key_path is None
+            else _resolve(key_path, base, environ, "kalshi.private_key_path"),
         ),
         recorder=msgspec.structs.replace(
             recorder, data_dir=_resolve(recorder.data_dir, base, environ, "recorder.data_dir")
         ),
         serve=parsed.serve,
     )
-    _check_private_key(settings.kalshi.private_key_path)
     _check_data_dir(settings.recorder.data_dir)
     return settings
+
+
+def signing_credentials(settings: Settings) -> SigningCredentials:
+    """Require the key id and private key file that signing Kalshi requests needs.
+
+    Only commands that sign call this: ``tape record``, and ``tape config check`` on its behalf.
+
+    Args:
+        settings: Loaded settings.
+
+    Returns:
+        The key id and the checked private key path.
+
+    Raises:
+        ConfigError: If ``kalshi.key_id`` or ``kalshi.private_key_path`` is not set, or the key
+            file is missing, not a regular file, or open to group or others. The message names
+            the setting.
+    """
+    kalshi = settings.kalshi
+    if kalshi.key_id is None:
+        raise ConfigError(f"kalshi.key_id is not set; {_SIGNING_NEEDS_IT}")
+    if kalshi.private_key_path is None:
+        raise ConfigError(f"kalshi.private_key_path is not set; {_SIGNING_NEEDS_IT}")
+    _check_private_key(kalshi.private_key_path)
+    return SigningCredentials(key_id=kalshi.key_id, private_key_path=kalshi.private_key_path)
 
 
 def redacted(settings: Settings) -> dict[str, Any]:  # Any: nested TOML-shaped builtins
     """Render the effective settings for display, with the endpoints ``env`` selects.
 
     Nothing is masked because nothing secret is a value: the private key appears only as
-    the path to its file, and the key id alone cannot sign a request.
+    the path to its file, and the key id alone cannot sign a request. Unset credentials show as
+    ``None``.
 
     Args:
         settings: Loaded settings.

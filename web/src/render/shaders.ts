@@ -41,9 +41,11 @@ void main() {
 /**
  * The heatmap. Each device pixel covers a span of bins and rows; it takes the maximum
  * depth over up to SAMPLES x SAMPLES texels of that span (a thin level never disappears
- * between pixels) and the worst status of the columns it covers. Stale columns keep
- * their depth under amber hatching; unknown and gap columns draw grey hatching on the
- * background, gap more strongly. Time after now is plain background.
+ * between pixels) and the worst status of the columns it covers. Bins after the head, up
+ * to now, continue the head column's depth with uEdgeStatus, the book's state now, as
+ * sampleBin in columns.ts does. Stale columns keep their depth under amber hatching;
+ * unknown and gap columns draw grey hatching on the background, gap more strongly. Time
+ * after now is plain background.
  */
 export const HEATMAP_FRAGMENT = `${HEADER}${VIEW_UNIFORMS}${RING_UNIFORMS}
 uniform sampler2D uDepth;
@@ -52,6 +54,7 @@ uniform int uRows;
 uniform float uRowStep;
 uniform float uCeiling;
 uniform float uDpr;
+uniform int uEdgeStatus;
 
 out vec4 outColor;
 
@@ -96,7 +99,9 @@ void main() {
       continue;
     }
     int column = min(bin, uHeadBin) % uCapacity;
-    int columnStatus = int(texelFetch(uMeta, ivec2(column, 0), 0).b + 0.5);
+    int columnStatus = bin > uHeadBin
+      ? uEdgeStatus
+      : int(texelFetch(uMeta, ivec2(column, 0), 0).b + 0.5);
     status = max(status, columnStatus);
     if (!onGrid || columnStatus >= 2) continue;
     for (int j = 0; j < SAMPLES; j++) {

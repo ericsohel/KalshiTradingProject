@@ -6,26 +6,30 @@
  * never throws, so a malformed message is counted and dropped instead of crashing the
  * page. Invariants checked: prices are integers in 0..10,000; counts are non-negative
  * safe integers; levels are best first with no repeated price; closed enums (sides and
- * book status) hold only known values, while open codes accept any string (ADR 0017).
+ * book states) hold only known values, while open codes accept any string (ADR 0017).
  * Unknown fields are ignored and unknown message types are reported as `ignored`, so a
  * newer server stays compatible.
+ *
+ * Each decoder is typed with the API type it produces (`protocol.ts`, generated from the
+ * server's structs), so a field the contract adds, removes, or makes nullable fails to
+ * compile here until the decoder accepts exactly what the schema allows.
  */
 
 import {
   MAX_PRICE_E4,
-  type ApiErrorBody,
   type BookSide,
-  type BookStatus,
-  type BusCounters,
-  type DepthImage,
-  type KnownBookStatus,
+  type BookState,
+  type BusHealth,
+  type ConnectionHealth,
+  type Depth,
+  type ErrorResponse,
+  type KnownBookState,
   type MarketDetail,
   type MarketRow,
   type PriceLevel,
   type PriceRange,
-  type RecorderConnectionStatus,
-  type RecorderStatus,
-  type RejectedTicker,
+  type RecorderHealth,
+  type Rejection,
   type ServerMessage,
   type ServiceStatus,
 } from "./protocol";
@@ -105,6 +109,14 @@ function nullableInteger(fields: Fields, key: string, path: string): number | nu
   return fields[key] === null ? null : integer(fields, key, path);
 }
 
+/** A non-negative integer too large for a JavaScript number, as the decimal string it travels as. */
+function nullableDecimalText(fields: Fields, key: string, path: string): string | null {
+  if (fields[key] === null) return null;
+  const value = text(fields, key, path);
+  if (!/^[0-9]+$/.test(value)) fail(`${path}.${key}`, "a decimal string or null");
+  return value;
+}
+
 function price(fields: Fields, key: string, path: string): number {
   return integer(fields, key, path, 0, MAX_PRICE_E4);
 }
@@ -126,8 +138,8 @@ function oneOf<T extends string>(
   return value as T;
 }
 
-const BOOK_STATUSES: readonly BookStatus[] = ["unknown", "fresh", "stale"];
-const KNOWN_BOOK_STATUSES: readonly KnownBookStatus[] = ["fresh", "stale"];
+const BOOK_STATES: readonly BookState[] = ["unknown", "fresh", "stale"];
+const KNOWN_BOOK_STATES: readonly KnownBookState[] = ["fresh", "stale"];
 const SIDES: readonly BookSide[] = ["bid", "ask"];
 
 /**
@@ -177,7 +189,7 @@ function marketRowFields(fields: Fields, path: string): MarketRow {
     bid_e4: nullablePrice(fields, "bid_e4", path),
     ask_e4: nullablePrice(fields, "ask_e4", path),
     last_e4: nullablePrice(fields, "last_e4", path),
-    book: oneOf(fields, "book", path, BOOK_STATUSES),
+    book: oneOf(fields, "book", path, BOOK_STATES),
   };
 }
 
@@ -192,16 +204,16 @@ function priceRange(value: unknown, path: string): PriceRange {
   return range;
 }
 
-function depthImage(value: unknown, path: string): DepthImage {
+function depth(value: unknown, path: string): Depth {
   const fields = record(value, path);
   return {
-    ts_ms: integer(fields, "ts_ms", path),
+    ts_ms: nullableInteger(fields, "ts_ms", path),
     bids: levels(fields, "bids", path, "bid"),
     asks: levels(fields, "asks", path, "ask"),
   };
 }
 
-function connectionStatus(value: unknown, path: string): RecorderConnectionStatus {
+function connectionHealth(value: unknown, path: string): ConnectionHealth {
   const fields = record(value, path);
   return {
     conn_id: integer(fields, "conn_id", path),
@@ -214,26 +226,22 @@ function connectionStatus(value: unknown, path: string): RecorderConnectionStatu
   };
 }
 
-function recorderStatus(value: unknown, path: string): RecorderStatus {
+function recorderHealth(value: unknown, path: string): RecorderHealth {
   const fields = record(value, path);
   return {
     universe_size: integer(fields, "universe_size", path),
     subscribed_markets: integer(fields, "subscribed_markets", path),
     connections: array(fields["connections"], `${path}.connections`).map((item, index) =>
-      connectionStatus(item, `${path}.connections[${index}]`),
+      connectionHealth(item, `${path}.connections[${index}]`),
     ),
   };
 }
 
-function busCounters(value: unknown, path: string): BusCounters {
+function busHealth(value: unknown, path: string): BusHealth {
   const fields = record(value, path);
-  const epoch = fields["epoch"];
-  if (epoch !== null && (typeof epoch !== "number" || !Number.isInteger(epoch) || epoch < 0)) {
-    fail(`${path}.epoch`, "a non-negative integer or null");
-  }
   return {
-    epoch,
-    last_seq: integer(fields, "last_seq", path),
+    epoch: nullableDecimalText(fields, "epoch", path),
+    last_seq: nullableInteger(fields, "last_seq", path),
     messages: integer(fields, "messages", path),
     resets: integer(fields, "resets", path),
     missed: integer(fields, "missed", path),
@@ -241,88 +249,92 @@ function busCounters(value: unknown, path: string): BusCounters {
   };
 }
 
+type MessageDecoders = {
+  readonly [Type in ServerMessage["t"]]: (
+    fields: Fields,
+    path: string,
+  ) => Extract<ServerMessage, { t: Type }>;
+};
+
+/** One decoder per server message type; a type the contract adds is a compile error until it has one. */
+const MESSAGE_DECODERS: MessageDecoders = {
+  hello: (fields, path) => ({
+    t: "hello",
+    protocol: integer(fields, "protocol", path, 1),
+    max_tickers: integer(fields, "max_tickers", path, 1),
+    bus_refresh_s: integer(fields, "bus_refresh_s", path, 1),
+  }),
+  subscribed: (fields, path) => ({
+    t: "subscribed",
+    tickers: tickerList(fields, "tickers", path),
+    rejected: array(fields["rejected"], `${path}.rejected`).map((item, index) => {
+      const itemPath = `${path}.rejected[${index}]`;
+      const rejected = record(item, itemPath);
+      const entry: Rejection = {
+        ticker: nonEmptyText(rejected, "ticker", itemPath),
+        code: text(rejected, "code", itemPath),
+      };
+      return entry;
+    }),
+  }),
+  snapshot: (fields, path) => ({
+    t: "snapshot",
+    ticker: nonEmptyText(fields, "ticker", path),
+    book: oneOf(fields, "book", path, KNOWN_BOOK_STATES),
+    ts_ms: nullableInteger(fields, "ts_ms", path),
+    bids: levels(fields, "bids", path, "bid"),
+    asks: levels(fields, "asks", path, "ask"),
+  }),
+  delta: (fields, path) => ({
+    t: "delta",
+    ticker: nonEmptyText(fields, "ticker", path),
+    ts_ms: nullableInteger(fields, "ts_ms", path),
+    side: oneOf(fields, "side", path, SIDES),
+    price_e4: price(fields, "price_e4", path),
+    delta_e2: integer(fields, "delta_e2", path, Number.MIN_SAFE_INTEGER),
+  }),
+  book: (fields, path) => ({
+    t: "book",
+    ticker: nonEmptyText(fields, "ticker", path),
+    book: oneOf(fields, "book", path, KNOWN_BOOK_STATES),
+  }),
+  resync: (fields, path) => ({
+    t: "resync",
+    ticker: nonEmptyText(fields, "ticker", path),
+    reason: text(fields, "reason", path),
+  }),
+  trade: (fields, path) => ({
+    t: "trade",
+    ticker: nonEmptyText(fields, "ticker", path),
+    ts_ms: integer(fields, "ts_ms", path),
+    price_e4: price(fields, "price_e4", path),
+    count_e2: integer(fields, "count_e2", path, 1),
+    taker_side: oneOf(fields, "taker_side", path, SIDES),
+  }),
+  ticker: (fields, path) => ({
+    t: "ticker",
+    ticker: nonEmptyText(fields, "ticker", path),
+    ts_ms: integer(fields, "ts_ms", path),
+    bid_e4: nullablePrice(fields, "bid_e4", path),
+    ask_e4: nullablePrice(fields, "ask_e4", path),
+    last_e4: nullablePrice(fields, "last_e4", path),
+    volume_e2: integer(fields, "volume_e2", path),
+  }),
+  error: (fields, path) => ({
+    t: "error",
+    code: text(fields, "code", path),
+    message: text(fields, "message", path),
+  }),
+};
+
+function isMessageType(type: string): type is ServerMessage["t"] {
+  return Object.hasOwn(MESSAGE_DECODERS, type);
+}
+
 function serverMessage(fields: Fields, type: string): ServerMessage | null {
-  const path = type;
-  switch (type) {
-    case "hello":
-      return {
-        t: "hello",
-        protocol: integer(fields, "protocol", path, 1),
-        max_tickers: integer(fields, "max_tickers", path, 1),
-        bus_refresh_s: integer(fields, "bus_refresh_s", path, 1),
-      };
-    case "subscribed":
-      return {
-        t: "subscribed",
-        tickers: tickerList(fields, "tickers", path),
-        rejected: array(fields["rejected"], `${path}.rejected`).map((item, index) => {
-          const itemPath = `${path}.rejected[${index}]`;
-          const rejected = record(item, itemPath);
-          const entry: RejectedTicker = {
-            ticker: nonEmptyText(rejected, "ticker", itemPath),
-            code: text(rejected, "code", itemPath),
-          };
-          return entry;
-        }),
-      };
-    case "snapshot":
-      return {
-        t: "snapshot",
-        ticker: nonEmptyText(fields, "ticker", path),
-        book: oneOf(fields, "book", path, KNOWN_BOOK_STATUSES),
-        ts_ms: integer(fields, "ts_ms", path),
-        bids: levels(fields, "bids", path, "bid"),
-        asks: levels(fields, "asks", path, "ask"),
-      };
-    case "delta":
-      return {
-        t: "delta",
-        ticker: nonEmptyText(fields, "ticker", path),
-        ts_ms: integer(fields, "ts_ms", path),
-        side: oneOf(fields, "side", path, SIDES),
-        price_e4: price(fields, "price_e4", path),
-        delta_e2: integer(fields, "delta_e2", path, Number.MIN_SAFE_INTEGER),
-      };
-    case "book":
-      return {
-        t: "book",
-        ticker: nonEmptyText(fields, "ticker", path),
-        book: oneOf(fields, "book", path, KNOWN_BOOK_STATUSES),
-      };
-    case "resync":
-      return {
-        t: "resync",
-        ticker: nonEmptyText(fields, "ticker", path),
-        reason: text(fields, "reason", path),
-      };
-    case "trade":
-      return {
-        t: "trade",
-        ticker: nonEmptyText(fields, "ticker", path),
-        ts_ms: integer(fields, "ts_ms", path),
-        price_e4: price(fields, "price_e4", path),
-        count_e2: integer(fields, "count_e2", path, 1),
-        taker_side: oneOf(fields, "taker_side", path, SIDES),
-      };
-    case "ticker":
-      return {
-        t: "ticker",
-        ticker: nonEmptyText(fields, "ticker", path),
-        ts_ms: integer(fields, "ts_ms", path),
-        bid_e4: nullablePrice(fields, "bid_e4", path),
-        ask_e4: nullablePrice(fields, "ask_e4", path),
-        last_e4: nullablePrice(fields, "last_e4", path),
-        volume_e2: integer(fields, "volume_e2", path),
-      };
-    case "error":
-      return {
-        t: "error",
-        code: text(fields, "code", path),
-        message: text(fields, "message", path),
-      };
-    default:
-      return null;
-  }
+  if (!isMessageType(type)) return null;
+  const decode: (fields: Fields, path: string) => ServerMessage = MESSAGE_DECODERS[type];
+  return decode(fields, type);
 }
 
 function attempt<T>(decode: () => T): DecodeResult<T> {
@@ -387,7 +399,7 @@ export function decodeMarketDetail(json: unknown): DecodeResult<MarketDetail> {
   return attempt(() => {
     const fields = record(json, "market");
     const ranges = fields["price_ranges"];
-    const depth = fields["depth"];
+    const depthFields = fields["depth"];
     return {
       ...marketRowFields(fields, "market"),
       price_ranges:
@@ -396,7 +408,7 @@ export function decodeMarketDetail(json: unknown): DecodeResult<MarketDetail> {
           : array(ranges, "market.price_ranges").map((item, index) =>
               priceRange(item, `market.price_ranges[${index}]`),
             ),
-      depth: depth === null ? null : depthImage(depth, "market.depth"),
+      depth: depthFields === null ? null : depth(depthFields, "market.depth"),
     };
   });
 }
@@ -409,15 +421,15 @@ export function decodeServiceStatus(json: unknown): DecodeResult<ServiceStatus> 
       recording: flag(fields, "recording", "status"),
       recorder_status_age_ms: nullableInteger(fields, "recorder_status_age_ms", "status"),
       recorder:
-        fields["recorder"] === null ? null : recorderStatus(fields["recorder"], "status.recorder"),
-      bus: busCounters(fields["bus"], "status.bus"),
+        fields["recorder"] === null ? null : recorderHealth(fields["recorder"], "status.recorder"),
+      bus: busHealth(fields["bus"], "status.bus"),
       clients: integer(fields, "clients", "status"),
     };
   });
 }
 
 /** Decodes the `{"error": {"code", "message"}}` body of a failed request. */
-export function decodeApiError(json: unknown): DecodeResult<ApiErrorBody> {
+export function decodeApiError(json: unknown): DecodeResult<ErrorResponse> {
   return attempt(() => {
     const error = record(record(json, "body")["error"], "body.error");
     return {

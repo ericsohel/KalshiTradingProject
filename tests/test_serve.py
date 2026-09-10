@@ -65,13 +65,10 @@ _messages: Final = msgspec.json.Decoder(ServerMessage)
 
 
 def write_settings(tmp_path: Path, endpoint: str) -> Settings:
-    key = tmp_path / "read.pem"
-    # tape serve holds no credentials; settings validation only checks the file's permissions.
-    key.write_text("placeholder: tape serve never reads this file\n")
-    key.chmod(0o600)
+    # tape serve holds no credentials (ADR 0023), so its configuration names no key at all.
     config = tmp_path / "tape.toml"
     config.write_text(
-        f'[kalshi]\nenv = "demo"\nkey_id = "key-1"\nprivate_key_path = "{key}"\n\n'
+        '[kalshi]\nenv = "demo"\n\n'
         f'[recorder]\ndata_dir = "data"\nbus_endpoint = "{endpoint}"\nbus_refresh_s = 5\n\n'
         f'[serve]\nallowed_origins = ["{ORIGIN}"]\nmax_tickers_per_client = 3\n'
     )

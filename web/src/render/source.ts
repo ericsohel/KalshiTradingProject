@@ -31,8 +31,9 @@ export const NO_PRICE = -1;
 
 /**
  * A ring of time columns. Column `c` holds bin `b` when `c = b mod capacity` and `b` is
- * in `[oldestBin, headBin]`; bins after `headBin` continue the head column, whose book
- * has not changed since.
+ * in `[oldestBin, headBin]`. Bins after `headBin`, up to now, have no column yet: they
+ * continue the head column's depth and quotes, which are the latest book, with
+ * `edgeStatus`, the book's state now (see `sampleBin` in columns.ts).
  */
 export interface DepthColumns {
   readonly capacity: number;
@@ -47,6 +48,12 @@ export interface DepthColumns {
   /** Newest bin written, or -1 before the first. */
   readonly headBin: number;
   readonly oldestBin: number;
+  /**
+   * The book's state now, drawn for the bins after `headBin`. The head column's own status
+   * is the worst its bin saw, so a snapshot that restored the book within that bin leaves
+   * it `unknown`; the time after it must show the restored book.
+   */
+  readonly edgeStatus: ColumnStatusCode;
 }
 
 /** Floats per trade in `TradeInstances.instances`. */

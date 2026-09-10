@@ -18,9 +18,11 @@ from tape.config import (
     RecorderSettings,
     ServeSettings,
     Settings,
+    SigningCredentials,
     UniverseSettings,
     load_settings,
     redacted,
+    signing_credentials,
 )
 from tape.errors import ConfigError
 from tape.fixedpoint import CountE2
@@ -90,7 +92,7 @@ def home(tmp_path: Path) -> Path:
     return home
 
 
-def test_only_identity_and_paths_are_required_and_everything_else_has_a_default(
+def test_only_env_and_the_data_dir_are_required_and_everything_else_has_a_default(
     tmp_path: Path, key: Path, tables: Tables
 ) -> None:
     path = tmp_path / "tape.toml"
@@ -135,7 +137,7 @@ def test_only_identity_and_paths_are_required_and_everything_else_has_a_default(
     assert (serve.listen_host, serve.listen_port, serve.allowed_origins) == (
         "127.0.0.1",
         8080,
-        ("http://localhost:5173",),
+        ("http://localhost:5173", "http://127.0.0.1:5173"),
     )
     assert (serve.max_clients, serve.max_tickers_per_client, serve.client_queue_max) == (
         200,
@@ -303,7 +305,6 @@ def test_an_override_into_a_value_that_is_not_a_table_is_refused(tmp_path: Path)
         (("kalshi", "env"), "staging", r"Invalid enum value 'staging' - at `\$\.kalshi\.env`"),
         (("kalshi", "key_id"), "", r"at `\$\.kalshi\.key_id`"),
         (("kalshi", "key_id"), "two words", r"at `\$\.kalshi\.key_id`"),
-        (("kalshi", "key_id"), DELETE, "missing required field `key_id`"),
         (("kalshi", "private_key_path"), 5, r"Expected `str`, got `int` - at `\$\.kalshi\."),
         (("kalshi", "rest_timeout_s"), 0, r">= 1 - at `\$\.kalshi\.rest_timeout_s`"),
         (("kalshi", "ws_ping_interval_s"), 0, r">= 1 - at `\$\.kalshi\.ws_ping_interval_s`"),
@@ -413,21 +414,45 @@ def test_a_universe_the_book_connections_cannot_carry_is_refused_with_the_fix(
         load_all(tmp_path, tables, {"TAPE_RECORDER__UNIVERSE__MAX_L2_MARKETS": "2001"})
 
 
+def test_credentials_are_optional_until_a_command_signs(
+    tmp_path: Path, tables: Tables, key: Path
+) -> None:
+    """tape serve holds no credentials (ADR 0023); only tape record, which signs, requires them."""
+    del tables["kalshi"]["key_id"]
+    del tables["kalshi"]["private_key_path"]
+    settings = load_all(tmp_path, tables)
+    assert (settings.kalshi.key_id, settings.kalshi.private_key_path) == (None, None)
+    assert redacted(settings)["kalshi"]["private_key_path"] is None
+    with pytest.raises(ConfigError, match=r"^kalshi\.key_id is not set; tape record signs every"):
+        signing_credentials(settings)
+
+    tables["kalshi"]["key_id"] = "key-1"
+    with pytest.raises(ConfigError, match=r"^kalshi\.private_key_path is not set; tape record"):
+        signing_credentials(load_all(tmp_path, tables))
+
+    tables["kalshi"]["private_key_path"] = str(key.relative_to(tmp_path))
+    assert signing_credentials(load_all(tmp_path, tables)) == SigningCredentials(
+        key_id="key-1", private_key_path=key
+    )
+
+
 def test_the_private_key_must_be_a_file_only_its_owner_can_read(
     tmp_path: Path, tables: Tables, key: Path
 ) -> None:
     key.chmod(0o640)
+    # Loading never opens the key, so a command that does not sign is unaffected.
+    settings = load_all(tmp_path, tables)
     with pytest.raises(ConfigError, match=r"mode 0640, so other users can read .* chmod 600"):
-        load_all(tmp_path, tables)
+        signing_credentials(settings)
     key.chmod(0o604)
     with pytest.raises(ConfigError, match="mode 0604"):
-        load_all(tmp_path, tables)
+        signing_credentials(settings)
     tables["kalshi"]["private_key_path"] = str(tmp_path / "missing.pem")
     with pytest.raises(ConfigError, match=r"private_key_path: .*missing\.pem does not exist"):
-        load_all(tmp_path, tables)
+        signing_credentials(load_all(tmp_path, tables))
     tables["kalshi"]["private_key_path"] = str(key.parent)
     with pytest.raises(ConfigError, match="is not a regular file"):
-        load_all(tmp_path, tables)
+        signing_credentials(load_all(tmp_path, tables))
 
 
 def test_the_data_dir_must_be_a_writable_directory(tmp_path: Path, tables: Tables) -> None:

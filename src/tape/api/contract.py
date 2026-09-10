@@ -275,7 +275,9 @@ class BusHealth(msgspec.Struct, frozen=True, kw_only=True):
     """How the server follows the recorder's bus.
 
     Attributes:
-        epoch: The recorder run the latest message came from, or ``null`` before any.
+        epoch: The recorder run the latest message came from, or ``null`` before any: its
+            ``bus_epoch``, a wall-clock nanosecond count, as a decimal string. It identifies a run
+            and exceeds what a JavaScript number holds exactly, so clients only compare it.
         last_seq: Number of the latest message, or ``null`` before any.
         messages: Messages received.
         resets: Times every book was dropped: at the first message, a recorder restart, or loss.
@@ -283,7 +285,7 @@ class BusHealth(msgspec.Struct, frozen=True, kw_only=True):
         books_known: Books the server holds now.
     """
 
-    epoch: int | None
+    epoch: str | None
     last_seq: int | None
     messages: int
     resets: int

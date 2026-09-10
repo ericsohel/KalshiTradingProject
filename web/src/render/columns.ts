@@ -1,5 +1,6 @@
 /**
- * Pure helpers for the ring of time columns and the upload plan for its textures.
+ * Pure helpers for the ring of time columns: which column and status each time bin is
+ * drawn with, and the upload plan for the textures.
  *
  * The depth texture is transposed relative to the picture: texture x is the price row
  * and texture y is the ring column, so one time column is one texture row and uploads
@@ -7,6 +8,14 @@
  * `[0, capacity)`, ranges are disjoint and ascending, and together they cover every
  * slot that changed.
  */
+
+import {
+  ColumnStatus,
+  META_STATUS,
+  META_STRIDE,
+  type ColumnStatusCode,
+  type DepthColumns,
+} from "./source";
 
 export interface UploadRange {
   readonly start: number;
@@ -16,6 +25,34 @@ export interface UploadRange {
 /** The ring slot of `bin`; `bin` must be a non-negative integer. */
 export function ringColumn(bin: number, capacity: number): number {
   return ((bin % capacity) + capacity) % capacity;
+}
+
+/** What the heatmap draws for one time bin. */
+export interface BinSample {
+  /** Ring slot whose depth and quotes are drawn, or `null` when the bin has none. */
+  readonly column: number | null;
+  readonly status: ColumnStatusCode;
+}
+
+/**
+ * The column and status drawn at integer `bin`, exactly as the heatmap shader samples them.
+ *
+ * Before the first column, or before the ring, a bin has no depth and is unknown. A bin in
+ * the ring is its own column. A bin after the head has no column yet: it continues the head
+ * column, which holds the latest book, with `edgeStatus`, the book's state now, rather than
+ * the worst state the head bin saw. The result depends only on the columns, never on the
+ * frame's time, so the live edge looks the same at 1 frame per second as at 60.
+ */
+export function sampleBin(columns: DepthColumns, bin: number): BinSample {
+  if (columns.headBin < 0 || bin < columns.oldestBin) {
+    return { column: null, status: ColumnStatus.unknown };
+  }
+  if (bin > columns.headBin) {
+    return { column: ringColumn(columns.headBin, columns.capacity), status: columns.edgeStatus };
+  }
+  const column = ringColumn(bin, columns.capacity);
+  const stored = columns.meta[column * META_STRIDE + META_STATUS] ?? ColumnStatus.unknown;
+  return { column, status: Math.round(stored) as ColumnStatusCode };
 }
 
 /** How many bins the ring currently holds. */

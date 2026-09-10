@@ -252,7 +252,9 @@ def test_status_shows_the_recorder_the_bus_and_the_open_live_connections() -> No
     assert (status.recording, status.recorder_status_age_ms, status.clients) == (True, 1500, 1)
     assert status.recorder is not None
     assert (status.recorder.universe_size, status.recorder.subscribed_markets) == (4, 3)
-    assert (status.bus.epoch, status.bus.last_seq, status.bus.messages) == (EPOCH, 1, 1)
+    assert (status.bus.epoch, status.bus.last_seq, status.bus.messages) == (str(EPOCH), 1, 1)
+    # The epoch exceeds 2**53, so it travels as a string that JavaScript keeps exact.
+    assert f'"epoch":"{EPOCH}"' in response.text
     assert response.headers["cache-control"] == "no-store"
 
 

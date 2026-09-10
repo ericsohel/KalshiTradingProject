@@ -20,8 +20,8 @@ import { parseArgs } from "node:util";
 import { WebSocketServer } from "ws";
 import type { RawData, WebSocket } from "ws";
 import type {
-  ApiErrorBody,
-  BookStatus,
+  BookState,
+  ErrorResponse,
   MarketDetail,
   MarketRow,
   ServerMessage,
@@ -58,7 +58,7 @@ const startedAtMs = Date.now();
 interface MarketState {
   readonly definition: MarketDefinition;
   readonly simulator: MarketSimulator;
-  book: BookStatus;
+  book: BookState;
   /** When a stale or lost book comes back with a snapshot. */
   recoverAtMs: number | null;
   lastTicker: TickerMessage | null;
@@ -260,7 +260,7 @@ function statusOf(): ServiceStatus {
       connections: [connection(0, false, 180), connection(1, true, 3), connection(2, true, 95)],
     },
     bus: {
-      epoch: startedAtMs * 1_000_000,
+      epoch: (BigInt(startedAtMs) * 1_000_000n).toString(),
       last_seq: messagesSent,
       messages: messagesSent,
       resets: busResets,
@@ -276,7 +276,7 @@ function json(response: ServerResponse, status: number, body: unknown): void {
   response.end(JSON.stringify(body));
 }
 
-function apiError(code: string, message: string): ApiErrorBody {
+function apiError(code: string, message: string): ErrorResponse {
   return { error: { code, message } };
 }
 

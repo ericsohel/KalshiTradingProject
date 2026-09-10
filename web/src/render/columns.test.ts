@@ -1,5 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { dirtyColumnRanges, heldBins, ringColumn, ringWriteRanges } from "./columns";
+import { dirtyColumnRanges, heldBins, ringColumn, ringWriteRanges, sampleBin } from "./columns";
+import { ColumnStatus, META_STATUS, META_STRIDE, type DepthColumns } from "./source";
+
+function ring(headBin: number, oldestBin: number, statuses: readonly number[]): DepthColumns {
+  const capacity = statuses.length;
+  const meta = new Float32Array(capacity * META_STRIDE);
+  statuses.forEach((status, column) => {
+    meta[column * META_STRIDE + META_STATUS] = status;
+  });
+  return {
+    capacity,
+    rows: 1,
+    rowStepE4: 100,
+    depth: new Float32Array(capacity),
+    meta,
+    revisions: new Uint32Array(capacity),
+    headBin,
+    oldestBin,
+    edgeStatus: ColumnStatus.fresh,
+  };
+}
 
 describe("ring columns", () => {
   it("maps bins to slots", () => {
@@ -10,6 +30,36 @@ describe("ring columns", () => {
   it("counts held bins", () => {
     expect(heldBins(-1, 0)).toBe(0);
     expect(heldBins(9, 6)).toBe(4);
+  });
+});
+
+describe("sampleBin", () => {
+  it("draws nothing known before the first column or before the ring", () => {
+    expect(sampleBin(ring(-1, 0, [0, 0]), 0)).toEqual({
+      column: null,
+      status: ColumnStatus.unknown,
+    });
+    expect(sampleBin(ring(9, 6, [0, 0, 0, 0]), 5)).toEqual({
+      column: null,
+      status: ColumnStatus.unknown,
+    });
+  });
+
+  it("draws a bin in the ring from its own column and status", () => {
+    const columns = ring(9, 6, [ColumnStatus.stale, ColumnStatus.fresh, ColumnStatus.gap, 0]);
+    expect(sampleBin(columns, 8)).toEqual({ column: 0, status: ColumnStatus.stale });
+    expect(sampleBin(columns, 6)).toEqual({ column: 2, status: ColumnStatus.gap });
+  });
+
+  it("continues the head column after the head with the edge status, not the head's", () => {
+    const columns = ring(9, 6, [0, ColumnStatus.unknown, 0, 0]);
+    expect(sampleBin(columns, 9)).toEqual({ column: 1, status: ColumnStatus.unknown });
+    for (const bin of [10, 50, 5000]) {
+      expect(sampleBin(columns, bin)).toEqual({ column: 1, status: ColumnStatus.fresh });
+    }
+    expect(sampleBin({ ...columns, edgeStatus: ColumnStatus.gap }, 10).status).toBe(
+      ColumnStatus.gap,
+    );
   });
 });
 

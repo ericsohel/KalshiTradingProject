@@ -4,9 +4,12 @@
  * Each column is the book's depth profile during one bin plus its best bid, best ask,
  * and the worst book status seen in that bin. Only the head (newest) column changes;
  * moving the head forward copies the head column into every skipped bin, because a book
- * with no messages did not change. Invariants: `oldestBin <= headBin`, the ring never
- * holds more than `capacity` bins, a column's status only rises within its bin, and each
- * write increments that column's revision.
+ * with no messages did not change. Until then, the time after the head bin is drawn from
+ * the head column with `edgeStatus`, the book's state now, so how long a market stays
+ * quiet, or when a frame happens to be drawn, never changes what that time shows.
+ * Invariants: `oldestBin <= headBin`, the ring never holds more than `capacity` bins, a
+ * column's status only rises within its bin, and each write increments that column's
+ * revision.
  */
 
 import { ringColumn } from "../render/columns";
@@ -30,6 +33,7 @@ export class DepthHistory implements DepthColumns {
   readonly revisions: Uint32Array;
   #headBin = -1;
   #oldestBin = 0;
+  #edgeStatus: ColumnStatusCode = ColumnStatus.unknown;
 
   /**
    * @param capacity Columns in the ring (the texture's height; at most 2,048 for WebGL2).
@@ -53,12 +57,22 @@ export class DepthHistory implements DepthColumns {
     return this.#oldestBin;
   }
 
+  get edgeStatus(): ColumnStatusCode {
+    return this.#edgeStatus;
+  }
+
+  /** Sets the book's state now, which the bins after the head are drawn with. */
+  setEdgeStatus(status: ColumnStatusCode): void {
+    this.#edgeStatus = status;
+  }
+
   /**
    * Makes `bin` the head. A bin at or before the head leaves the head where it is (time
    * never runs backwards in the picture). Skipped bins inherit the head column with
-   * `status`, the book's status throughout the silence.
+   * `status`, the book's status throughout the silence, which is also the edge status.
    */
   advanceTo(bin: number, status: ColumnStatusCode): void {
+    this.#edgeStatus = status;
     if (this.#headBin < 0) {
       this.#headBin = bin;
       this.#oldestBin = bin;

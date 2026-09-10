@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { MarketMessage, PriceLevel } from "../api/protocol";
+import { ringColumn, sampleBin } from "../render/columns";
 import {
   ColumnStatus,
   META_BEST_ASK,
@@ -8,6 +9,7 @@ import {
   NO_PRICE,
   TRADE_STRIDE,
 } from "../render/source";
+import { FULL_WINDOW, leftBin, liveView } from "../render/viewport";
 import { gridFromPriceRanges, ONE_CENT_GRID } from "./priceGrid";
 import { TapeStore } from "./tapeStore";
 
@@ -117,6 +119,30 @@ describe("TapeStore book", () => {
     expect(tape.columns.depthAt(1, 56)).toBe(0);
   });
 
+  it("keeps a book whose snapshot and deltas carry no exchange time", () => {
+    const tape = store();
+    const untimed: MarketMessage = {
+      t: "snapshot",
+      ticker: TICKER,
+      book: "fresh",
+      ts_ms: null,
+      bids: BIDS,
+      asks: ASKS,
+    };
+    expect(tape.apply(untimed, 0)).toBe("applied");
+    expect(
+      tape.apply(
+        { t: "delta", ticker: TICKER, ts_ms: null, side: "bid", price_e4: 5600, delta_e2: 1 },
+        10,
+      ),
+    ).toBe("applied");
+    expect(tape.summary()).toMatchObject({
+      book: "fresh",
+      bestBidE4: 5600,
+      lastBookChangeAtMs: 10,
+    });
+  });
+
   it("ignores messages for other tickers", () => {
     const tape = store();
     expect(tape.apply({ ...snapshot(BIDS, ASKS), ticker: "KXB" }, 0)).toBe("ignored");
@@ -188,6 +214,76 @@ describe("TapeStore freshness, resync, and gaps", () => {
     tape.markConnectionLost(300);
     expect(tape.summary()).toMatchObject({ book: "unknown", gap: true, resync: null });
     expect(tape.columns.statusAt(3)).toBe(ColumnStatus.gap);
+  });
+});
+
+describe("TapeStore live edge at any frame rate", () => {
+  const BIN_MS = 250;
+  const VISIBLE_BINS = (5 * 60_000) / BIN_MS;
+
+  function liveStore(): TapeStore {
+    return new TapeStore({ ticker: TICKER, grid: ONE_CENT_GRID, originMs: 0, binMs: BIN_MS });
+  }
+
+  /**
+   * Draws frames every `frameMs` from `fromMs` to `toMs` the way the heatmap host does, and
+   * returns what every bin between the head column and the "now" cursor would show.
+   */
+  function edgeFrames(tape: TapeStore, frameMs: number, fromMs: number, toMs: number) {
+    const frames: { nowBin: number; samples: ReturnType<typeof sampleBin>[] }[] = [];
+    for (let atMs = fromMs; atMs <= toMs; atMs += frameMs) {
+      const view = liveView(tape.binAt(atMs), VISIBLE_BINS, 0.04, FULL_WINDOW);
+      const first = Math.max(Math.ceil(leftBin(view)), tape.columns.headBin + 1);
+      const samples = [];
+      for (let bin = first; bin < view.nowBin; bin += 1) samples.push(sampleBin(tape.columns, bin));
+      frames.push({ nowBin: view.nowBin, samples });
+    }
+    return frames;
+  }
+
+  it.each([
+    ["1 frame per second", 1000],
+    ["60 frames per second", 16],
+  ])("draws a quiet market's book up to now after its first snapshot (%s)", (_rate, frameMs) => {
+    const tape = liveStore();
+    // The first snapshot lands in the store's first bin, which was unknown until then.
+    tape.apply(snapshot(BIDS, ASKS), 100);
+    const head = tape.columns.headBin;
+    expect(tape.columns.statusAt(head)).toBe(ColumnStatus.unknown);
+    const frames = edgeFrames(tape, frameMs, 1000, 25_000);
+    expect(frames.at(-1)?.samples.length).toBeGreaterThanOrEqual(95);
+    for (const { samples } of frames) {
+      for (const sample of samples) {
+        // Before the fix these were the head bin's `unknown`: a dark band growing to now.
+        expect(sample).toEqual({
+          column: ringColumn(head, tape.columns.capacity),
+          status: ColumnStatus.fresh,
+        });
+      }
+    }
+    expect(tape.columns.depthAt(head, 56)).toBeCloseTo(Math.log1p(100));
+  });
+
+  it("shows the state the book is in now after a resync, a lost book, or a stale mark", () => {
+    const tape = liveStore();
+    tape.apply(snapshot(BIDS, ASKS), 0);
+    tape.apply({ t: "resync", ticker: TICKER, reason: "bus_loss" }, 1000);
+    const lastBin = (): ReturnType<typeof sampleBin> | undefined =>
+      edgeFrames(tape, 1000, 20_000, 20_000)[0]?.samples.at(-1);
+    expect(lastBin()?.status).toBe(ColumnStatus.gap);
+    tape.apply(snapshot(BIDS, ASKS), 9000);
+    expect(tape.columns.statusAt(tape.columns.headBin)).toBe(ColumnStatus.gap);
+    expect(lastBin()?.status).toBe(ColumnStatus.fresh);
+    tape.apply({ t: "book", ticker: TICKER, book: "stale" }, 12_000);
+    expect(lastBin()?.status).toBe(ColumnStatus.stale);
+  });
+
+  it("commits the quiet time as the book it held once the next change arrives", () => {
+    const tape = liveStore();
+    tape.apply(snapshot(BIDS, ASKS), 100);
+    tape.apply(delta("bid", 5600, 1), 20_000);
+    for (const bin of [1, 40, 79]) expect(tape.columns.statusAt(bin)).toBe(ColumnStatus.fresh);
+    expect(tape.columns.depthAt(40, 56)).toBeCloseTo(Math.log1p(100));
   });
 });
 

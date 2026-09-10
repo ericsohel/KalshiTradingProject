@@ -28,8 +28,19 @@ repos:
         entry: uv run python scripts/check_no_float.py
         language: system
         pass_filenames: false
+      - id: api-schema
+        name: live API schema is current
+        entry: uv run python scripts/gen_api_schema.py --check
+        language: system
+        pass_filenames: false
       # Web hooks run through npm so pre-commit, CI, and developers use the exact
       # versions pinned in web/package-lock.json (run `npm ci` in web/ first).
+      - id: web-api-types
+        name: web API types are current
+        entry: npm --prefix web run api-types:check
+        language: system
+        files: ^web/
+        pass_filenames: false
       - id: web-typecheck
         name: web typecheck
         entry: npm --prefix web run typecheck

@@ -27,7 +27,7 @@
       "type": "object"
     },
     "BusHealth": {
-      "description": "How the server follows the recorder's bus.\n\nAttributes:\n    epoch: The recorder run the latest message came from, or ``null`` before any.\n    last_seq: Number of the latest message, or ``null`` before any.\n    messages: Messages received.\n    resets: Times every book was dropped: at the first message, a recorder restart, or loss.\n    missed: Messages known to be lost.\n    books_known: Books the server holds now.",
+      "description": "How the server follows the recorder's bus.\n\nAttributes:\n    epoch: The recorder run the latest message came from, or ``null`` before any: its\n        ``bus_epoch``, a wall-clock nanosecond count, as a decimal string. It identifies a run\n        and exceeds what a JavaScript number holds exactly, so clients only compare it.\n    last_seq: Number of the latest message, or ``null`` before any.\n    messages: Messages received.\n    resets: Times every book was dropped: at the first message, a recorder restart, or loss.\n    missed: Messages known to be lost.\n    books_known: Books the server holds now.",
       "properties": {
         "books_known": {
           "type": "integer"
@@ -35,7 +35,7 @@
         "epoch": {
           "anyOf": [
             {
-              "type": "integer"
+              "type": "string"
             },
             {
               "type": "null"

@@ -332,6 +332,7 @@ export class HeatmapRenderer {
       depthValue(depthCeilingContracts(source.maxRowContracts)),
     );
     gl.uniform1f(uniforms.get("uDpr") ?? null, this.#dpr);
+    gl.uniform1i(uniforms.get("uEdgeStatus") ?? null, columns.edgeStatus);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 

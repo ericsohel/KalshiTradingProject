@@ -33,21 +33,32 @@ from tape.recorder.tap import CompositeBookTap, TapWindow
 from tape.timeutil import NS_PER_MS, NS_PER_S, FrozenClock
 
 
-def write_settings(tmp_path: Path, *, group_size: int = 500, pem: bytes | None = None) -> Path:
-    key = tmp_path / "read.pem"
-    if pem is None:
-        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        pem = private_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    key.write_bytes(pem)
-    key.chmod(0o600)
+def write_settings(
+    tmp_path: Path,
+    *,
+    group_size: int = 500,
+    pem: bytes | None = None,
+    credentials: bool = True,
+    bus_endpoint: str | None = None,
+) -> Path:
+    kalshi = '[kalshi]\nenv = "demo"\n'
+    if credentials:
+        key = tmp_path / "read.pem"
+        if pem is None:
+            private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            pem = private_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        key.write_bytes(pem)
+        key.chmod(0o600)
+        kalshi += f'key_id = "key-1"\nprivate_key_path = "{key}"\n'
+    bus = "" if bus_endpoint is None else f'bus_endpoint = "{bus_endpoint}"\n'
     config = tmp_path / "tape.toml"
     config.write_text(
-        f'[kalshi]\nenv = "demo"\nkey_id = "key-1"\nprivate_key_path = "{key}"\n\n'
-        f'[recorder]\ndata_dir = "data"\ngroup_size = {group_size}\nbook_connections = 3\n\n'
+        f"{kalshi}\n"
+        f'[recorder]\ndata_dir = "data"\ngroup_size = {group_size}\nbook_connections = 3\n{bus}\n'
         "[recorder.universe]\nmax_l2_markets = 1500\n"
     )
     return config
@@ -105,6 +116,37 @@ def test_record_refuses_an_invalid_configuration_before_connecting(
     assert main(["record", "--config", str(config), "--log-format", "json"]) == 1
     assert "$.recorder.group_size" in capsys.readouterr().err
     assert isinstance(root_logger.handlers[0].formatter, JsonLogFormatter)
+
+
+def test_config_check_requires_credentials_for_record_and_a_bus_endpoint_for_serve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    without_bus = write_settings(tmp_path, credentials=False)
+    for argv in (["config", "check"], ["config", "check", "--for", "record"]):
+        assert main([*argv, "--config", str(without_bus)]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == (
+            "tape: configuration error: kalshi.key_id is not set; "
+            "tape record signs every Kalshi request with it; tape serve does not\n"
+        )
+    assert main(["config", "check", "--for", "serve", "--config", str(without_bus)]) == 1
+    assert "recorder.bus_endpoint is not set" in capsys.readouterr().err
+
+    serve_only = write_settings(tmp_path, credentials=False, bus_endpoint="tcp://127.0.0.1:5555")
+    assert main(["config", "check", "--for", "serve", "--config", str(serve_only)]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["kalshi"]["key_id"] is None
+    assert captured.err == ""
+
+
+def test_record_refuses_missing_credentials_before_connecting(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], root_logger: logging.Logger
+) -> None:
+    config = write_settings(tmp_path, credentials=False)
+    assert main(["record", "--config", str(config)]) == 1
+    assert "tape: configuration error: kalshi.key_id is not set" in capsys.readouterr().err
+    assert root_logger.handlers
 
 
 @pytest.mark.parametrize("argv", [[], ["config"], ["record"], ["config", "check"]])
@@ -298,10 +340,22 @@ async def test_build_recorder_refuses_a_key_that_is_not_rsa(tmp_path: Path) -> N
             build_recorder(settings, http=http, clock=FrozenClock(), host="box")
 
 
+async def test_build_recorder_requires_credentials(tmp_path: Path) -> None:
+    settings = load_settings(write_settings(tmp_path, credentials=False), environ={})
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ConfigError, match=r"kalshi\.key_id is not set"):
+            build_recorder(settings, http=http, clock=FrozenClock(), host="box")
+
+
+@pytest.mark.parametrize("credentials", [True, False])
 def test_serve_refuses_a_configuration_without_a_bus_endpoint(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], root_logger: logging.Logger
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    root_logger: logging.Logger,
+    credentials: bool,
 ) -> None:
-    config = write_settings(tmp_path)
+    # Without credentials the only complaint is the bus endpoint: tape serve signs nothing.
+    config = write_settings(tmp_path, credentials=credentials)
     assert main(["serve", "--config", str(config)]) == 1
     error = capsys.readouterr().err
     assert error.startswith("tape: configuration error: ")

@@ -1,5 +1,7 @@
 # Example configuration for `tape`. Copy it to tape.toml (ignored by git), set key_id,
 # then run `uv run tape config check --config tape.toml` before `tape record`.
+# `tape serve` signs nothing: key_id and private_key_path may be left out of its
+# configuration, and `tape config check --for serve` checks what it needs instead.
 #
 # Every setting can be overridden from the environment as TAPE_<SECTION>__<KEY>, for
 # example TAPE_RECORDER__BOOK_CONNECTIONS=6 or TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES=A,B.
@@ -69,7 +71,7 @@ exclude_mve = true
 listen_host = "127.0.0.1"
 listen_port = 8080
 # Exact origins (scheme://host[:port]) that CORS and the WebSocket Origin check accept.
-allowed_origins = ["http://localhost:5173"]
+allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 # Live connections at once (1 to 1000), markets per connection (1 to 50), and messages queued
 # for one connection before it is resynchronized (100 to 100000).
 max_clients = 200

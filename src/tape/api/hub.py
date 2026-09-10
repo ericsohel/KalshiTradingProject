@@ -184,7 +184,7 @@ class LiveHub:
         """How the hub follows the bus, for ``GET /status``."""
         stats = self._live.stats
         return BusHealth(
-            epoch=self._live.epoch,
+            epoch=None if self._live.epoch is None else str(self._live.epoch),
             last_seq=self._live.last_seq,
             messages=stats.messages,
             resets=stats.resets,

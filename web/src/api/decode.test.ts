@@ -62,6 +62,13 @@ describe("decodeFrame: valid messages", () => {
     expect(frame({ t: "error", code: "new_code", message: "" }).kind).toBe("message");
   });
 
+  it("accepts a snapshot and a delta without exchange time, as the schema allows", () => {
+    const snapshot = { ...VALID_MESSAGES.snapshot, ts_ms: null };
+    const delta = { ...VALID_MESSAGES.delta, ts_ms: null };
+    expect(frame(snapshot)).toEqual({ kind: "message", message: snapshot });
+    expect(frame(delta)).toEqual({ kind: "message", message: delta });
+  });
+
   it("accepts empty books and tickers with dots", () => {
     const snapshot = {
       ...VALID_MESSAGES.snapshot,
@@ -124,7 +131,9 @@ describe("decodeFrame: malformed input never throws", () => {
     ["snapshot level with three numbers", { ...snapshot, asks: [[5700, 1, 2]] }],
     ["snapshot without ticker", { ...snapshot, ticker: undefined }],
     ["snapshot with empty ticker", { ...snapshot, ticker: "" }],
-    ["snapshot without ts_ms", { ...snapshot, ts_ms: null }],
+    ["snapshot without ts_ms", { ...snapshot, ts_ms: undefined }],
+    ["delta without ts_ms", { ...VALID_MESSAGES.delta, ts_ms: undefined }],
+    ["trade with a null ts_ms", { ...VALID_MESSAGES.trade, ts_ms: null }],
     ["delta with a Kalshi side", { ...VALID_MESSAGES.delta, side: "yes" }],
     ["delta with a fractional change", { ...VALID_MESSAGES.delta, delta_e2: 1.5 }],
     ["delta with a negative price", { ...VALID_MESSAGES.delta, price_e4: -1 }],
@@ -207,6 +216,8 @@ describe("REST decoders", () => {
       depth: { ts_ms: 5, bids: [[3100, 100]], asks: [[3200, 200]] },
     };
     expect(decodeMarketDetail(detail)).toEqual({ ok: true, value: detail });
+    const untimed = { ...detail, depth: { ...detail.depth, ts_ms: null } };
+    expect(decodeMarketDetail(untimed)).toEqual({ ok: true, value: untimed });
   });
 
   it("rejects an empty price range and unordered depth", () => {
@@ -233,7 +244,7 @@ describe("REST decoders", () => {
     ).toBe(false);
   });
 
-  it("decodes service status, including an epoch beyond 2^53", () => {
+  it("decodes service status, keeping an epoch beyond 2^53 exact as a string", () => {
     const status = {
       recording: true,
       recorder_status_age_ms: 1200,
@@ -253,7 +264,7 @@ describe("REST decoders", () => {
         ],
       },
       bus: {
-        epoch: 1_757_500_000_000_000_000,
+        epoch: "1757500000000000123",
         last_seq: 9,
         messages: 9,
         resets: 0,
@@ -263,6 +274,14 @@ describe("REST decoders", () => {
       clients: 2,
     };
     expect(decodeServiceStatus(status)).toEqual({ ok: true, value: status });
+    const beforeTheBus = { ...status.bus, epoch: null, last_seq: null, messages: 0 };
+    expect(decodeServiceStatus({ ...status, bus: beforeTheBus })).toEqual({
+      ok: true,
+      value: { ...status, bus: beforeTheBus },
+    });
+    for (const epoch of [1_757_500_000_000_000_000, "", "-1", "1e18", " 7"]) {
+      expect(decodeServiceStatus({ ...status, bus: { ...status.bus, epoch } }).ok).toBe(false);
+    }
     expect(
       decodeServiceStatus({ ...status, recorder: null, recorder_status_age_ms: null }).ok,
     ).toBe(true);

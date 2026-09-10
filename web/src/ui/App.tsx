@@ -8,6 +8,7 @@ import type { MarketRow } from "../api/protocol";
 import { resolveEndpoints, RestClient } from "../api/rest";
 import { PALETTE } from "../render/heatmapRenderer";
 import { gridFromPriceRanges } from "../state/priceGrid";
+import { marketNotice, WAITING_FOR_MARKET_LIST } from "./availability";
 import { DepthLadder } from "./DepthLadder";
 import { HeatmapPanel } from "./HeatmapPanel";
 import { useLiveFeed, useMarketStore, usePolling, useStoreSummary, useUrlSearch } from "./hooks";
@@ -25,6 +26,10 @@ import {
 } from "./url";
 
 const MARKETS_LIMIT = 50;
+/** The market list refreshes at this pace, so one published after the page loaded appears. */
+const MARKETS_REFRESH_MS = 15_000;
+const STATUS_REFRESH_MS = 10_000;
+const DETAIL_REFRESH_MS = 30_000;
 
 function rgbCss(rgb: readonly number[]): string {
   const channel = (index: number): number => Math.round((rgb[index] ?? 0) * 255);
@@ -57,9 +62,9 @@ export function App() {
     (signal: AbortSignal) => rest.listMarkets(MARKETS_LIMIT, signal),
     [rest],
   );
-  const markets = usePolling(loadMarkets, 15_000);
+  const markets = usePolling(loadMarkets, MARKETS_REFRESH_MS);
   const loadStatus = useCallback((signal: AbortSignal) => rest.getStatus(signal), [rest]);
-  const service = usePolling(loadStatus, 10_000);
+  const service = usePolling(loadStatus, STATUS_REFRESH_MS);
 
   const rows = markets.data?.markets ?? [];
   const selectedTicker = tickerFromSearch(search) ?? defaultTicker(rows);
@@ -68,7 +73,7 @@ export function App() {
       selectedTicker === null ? Promise.resolve(null) : rest.getMarket(selectedTicker, signal),
     [rest, selectedTicker],
   );
-  const detail = usePolling(loadDetail, 30_000);
+  const detail = usePolling(loadDetail, DETAIL_REFRESH_MS);
   const priceRanges = detail.data?.price_ranges ?? null;
   const grid = useMemo(() => gridFromPriceRanges(priceRanges), [priceRanges]);
 
@@ -76,7 +81,17 @@ export function App() {
   const summary = useStoreSummary(store, 250);
   const row = rows.find((candidate) => candidate.ticker === selectedTicker) ?? detail.data ?? null;
   const mode = rangeFromSearch(search);
-  const rejected = connection.rejected.find((entry) => entry.ticker === selectedTicker) ?? null;
+  const listedMarkets = markets.data === null ? null : rows.length;
+  const notice =
+    selectedTicker === null
+      ? null
+      : marketNotice({
+          listedMarkets,
+          detailUnknown: detail.error?.code === "unknown_ticker",
+          subscribed: connection.subscribed.includes(selectedTicker),
+          rejection: connection.rejected.find((entry) => entry.ticker === selectedTicker) ?? null,
+          retryAtMs: connection.rejectionRetryAtMs,
+        });
 
   const selectMarket = useCallback(
     (ticker: string) => navigate(searchWithTicker(search, ticker)),
@@ -103,6 +118,7 @@ export function App() {
       <div className="layout">
         <MarketPicker
           rows={rows}
+          listed={listedMarkets}
           loading={markets.data === null && markets.error === null}
           error={markets.error}
           selectedTicker={selectedTicker}
@@ -112,16 +128,21 @@ export function App() {
         <main className="stage" id="live-view" tabIndex={-1}>
           {selectedTicker === null ? (
             <p className="empty-stage">
-              {markets.error === null ? "Loading markets…" : "No market to show yet."}
+              {markets.error !== null
+                ? "No market to show yet."
+                : listedMarkets === 0
+                  ? WAITING_FOR_MARKET_LIST
+                  : "Loading markets…"}
             </p>
           ) : (
             <>
               <MarketHeader ticker={selectedTicker} row={row} summary={summary} />
-              {detail.error?.code === "unknown_ticker" || rejected !== null ? (
-                <p className="notice notice-error" role="alert">
-                  {rejected?.code === "too_many_tickers"
-                    ? "The live server refused this market: too many markets are open on this page."
-                    : "This market is not recorded, so there is no live book to show."}
+              {notice !== null ? (
+                <p
+                  className={notice.tone === "error" ? "notice notice-error" : "notice"}
+                  role={notice.tone === "error" ? "alert" : "status"}
+                >
+                  {notice.text}
                 </p>
               ) : null}
               <div className="stage-grid">

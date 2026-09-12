@@ -62,7 +62,7 @@ docs/            design documents and ADRs
 src/tape/        Python package (recorder, book, tape store, simulator, engine, API)
 tests/           unit, property, contract, and integration tests
 web/             TypeScript + WebGL2 viewer
-deploy/          systemd units, Caddy config, Oracle Cloud notes
+deploy/          systemd units, Caddyfile, and server config for the Azure host (ADR 0024)
 ```
 
 ## License

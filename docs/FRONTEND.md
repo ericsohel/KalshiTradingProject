@@ -148,7 +148,7 @@ Closed historical windows set `Cache-Control: public, max-age=3600`.
 | Static site | Cloudflare Pages, `*.pages.dev` hostname, built by CI on push to `main` | $0 |
 | API | `tape serve` on the recorder host, bound to localhost | $0 |
 | TLS and ingress | Caddy with automatic certificates; hostname from a free dynamic-DNS provider (DuckDNS) or a purchased domain (about $10 per year) | $0 to $10/yr |
-| CORS | API allows only the Pages origin and localhost for development | |
+| CORS | API allows only the viewer's own origin, `https://ericsohel.com` (whose site embeds a live panel fed by this API), and localhost for development | |
 
 The API is rate-limited per client IP (token bucket in Caddy or in the app) and
 serves at most 200 concurrent live clients; beyond that it accepts the WebSocket handshake

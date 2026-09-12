@@ -31,5 +31,5 @@ exclude_mve = true
 [serve]
 listen_host = "127.0.0.1"
 listen_port = 8080
-allowed_origins = ["https://kalshi-tape-live.northcentralus.cloudapp.azure.com"]
+allowed_origins = ["https://kalshi-tape-live.northcentralus.cloudapp.azure.com", "https://ericsohel.com"]
 max_clients = 200

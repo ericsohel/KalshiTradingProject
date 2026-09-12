@@ -145,16 +145,16 @@ Measured in production and revisited monthly. With the `ticker` channel live-onl
 (ADR 0018), 2,000 markets produce about 9.4 GB of raw data a day and 200 markets about
 2.4 GB. The production host's 64 GB data disk therefore holds about 25 days at 200
 markets, so retention, or moving data off the host, is required within weeks; the Mac,
-with far more disk, keeps the longer archive. Policy from day one:
+with far more disk, keeps the longer archive. Policy (ADR 0025):
 
-| Data | Retention on host | Backup |
+| Data | Retention on the production host | Backup |
 |---|---|---|
-| Raw segments for showcase and quoted markets | forever (compressed) | R2 nightly while under the free tier |
-| Raw segments for other markets | 90 days, then keep baked tables only | none |
-| Keyframes | forever | R2 nightly |
-| Baked tables and manifests | forever | R2 nightly |
+| Raw segments | `raw_retention_hours` (72) after a verified bake of their hour (ADR 0025) | the Mac archive, once set up |
+| Keyframes | forever | planned |
+| Baked tables and manifests | forever | planned |
 
-`tape bake --prune` applies the policy and records what it removed in the manifest.
+`tape bake` bakes closed hours; `tape prune --apply` then deletes the raw segments of hours
+that meet every condition in ADR 0025 and records each deletion in the day's manifest.
 
 ## 6. Runbook
 

@@ -1,6 +1,6 @@
 # 0009. TypeScript + WebGL2 viewer on Cloudflare Pages; API behind Caddy
 
-Status: accepted; framework amended by ADR 0023 (Starlette on msgspec, not FastAPI). Date: 2026-09-09.
+Status: accepted; framework amended by ADR 0023 (Starlette on msgspec, not FastAPI); hosting amended by ADR 0024 (viewer served from the API host). Date: 2026-09-09.
 
 ## Context
 

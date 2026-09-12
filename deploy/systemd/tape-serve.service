@@ -1,0 +1,16 @@
+[Unit]
+Description=tape live API
+After=tape-record.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=tapeops
+WorkingDirectory=/home/tapeops/tape
+ExecStart=/home/tapeops/tape/.venv/bin/tape serve --config /home/tapeops/tape.toml
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+kalshi-tape-live.northcentralus.cloudapp.azure.com {
+	encode zstd gzip
+
+	header {
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' wss://kalshi-tape-live.northcentralus.cloudapp.azure.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	# The live API and its WebSocket; tape serve listens on localhost only.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# The viewer: a static single-page app built from web/.
+	handle {
+		root * /srv/tape/www
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		try_files {path} /index.html
+		file_server
+	}
+}

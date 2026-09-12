@@ -4,11 +4,12 @@
 
 | Name | Host | Kalshi env | Purpose |
 |---|---|---|---|
-| dev | Owner's Mac | demo for order paths, prod public data for capture | development, first recordings |
-| prod | Oracle Cloud Always Free ARM (2 OCPU, 12 GB, 200 GB), US region | prod | continuous recording, API |
+| dev | Owner's Mac | demo for order paths, prod public data for capture | development; records a wider universe while it is on |
+| prod | Azure for Students VM `tape-1` (`Standard_B2ats_v2`: 2 vCPUs, 1 GB, 64 GB data disk), North Central US (ADR 0024) | prod | continuous recording of the 200 busiest markets, live API, viewer |
 
-The first production tape starts on the Mac the day a production read key exists; the
-process moves to the cloud host once it has run cleanly for a week.
+The first production tape ran on the Mac from 2026-09-10, and the production host has
+recorded since 2026-09-12. The Mac's tape is a separate, wider recording; it does not
+replace the host's.
 
 **Running on a Mac.** A sleeping laptop records nothing: the first production smoke
 test lost two five-minute windows to sleep on battery. The Mac must be on AC power,
@@ -29,16 +30,35 @@ a `clock_jump` record, so the resulting gap is attributable rather than mysterio
 
 ## 3. Provisioning the production host
 
-1. Create the Always Free ARM instance (Ubuntu 24.04 aarch64) in a US home region;
-   open only port 443 in the security list; SSH by key.
-2. Install `chrony`, `zstd`, `caddy`, and `uv`; create user `tape` with no sudo.
-3. `git clone`, `uv sync --frozen`, place the key, write `tape.toml`.
-4. Install the systemd units from `deploy/systemd/` (`tape-record`, `tape-serve`,
-   `tape-bake.timer` hourly, `tape-backup.timer` nightly) with `Restart=always`,
-   `MemoryMax` set per process, and journald logging.
-5. Point a DuckDNS (or owned) hostname at the instance; install `deploy/Caddyfile`;
-   confirm the certificate is issued.
-6. Register the dead-man ping (healthchecks.io) and the alert channel (ntfy topic).
+The host of ADR 0024, as provisioned on 2026-09-12. Files named below are in `deploy/`.
+
+1. In Azure Cloud Shell, under the Azure for Students subscription, read the allowed
+   regions (`az policy assignment list`), then create the VM in an allowed US region:
+   Ubuntu 24.04, `Standard_B2ats_v2`, a 64 GB Premium SSD OS disk and a 64 GB data disk,
+   a Standard public IP with a DNS label, and SSH key authentication. Open ports 80 and
+   443 besides SSH (`az vm open-port`).
+2. Do not name the admin user `tape`. Ubuntu already has a system group `tape`, so
+   provisioning fails to create the user and installs no key. The host uses `tapeops`,
+   added afterwards with `az vm user update`.
+3. Format the data disk as ext4 with label `tapedata` and mount it at `/srv/tape` with
+   `nofail`; add a 2 GB swap file with `vm.swappiness=10`.
+4. Install `git`, `zstd`, `uv`, and Caddy from its official package repository.
+5. Clone the repository and run `uv sync --frozen`. Create a read-only Kalshi key for
+   this host alone, copy its PEM to `~/.config/tape/keys/server-read.pem` (mode 600)
+   with `scp`, and install `tape.server.example.toml` as `~/tape.toml` with its `key_id`.
+   Check it with `tape config check` and `tape config check --for serve`.
+6. Create `/srv/tape/run` (mode 700) for the bus socket, install
+   `systemd/tape-record.service` and `systemd/tape-serve.service`, and enable both.
+7. Build the viewer on a development machine (`npm --prefix web run build`), copy
+   `web/dist/` to `/srv/tape/www` with `rsync --delete`, install `caddy/Caddyfile`, and
+   confirm that the certificate is issued.
+
+To deploy new code: `git -C ~/tape pull --ff-only` and `uv sync --frozen`, then restart
+`tape-serve`, and `tape-record` only when recorder code changed, because every recorder
+restart is a gap in the tape.
+
+Not yet in place: a check that time sync is healthy, bake and backup timers, a dead-man
+ping and alerts, and `MemoryMax` per service.
 
 ## 4. Monitoring
 
@@ -121,13 +141,11 @@ accepted. `web/dev/mock-server.ts` lists the disruptions it can trigger on reque
 
 ## 5. Storage and retention
 
-Measured in week one and revisited monthly. A first 65-second production sample
-extrapolated to about 1.7 GB per day compressed, 99% of it from the unfiltered
-`ticker` channel, which would fill the 200 GB free-tier disk in roughly four months
-and the 10 GB R2 free tier in under a week. Order books and trades for the 50
-busiest markets were a small fraction of that. The `ticker` channel is therefore
-live-only and never taped (ADR 0018), so the taped volume is the order-book, trade, and
-lifecycle traffic. Policy from day one:
+Measured in production and revisited monthly. With the `ticker` channel live-only
+(ADR 0018), 2,000 markets produce about 9.4 GB of raw data a day and 200 markets about
+2.4 GB. The production host's 64 GB data disk therefore holds about 25 days at 200
+markets, so retention, or moving data off the host, is required within weeks; the Mac,
+with far more disk, keeps the longer archive. Policy from day one:
 
 | Data | Retention on host | Backup |
 |---|---|---|
@@ -162,5 +180,5 @@ on start. A restore is exercised quarterly.
 | Item | Budget | Notes |
 |---|---|---|
 | Kalshi deposit for probes | $10 | minimum ACH deposit; about $3 at risk |
-| Hostname | $0 to $10/yr | DuckDNS free or a purchased domain |
-| Compute, storage, TLS, CI, hosting | $0 | Oracle Always Free, R2 free tier, Cloudflare Pages, GitHub Actions |
+| Hostname | $0 | Azure DNS label on the VM's public IP (`*.cloudapp.azure.com`) |
+| Compute, storage, TLS, CI, hosting | $0 | Azure for Students (USD 100 of credit a year and 12 months of free services; to be confirmed on the first bill), Let's Encrypt through Caddy, GitHub Actions |

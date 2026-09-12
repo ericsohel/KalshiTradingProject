@@ -1,0 +1,18 @@
+[Unit]
+Description=tape recorder (Kalshi order books)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/srv/tape
+
+[Service]
+User=tapeops
+WorkingDirectory=/home/tapeops/tape
+ExecStart=/home/tapeops/tape/.venv/bin/tape record --config /home/tapeops/tape.toml
+# SIGINT runs the recorder's ordered shutdown: final keyframe, supervisors, then sinks.
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

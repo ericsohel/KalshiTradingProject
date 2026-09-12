@@ -1,0 +1,35 @@
+# tape on the production host (ADR 0024). Secrets are paths, never values.
+[kalshi]
+env = "prod"
+# A read-only key made for this host alone, so it can be revoked without touching others.
+key_id = "REPLACE-WITH-THE-SERVER-READ-KEY-ID"
+private_key_path = "~/.config/tape/keys/server-read.pem"
+rest_timeout_s = 10
+
+[recorder]
+data_dir = "/srv/tape/data"
+# The directory must exist and be writable by this user only.
+bus_endpoint = "ipc:///srv/tape/run/bus.sock"
+max_connections = 16
+# 200 markets keep raw data near 2.4 GB/day, inside the 64 GB data disk.
+book_connections = 2
+group_size = 100
+keyframe_interval_s = 300
+audit_interval_s = 300
+audit_sample = 200
+# Sized for a host with 1 GB of memory.
+writer_queue_max = 50000
+universe_refresh_s = 300
+status_interval_s = 60
+
+[recorder.universe]
+min_volume_24h = "1000.00"
+max_l2_markets = 200
+showcase_series = ["KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDECISION"]
+exclude_mve = true
+
+[serve]
+listen_host = "127.0.0.1"
+listen_port = 8080
+allowed_origins = ["https://kalshi-tape-live.northcentralus.cloudapp.azure.com"]
+max_clients = 200

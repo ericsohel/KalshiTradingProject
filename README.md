@@ -3,6 +3,8 @@
 An order-book flight recorder, deterministic replay engine, and self-calibrating
 market maker for [Kalshi](https://kalshi.com), with a live WebGL viewer.
 
+> Live: <https://kalshi-tape-live.northcentralus.cloudapp.azure.com>
+>
 > Status: recording. The exchange client (RSA-PSS signing, rate-limit
 > mirror, bounded-buffer WebSocket session), the book, the tape writer, the
 > recorder orchestrator, its live event bus, the live API (`tape serve`), and the

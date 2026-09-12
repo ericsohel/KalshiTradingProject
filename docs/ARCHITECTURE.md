@@ -240,14 +240,15 @@ sequence of emitted intents is logged hourly and must match on replay.
 
 | Environment | Where | Purpose |
 |---|---|---|
-| Development | Owner's Mac | Everything; recorder may run here initially |
-| Production | Oracle Cloud Always Free ARM instance (US region) | Recorder, baker, API, later engine |
-| Web | Cloudflare Pages | Static viewer; calls the production API over HTTPS |
-| TLS and ingress | Caddy on the production host, hostname from a free dynamic-DNS provider or a purchased domain | HTTPS termination and reverse proxy to `tape serve` |
-| Backups | Cloudflare R2 free tier | Keyframes, manifests, and baked tables; raw segments only if space allows |
+| Development | Owner's Mac | Everything; also records a wider universe while it is on |
+| Production | Azure for Students VM, North Central US (ADR 0024) | Recorder and API as separate systemd services; later baker and engine |
+| Web | The production host, served by Caddy from the API's origin | Static viewer on the same origin as the API, so no CORS |
+| TLS and ingress | Caddy on the production host, with the VM's Azure DNS name | HTTPS termination, static files, and reverse proxy to `tape serve` |
+| Backups | Planned: Cloudflare R2 free tier and the Mac | Keyframes, manifests, and baked tables; raw segments only if space allows |
 
-The production host exposes exactly one inbound port (443, Caddy). The recorder and
-API bind to localhost and `ipc://` sockets only. See [OPERATIONS.md](OPERATIONS.md).
+The production host accepts SSH on port 22 (keys only), port 80 for certificate issuance
+and redirects, and port 443 for Caddy. The recorder and API bind to localhost and
+`ipc://` sockets only. See [OPERATIONS.md](OPERATIONS.md) and `deploy/`.
 
 ## 9. Failure modes and responses
 

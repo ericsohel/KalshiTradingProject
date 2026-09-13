@@ -64,7 +64,10 @@ barely traded.
     are the likeliest outcomes. For a threshold (`greater`, `less`, and similar), the YES
     mid closest to 50 cents comes first. The mid is the average of the listing's YES bid
     and ask, or the last price when either is missing. Markets with no price at all come
-    after priced ones, ordered by volume.
+    after priced ones, ordered by volume. When a listing leaves a `near_price` series group
+    with an admitted event whose markets are not all priced, as when a new event is listed
+    before its first quotes, the recorder lists that group again after the minimum interval,
+    at most four times per event, until they are.
   
   The production groups for Bitcoin hourly, stock indexes, economy, and weather use
   `near_price`.

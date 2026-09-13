@@ -655,7 +655,12 @@ recorder removes every planned market whose close time has passed or that was re
 each series group that lost one. A re-listing lists `GET /markets?series_ticker=<s>&status=open`
 for each series of the due groups (`list_series_markets`, at most `RELIST_MAX_PAGES` pages per
 series), re-applies those groups to it and pins every other group, then replans; a failure is
-logged and retried after the minimum interval. A full refresh leaves out markets reported ended
+logged and retried after the minimum interval. After a full refresh or re-listing, each listed
+series group with `market_order = "near_price"` that admitted an event with a market lacking a
+`yes_mid` is due another re-listing `RELIST_MIN_INTERVAL_S` after that listing started, at most
+`NEAR_PRICE_FOLLOW_UPS` (4) times per group and event; its follow-ups end, and are logged, when the
+event's admitted markets are all priced, when it leaves the plan, or when the attempts run out.
+A full refresh leaves out markets reported ended
 while its listing still shows them open, applies moved close times, and covers every re-listing
 requested before it started. The catalog leaves out markets reported ended and carries moved close
 times, so a consumer that replaces its catalog whole never reinstates a market the recorder knows

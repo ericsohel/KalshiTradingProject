@@ -48,7 +48,9 @@ The host of ADR 0024, as provisioned on 2026-09-12. Files named below are in `de
    with `scp`, and install `tape.server.example.toml` as `~/tape.toml` with its `key_id`.
    Check it with `tape config check` and `tape config check --for serve`.
 6. Create `/srv/tape/run` (mode 700) for the bus socket, install
-   `systemd/tape-record.service` and `systemd/tape-serve.service`, and enable both.
+   `systemd/tape-record.service` and `systemd/tape-serve.service`, and enable both. Install
+   `needrestart/tape.conf` in `/etc/needrestart/conf.d/`, so unattended upgrades install but never
+   restart either service; every deploy restarts them deliberately.
 7. Build the viewer on a development machine (`npm --prefix web run build`), copy
    `web/dist/` to `/srv/tape/www` with `rsync --delete`, install `caddy/Caddyfile`, and
    confirm that the certificate is issued.
@@ -224,6 +226,17 @@ re-listing failed; keeping the current plan and retrying` with `error`, `relisti
 `retry_in_s`, and is retried after that interval; capture is unaffected, and the full refresh
 still converges on the same universe.
 
+A new event is often listed before its first quotes, so a `near_price` group can only admit its
+markets by volume and ticker. When a full refresh or a re-listing leaves such a series group with
+an admitted event whose admitted markets are not all priced (a market without a YES mid), the
+recorder lists the group again 30 seconds after that listing started, at most 4 times per event,
+and logs `near-price follow-up re-listing requested` with `group`, `event`, `attempt`,
+`max_attempts`, `unpriced` (the tickers), and `due_in_s`. Follow-ups for an event end with `near-price
+follow-ups ended`, with `group`, `event`, `attempts`, and `outcome`: `priced` once its admitted
+markets all have a mid, `left_plan` once no market of it is admitted, or `gave_up` after the last
+attempt, which also carries `unpriced` and `given_up_total`, the events given up on since start.
+A group that gave up on an event is not listed again for it; the next full refresh re-ranks it.
+
 - **A category group runs short:** its closed markets are removed at close but replaced only at
   the next full refresh, so `universe_refresh_s` bounds how long it has fewer markets. Name a
   series in a series group to have its replacements start within seconds.
@@ -310,6 +323,7 @@ appended byte is damage, not a truncated tail.
 |---|---|---|
 | Dead-man alert | `systemctl status tape-record`, journal tail | Restart if crashed; if a Kalshi outage, wait; the gap is visible in the manifest |
 | Repeated reconnects | `GET /exchange/status`, changelog RSS | If Kalshi maintenance (Thursdays 3 to 5 AM ET) do nothing; else inspect error frames in the raw segment |
+| Recorder or API restarted with no deploy | `Stopping tape-record.service` in the journal with no matching `sudo` command; `/var/log/apt/history.log` at that time | Unattended upgrades restarted it through needrestart: install `deploy/needrestart/tape.conf`; the upgraded libraries take effect at the next deliberate restart |
 | Gap share rising | per-connection message rate | Add a connection; shrink group size |
 | Audit mismatches on one group | affected `sid` | Force `get_snapshot`; if persistent, open an issue with the raw frames |
 | Disk filling | `df`, manifest sizes, `tape prune` (reasons hours are kept) | Fix what keeps hours from pruning (a decode failure needs a baker fix and a `BAKE_VERSION` bump), run `tape bake`, then `tape prune --apply`; tighten the L2 universe |

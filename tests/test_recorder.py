@@ -44,6 +44,7 @@ from tape.events import (
     MarketCatalog,
     Side,
     StatusReport,
+    Ticker,
 )
 from tape.fixedpoint import CountE2, PriceE4
 from tape.recorder.planner import Group
@@ -51,7 +52,7 @@ from tape.recorder.recorder import (
     CLOCK_JUMP_THRESHOLD_NS,
     CONTROL_CONN_ID,
     TICKER_CONN_ID,
-    TICKER_RETENTION_NS,
+    TICKER_GROUP_ID,
     BusStatus,
     PeriodicTask,
     Recorder,
@@ -258,7 +259,6 @@ class Harness:
         self.clock = FrozenClock(mono_ns=1, wall_ns=NOON)
         self.host_clock = HostClock(self.clock)
         self.time = VirtualTime(self.clock)
-        self.silence_timeouts: dict[int, list[int | None]] = {}
         self.limiter = RecordingLimiter()
         self.rest = FakeRest(markets)
         self.http = httpx.AsyncClient(transport=httpx.MockTransport(self.rest), base_url=REST_URL)
@@ -291,19 +291,15 @@ class Harness:
         )
         self.task: asyncio.Task[None] | None = None
 
-    def session(self, url: str, *, conn_id: int, silence_timeout_ns: int | None) -> WsSession:
+    def session(self, url: str, *, conn_id: int) -> WsSession:
         if conn_id == self.broken_conn:
             raise RuntimeError(f"no session for connection {conn_id}")
-        self.silence_timeouts.setdefault(conn_id, []).append(silence_timeout_ns)
-        # A clock of the session's own that never moves, so advancing virtual time cannot
-        # trip the ticker connection's silence timeout; the query string tells the fake
-        # which connection it is.
+        # The query string tells the fake which connection it is.
         return WsSession(
             f"{url}?conn={conn_id}",
             StubSigner(),
             FrozenClock(mono_ns=1, wall_ns=NOON),
             conn_id=conn_id,
-            silence_timeout_ns=silence_timeout_ns,
             connect_timeout_ns=2 * NS_PER_S,
         )
 
@@ -391,9 +387,26 @@ async def test_startup_sizes_the_limiter_and_subscribes_the_planned_groups(tmp_p
         first_books = await harness.connection(fake, 2)
         second_books = await harness.connection(fake, 3)
 
-        assert await ticker.wait_for_commands(1) == [
-            {"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker"]}}
+        # The plan's markets, never every market (ADR 0027), two per command at group_size 2.
+        assert await ticker.wait_for_commands(2) == [
+            {
+                "id": 1,
+                "cmd": "subscribe",
+                "params": {"channels": ["ticker"], "market_tickers": ["KXA-1", "KXA-2"]},
+            },
+            {
+                "id": 2,
+                "cmd": "update_subscription",
+                "params": {
+                    "sid": 1,
+                    "action": "add_markets",
+                    "market_tickers": ["KXA-3", "KXSHOW-1"],
+                },
+            },
         ]
+        assert ticker.subscriptions == {
+            1: {"channel": "ticker", "market_tickers": ["KXA-1", "KXA-2", "KXA-3", "KXSHOW-1"]}
+        }
         assert await control.wait_for_commands(1) == [
             {"id": 1, "cmd": "subscribe", "params": {"channels": ["market_lifecycle_v2"]}}
         ]
@@ -727,28 +740,84 @@ def test_universe_retries_double_from_15_seconds_and_cap_at_the_refresh_interval
         universe_retry_delay_s(0, refresh_s=300, jitter=1.0)
 
 
-async def test_only_the_live_only_ticker_connection_has_a_data_silence_timeout(
+def listing(*markets: Mapping[str, object]) -> list[httpx.Response]:
+    """A ``/markets`` answer holding exactly these markets on one page."""
+    return [httpx.Response(200, json={"markets": list(markets), "cursor": ""})]
+
+
+async def test_the_ticker_subscription_and_table_follow_the_plan_while_the_bus_gets_everything(
     tmp_path: Path,
 ) -> None:
+    """ADR 0027: growth adds a market to the one ticker subscription, shrinkage removes it
+    from the subscription and from the table, and every update still reaches the bus."""
+    publisher = RecordingPublisher()
     async with (
         FakeKalshiWs() as fake,
-        recording(fake.url, tmp_path, ticker_silence_timeout_s=45) as harness,
+        recording(fake.url, tmp_path, publisher=publisher) as harness,
     ):
-        harness.start()
-        await harness.subscribed(TICKER_CONN_ID, CONTROL_CONN_ID, 2, 3)
-        # An idle book connection, and a reconnected one, are built without one too.
-        (books,) = [c for c in fake.connections if c.path.endswith("?conn=2")]
-        await books.close_abruptly()
-        await until(lambda: harness.time.sleepers == LOOPS + 1)  # the reconnect backoff
-        harness.time.advance(1)
-        await until(lambda: len(harness.silence_timeouts[2]) == 2)
+        recorder = harness.recorder
 
-    assert harness.silence_timeouts == {
-        TICKER_CONN_ID: [45 * NS_PER_S],
-        CONTROL_CONN_ID: [None],
-        2: [None, None],
-        3: [None],
-    }
+        def published_tickers() -> list[str]:
+            return [e.event.ticker for e in publisher.envelopes if isinstance(e.event, Ticker)]
+
+        async def push_tickers(*names: str) -> None:
+            before = len(published_tickers())
+            for name in names:
+                await ticker.push_message("ticker", {"market_ticker": name, "ts_ms": 5}, sid=1)
+            await until(lambda: len(published_tickers()) == before + len(names))
+
+        harness.start()
+        ticker = await harness.connection(fake, TICKER_CONN_ID)
+        await ticker.wait_for_commands(2)
+        await harness.subscribed(TICKER_CONN_ID, 2, 3)
+        # KXLOW-1 is below the volume floor: published, but not kept.
+        await push_tickers("KXA-1", "KXA-3", "KXLOW-1")
+        assert sorted(recorder.latest_tickers()) == ["KXA-1", "KXA-3"]
+
+        # KXA-3 leaves the universe and KXA-4 joins it.
+        harness.rest.answers["/markets"] = listing(
+            market("KXA-1", "5000.00"),
+            market("KXA-2", "4000.00"),
+            market("KXA-4", "3500.00"),
+            market("KXSHOW-1", "0.00"),
+        )
+        await harness.parked()
+        harness.time.advance(300)
+        commands = await ticker.wait_for_commands(4)
+        assert [c["params"] for c in commands[2:]] == [
+            {"sid": 1, "action": "delete_markets", "market_tickers": ["KXA-3"]},
+            {"sid": 1, "action": "add_markets", "market_tickers": ["KXA-4"]},
+        ]
+        await until(lambda: "KXA-3" not in recorder.latest_tickers())
+        assert sorted(ticker.subscriptions[1]["market_tickers"]) == [
+            "KXA-1",
+            "KXA-2",
+            "KXA-4",
+            "KXSHOW-1",
+        ]
+        ticker_group = recorder.supervisors[TICKER_CONN_ID].group
+        assert ticker_group is not None
+        assert (ticker_group.group_id, ticker_group.tickers) == (
+            TICKER_GROUP_ID,
+            frozenset({"KXA-1", "KXA-2", "KXA-4", "KXSHOW-1"}),
+        )
+        # A straggler for the market just removed is published, and never kept again.
+        await push_tickers("KXA-3", "KXA-4")
+        assert sorted(recorder.latest_tickers()) == ["KXA-1", "KXA-4"]
+        status = recorder.status()
+        # The ticker connection's group is not counted among the book subscriptions.
+        assert (status.universe_size, status.subscribed_markets, status.live_tickers) == (4, 4, 2)
+
+        # An empty universe leaves nothing to subscribe and nothing to keep.
+        harness.rest.answers["/markets"] = listing()
+        await harness.parked()
+        harness.time.advance(300)
+        commands = await ticker.wait_for_commands(5)
+        assert commands[4] == {"id": 5, "cmd": "unsubscribe", "params": {"sids": [1]}}
+        await until(lambda: not recorder.latest_tickers())
+        assert recorder.status().live_tickers == 0
+
+    assert published_tickers() == ["KXA-1", "KXA-3", "KXLOW-1", "KXA-3", "KXA-4"]
 
 
 def test_a_clock_jump_is_wall_time_outrunning_monotonic_time_by_over_five_seconds() -> None:
@@ -803,16 +872,42 @@ async def test_a_host_sleep_writes_one_clock_jump_record_to_each_taped_connectio
     assert list(tmp_path.glob("raw/*/*/conn-00-*")) == []
 
 
-async def test_a_ticker_value_is_forgotten_a_day_after_its_last_update(tmp_path: Path) -> None:
+async def test_a_reconnected_ticker_connection_resubscribes_the_current_plan_in_batches(
+    tmp_path: Path,
+) -> None:
+    def ticker_connections() -> list[FakeConnection]:
+        return [c for c in fake.connections if c.path.endswith(f"?conn={TICKER_CONN_ID}")]
+
     async with FakeKalshiWs() as fake, recording(fake.url, tmp_path) as harness:
         harness.start()
-        ticker = await harness.connection(fake, TICKER_CONN_ID)
-        await harness.subscribed(TICKER_CONN_ID)
-        await ticker.push_message("ticker", {"market_ticker": "KXA-9", "ts_ms": 5}, sid=1)
-        await until(lambda: "KXA-9" in harness.recorder.latest_tickers())
+        first = await harness.connection(fake, TICKER_CONN_ID)
+        await first.wait_for_commands(2)
+        harness.rest.answers["/markets"] = listing(
+            market("KXA-1", "5000.00"), market("KXA-2", "4000.00"), market("KXA-4", "3500.00")
+        )
         await harness.parked()
-        harness.time.advance(TICKER_RETENTION_NS // NS_PER_S + 300)
-        await until(lambda: not harness.recorder.latest_tickers())
+        harness.time.advance(300)
+        await first.wait_for_commands(4)
+        await harness.parked()
+
+        await first.close_abruptly()
+        await until(lambda: harness.time.sleepers == LOOPS + 1)  # the reconnect backoff
+        harness.time.advance(1)
+        await until(lambda: len(ticker_connections()) == 2)
+        second = ticker_connections()[1]
+        commands = await second.wait_for_commands(2)
+        # Rebuilt from the plan as it is now, not replayed from the first connection.
+        assert [(c["cmd"], c["params"]) for c in commands] == [
+            ("subscribe", {"channels": ["ticker"], "market_tickers": ["KXA-1", "KXA-2"]}),
+            (
+                "update_subscription",
+                {"sid": 1, "action": "add_markets", "market_tickers": ["KXA-4"]},
+            ),
+        ]
+        assert second.subscriptions == {
+            1: {"channel": "ticker", "market_tickers": ["KXA-1", "KXA-2", "KXA-4"]}
+        }
+        assert harness.recorder.supervisors[TICKER_CONN_ID].stats.reconnects == 1
 
 
 async def test_listing_quirks_are_logged_and_never_fatal(
@@ -935,7 +1030,6 @@ def test_keyframe_paths_floor_to_the_slot_in_utc() -> None:
         ({"max_market_pages": 0}, "max_market_pages must be positive"),
         ({"shutdown_timeout_s": 0}, "shutdown_timeout_s must be positive"),
         ({"keyframe_write_timeout_s": 0}, "keyframe_write_timeout_s must be positive"),
-        ({"ticker_silence_timeout_s": 0}, "ticker_silence_timeout_s must be positive"),
         ({"bus_refresh_s": 0}, "bus_refresh_s must be positive"),
     ],
 )

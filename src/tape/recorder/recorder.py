@@ -13,24 +13,25 @@ markets it records followed by a refresh image of each book it holds, paced in s
 the interval (ADR 0022); and its status every ``status_interval_s`` (ADR 0023). Dependencies
 arrive fully built, so the orchestration is tested against a fake exchange in virtual time.
 
-Connection layout (ADR 0018): connection 0 is live-only and carries the unfiltered
-``ticker`` channel, whose latest value per market is kept in memory and never written;
-connection 1 is taped and carries ``market_lifecycle_v2``; connections 2 onwards are taped
-and each carries one planner group, its whole market set, on ``orderbook_delta`` and
-``trade`` with ``use_yes_price``, because Kalshi keeps one subscription per channel per
-connection (ADR 0020).
-Only connection 0, which always carries traffic, has a data-silence timeout; every
-connection relies on the transport keepalive for liveness (ADR 0019).
+Connection layout (ADR 0018): connection 0 is live-only and carries the ``ticker`` channel
+for every market of the current plan, one group that follows each replan (ADR 0027), whose
+latest value per market is kept in memory and never written; connection 1 is taped and
+carries ``market_lifecycle_v2``; connections 2 onwards are taped and each carries one planner
+group, its whole market set, on ``orderbook_delta`` and ``trade`` with ``use_yes_price``,
+because Kalshi keeps one subscription per channel per connection (ADR 0020). No connection
+has a data-silence timeout; every one relies on the transport keepalive (ADR 0019).
 
-Invariants: a supervisor, sink, or internal loop that fails ends the run with its
-exception after a full shutdown, never silently; a periodic task or the bus refresh cycle that
-fails is logged and capture continues, and nothing published can raise into a supervisor or
-wait on a consumer; a refresh image is read and published without an await in between, so it
-reflects exactly the bus messages numbered before it; shutdown stops auxiliary work and the
-refresh cycle first, writes a final keyframe while the books are still live, stops every
-supervisor, closes the bus publisher, then closes every sink so that every record accepted is
-on disk; shutdown runs once however often it is requested; every wait is raced against the stop
-request; and the module sleeps, draws randomness, and reads time only through what was injected.
+Invariants: the latest-ticker table holds only markets the ticker connection is meant to
+carry, so it never outgrows the plan; a supervisor, sink, or internal loop that fails ends
+the run with its exception after a full shutdown, never silently; a periodic task or the
+bus refresh cycle that fails is logged and capture continues, and nothing published can
+raise into a supervisor or wait on a consumer; a refresh image is read and published
+without an await in between, so it reflects exactly the bus messages numbered before it;
+shutdown stops auxiliary work and the refresh cycle first, writes a final keyframe while
+the books are still live, stops every supervisor, closes the bus publisher, then closes
+every sink so that every record accepted is on disk; shutdown runs once however often it
+is requested; every wait is raced against the stop request; and the module sleeps, draws
+randomness, and reads time only through what was injected.
 """
 
 from __future__ import annotations
@@ -88,7 +89,6 @@ __all__ = [
     "DEFAULT_KEYFRAME_WRITE_TIMEOUT_S",
     "DEFAULT_MAX_MARKET_PAGES",
     "DEFAULT_SHUTDOWN_TIMEOUT_S",
-    "DEFAULT_TICKER_SILENCE_TIMEOUT_S",
     "FIRST_BOOK_CONN_ID",
     "LIFECYCLE_CHANNEL",
     "MARKET_PAGE_LIMIT",
@@ -96,7 +96,7 @@ __all__ = [
     "PINNED_SPEC_VERSIONS",
     "TICKER_CHANNEL",
     "TICKER_CONN_ID",
-    "TICKER_RETENTION_NS",
+    "TICKER_GROUP_ID",
     "UNIVERSE_RETRY_INITIAL_S",
     "BusStatus",
     "ConnectionStatus",
@@ -116,7 +116,7 @@ __all__ = [
 ]
 
 TICKER_CONN_ID: Final = 0
-"""The live-only connection carrying the unfiltered ``ticker`` channel (ADR 0018)."""
+"""The live-only connection carrying the ``ticker`` channel for the plan's markets (ADR 0027)."""
 
 CONTROL_CONN_ID: Final = 1
 """The taped connection carrying ``market_lifecycle_v2``, which accepts no market filter."""
@@ -127,6 +127,9 @@ FIRST_BOOK_CONN_ID: Final = 2
 TICKER_CHANNEL: Final = "ticker"
 LIFECYCLE_CHANNEL: Final = "market_lifecycle_v2"
 BOOK_CHANNELS: Final = (ORDERBOOK_CHANNEL, "trade")
+
+TICKER_GROUP_ID: Final = "tickers"
+"""``group_id`` of the ticker connection's group, which holds every market of the plan."""
 
 MAX_GROUP_SIZE: Final = 500
 """Most markets on one order-book connection, all in its one subscription (ADR 0020)."""
@@ -147,12 +150,6 @@ DEFAULT_SHUTDOWN_TIMEOUT_S: Final = 30
 
 DEFAULT_KEYFRAME_WRITE_TIMEOUT_S: Final = 60
 """Deadline for writing one keyframe file."""
-
-TICKER_RETENTION_NS: Final = 24 * 3_600 * NS_PER_S
-"""A market's latest ``ticker`` value is forgotten after a day without an update."""
-
-DEFAULT_TICKER_SILENCE_TIMEOUT_S: Final = 60
-"""Seconds without a frame before the live-only ticker connection is declared dead (ADR 0019)."""
 
 UNIVERSE_RETRY_INITIAL_S: Final = 15
 """Nominal wait before retrying a failed universe refresh; it doubles up to the interval."""
@@ -356,13 +353,12 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
         universe: Which markets earn order-book capture.
         max_connections: Ceiling on connections.
         book_connections: Connections carrying order-book groups, one group each.
-        group_size: Most markets on one book connection.
+        group_size: Most markets on one book connection, and in one subscription command on
+            any connection.
         keyframe_interval_s: Seconds between keyframes.
         universe_refresh_s: Seconds between market listings; a failed listing is retried
             sooner, see :func:`universe_retry_delay_s`.
         status_interval_s: Seconds between status log lines and clock-jump checks.
-        ticker_silence_timeout_s: Seconds without a frame before the live-only ticker
-            connection is declared dead; no other connection has a silence timeout.
         max_market_pages: Page cap on one market listing.
         shutdown_timeout_s: Deadline for each shutdown stage.
         keyframe_write_timeout_s: Deadline for writing one keyframe file.
@@ -390,7 +386,6 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_market_pages: int = DEFAULT_MAX_MARKET_PAGES
     shutdown_timeout_s: int = DEFAULT_SHUTDOWN_TIMEOUT_S
     keyframe_write_timeout_s: int = DEFAULT_KEYFRAME_WRITE_TIMEOUT_S
-    ticker_silence_timeout_s: int = DEFAULT_TICKER_SILENCE_TIMEOUT_S
     bus_refresh_s: int = DEFAULT_BUS_REFRESH_S
 
     def __post_init__(self) -> None:
@@ -411,7 +406,6 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
             "max_market_pages",
             "shutdown_timeout_s",
             "keyframe_write_timeout_s",
-            "ticker_silence_timeout_s",
             "bus_refresh_s",
         ):
             value = getattr(self, name)
@@ -471,7 +465,8 @@ class RecorderStatus(msgspec.Struct, frozen=True, kw_only=True):
         connections: Every connection, by ascending id.
         universe_size: Markets the last universe selection chose.
         subscribed_markets: Markets of book connections whose subscriptions are live now.
-        live_tickers: Markets with a latest ``ticker`` value in memory.
+        live_tickers: Markets of the current plan with a latest ``ticker`` value in memory;
+            never more than the plan holds (ADR 0027).
         bus: The bus publisher's counters, or ``None`` when the recorder has no bus.
     """
 
@@ -485,11 +480,11 @@ class RecorderStatus(msgspec.Struct, frozen=True, kw_only=True):
 class SessionBuilder(Protocol):
     """Builds a new, unconnected WebSocket session; sessions are single-use."""
 
-    def __call__(self, url: str, *, conn_id: int, silence_timeout_ns: int | None) -> WsSession:
+    def __call__(self, url: str, *, conn_id: int) -> WsSession:
         """Return a session for ``url`` whose errors name connection ``conn_id``.
 
-        ``silence_timeout_ns`` is the data-silence timeout the recorder chose for this
-        connection, ``None`` for none; the session must honor it.
+        Every connection is built alike: liveness is the transport keepalive, and no
+        session has a data-silence timeout (ADR 0019, ADR 0027).
         """
         ...
 
@@ -589,12 +584,7 @@ class Recorder:
                 self._sinks[conn_id] = sink
             self._supervisors[conn_id] = ConnectionSupervisor(
                 supervisor_config,
-                session_factory=functools.partial(
-                    session_builder,
-                    config.ws_url,
-                    conn_id=conn_id,
-                    silence_timeout_ns=self._silence_timeout_ns(conn_id),
-                ),
+                session_factory=functools.partial(session_builder, config.ws_url, conn_id=conn_id),
                 clock=clock,
                 sleep=sleep,
                 jitter=jitter,
@@ -683,6 +673,9 @@ class Recorder:
     def latest_tickers(self) -> Mapping[str, Ticker]:
         """The latest ``ticker`` value per market from the live-only connection; never taped.
 
+        Only markets of the current plan are held; a market is dropped at the universe
+        refresh that removes it (ADR 0027).
+
         Returns:
             A read-only mapping by market ticker.
         """
@@ -700,8 +693,10 @@ class Recorder:
             stats = supervisor.stats
             sink = self._sinks.get(conn_id)
             group = supervisor.group
-            if group is not None and any(
-                info.group_id == group.group_id for info in supervisor.subscriptions
+            if (
+                conn_id in self._book_conn_ids()
+                and group is not None
+                and any(info.group_id == group.group_id for info in supervisor.subscriptions)
             ):
                 subscribed += len(group.tickers)
             connections.append(
@@ -784,33 +779,33 @@ class Recorder:
     # ------------------------------------------------------------------------ startup
 
     def _layout(self) -> list[SupervisorConfig]:
-        """The supervisor configuration of every connection, by ascending id."""
+        """The supervisor configuration of every connection, by ascending id.
+
+        No command names more than ``group_size`` markets on any connection, so the ticker
+        connection, whose group is the whole plan, reaches it in batches that join one
+        subscription (ADR 0020, ADR 0027).
+        """
+        batch = self._config.group_size
         return [
             SupervisorConfig(
                 conn_id=TICKER_CONN_ID,
-                book_channels=(),
-                firehose_channels=(TICKER_CHANNEL,),
+                group_channels=(TICKER_CHANNEL,),
                 persist=False,
+                max_markets_per_command=batch,
             ),
             SupervisorConfig(
-                conn_id=CONTROL_CONN_ID, book_channels=(), firehose_channels=(LIFECYCLE_CHANNEL,)
+                conn_id=CONTROL_CONN_ID, group_channels=(), firehose_channels=(LIFECYCLE_CHANNEL,)
             ),
             *(
-                SupervisorConfig(conn_id=conn_id, book_channels=BOOK_CHANNELS, use_yes_price=True)
+                SupervisorConfig(
+                    conn_id=conn_id,
+                    group_channels=BOOK_CHANNELS,
+                    use_yes_price=True,
+                    max_markets_per_command=batch,
+                )
                 for conn_id in self._book_conn_ids()
             ),
         ]
-
-    def _silence_timeout_ns(self, conn_id: int) -> int | None:
-        """The data-silence timeout of one connection (ADR 0019).
-
-        Only the unfiltered ticker connection always carries traffic, so only there does
-        silence on a live transport mean a failure. A book connection with no markets yet
-        or a quiet lifecycle channel is healthy, and the keepalive covers a dead peer.
-        """
-        if conn_id == TICKER_CONN_ID:
-            return self._config.ticker_silence_timeout_s * NS_PER_S
-        return None
 
     def _book_conn_ids(self) -> range:
         return range(FIRST_BOOK_CONN_ID, FIRST_BOOK_CONN_ID + self._config.book_connections)
@@ -819,8 +814,9 @@ class Recorder:
         """What one connection's supervisor hands each decoded event to.
 
         The ticker connection's events update the latest-ticker table; with a bus, every
-        connection's events are also published. ``SequencedPublisher.publish`` never raises,
-        and the supervisor would count and log it if it did.
+        connection's events are also published, including ticker updates the table does not
+        keep. ``SequencedPublisher.publish`` never raises, and the supervisor would count and
+        log it if it did.
         """
         bus = self._bus
         if conn_id != TICKER_CONN_ID:
@@ -1141,6 +1137,9 @@ class Recorder:
     async def _refresh_universe(self) -> None:
         """List open markets, select the universe, replan, and hand each connection its group.
 
+        Book connections get their planner groups; the ticker connection gets every market
+        of the plan, and the latest-ticker table drops the markets it no longer carries.
+
         Raises:
             KalshiError: If a listing page cannot be fetched.
             WireError: If a listing page does not decode.
@@ -1163,6 +1162,8 @@ class Recorder:
         }
         for conn_id in self._book_conn_ids():
             await self._supervisors[conn_id].set_group(group_of_conn.get(conn_id))
+        await self._supervisors[TICKER_CONN_ID].set_group(_ticker_group(desired))
+        self._forget_unrecorded_tickers()
         unplaced = decision.l2_tickers - desired.tickers
         if unplaced:
             # Possible only when showcase markets alone exceed the budget, which configuration
@@ -1182,7 +1183,6 @@ class Recorder:
             for group in desired.groups
             for ticker in group.tickers
         }
-        self._forget_old_tickers(now_wall_ns)
         self._log.info(
             "universe refreshed",
             extra={
@@ -1245,14 +1245,24 @@ class Recorder:
             )
         return summaries, truncated
 
+    def _ticker_markets(self) -> frozenset[str]:
+        """Markets the ticker connection is meant to carry: the plan's, as last handed to it."""
+        group = self._supervisors[TICKER_CONN_ID].group
+        return frozenset() if group is None else group.tickers
+
     def _remember_ticker(self, event: MarketEvent) -> None:
-        if isinstance(event, Ticker):
+        """Keep a ticker update as its market's latest value, if the market is recorded.
+
+        An update can still arrive for a market just removed from the subscription, before
+        the exchange applies the removal; it is published, but not kept.
+        """
+        if isinstance(event, Ticker) and event.ticker in self._ticker_markets():
             self._tickers[event.ticker] = event
 
-    def _forget_old_tickers(self, now_wall_ns: int) -> None:
-        """Bound the ticker table to markets heard from within :data:`TICKER_RETENTION_NS`."""
-        cutoff = now_wall_ns - TICKER_RETENTION_NS
-        for ticker in [t for t, e in self._tickers.items() if e.receipt.recv_wall_ns < cutoff]:
+    def _forget_unrecorded_tickers(self) -> None:
+        """Drop the latest values of markets the ticker connection no longer carries."""
+        recorded = self._ticker_markets()
+        for ticker in [t for t in self._tickers if t not in recorded]:
             del self._tickers[ticker]
 
     # --------------------------------------------------------------------- keyframes
@@ -1351,6 +1361,14 @@ class Recorder:
             extra={"component": component, "error": repr(exc)},
             exc_info=exc,
         )
+
+
+def _ticker_group(desired: Plan) -> Group | None:
+    """The ticker connection's market set: every market of the plan, or ``None`` for none."""
+    tickers = desired.tickers
+    if not tickers:
+        return None
+    return Group(group_id=TICKER_GROUP_ID, conn_id=TICKER_CONN_ID, tickers=tickers)
 
 
 def _catalog(decision: UniverseDecision) -> MarketCatalog:

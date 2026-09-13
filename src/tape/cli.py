@@ -863,7 +863,6 @@ def recorder_config(settings: Settings, *, host: str) -> RecorderConfig:
         keyframe_interval_s=recorder.keyframe_interval_s,
         universe_refresh_s=recorder.universe_refresh_s,
         status_interval_s=recorder.status_interval_s,
-        ticker_silence_timeout_s=kalshi.ws_silence_timeout_s,
         bus_refresh_s=recorder.bus_refresh_s,
     )
 
@@ -896,13 +895,12 @@ def build_recorder(
     ping_interval_ns = kalshi.ws_ping_interval_s * NS_PER_S
     ping_timeout_ns = kalshi.ws_ping_timeout_s * NS_PER_S
 
-    def session(url: str, *, conn_id: int, silence_timeout_ns: int | None) -> WsSession:
+    def session(url: str, *, conn_id: int) -> WsSession:
         return WsSession(
             url,
             signer,
             clock,
             conn_id=conn_id,
-            silence_timeout_ns=silence_timeout_ns,
             ping_interval_ns=ping_interval_ns,
             ping_timeout_ns=ping_timeout_ns,
         )

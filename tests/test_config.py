@@ -106,7 +106,6 @@ def test_only_env_and_the_data_dir_are_required_and_everything_else_has_a_defaul
     kalshi = settings.kalshi
     assert kalshi.rest_timeout_s == 10
     assert (kalshi.ws_ping_interval_s, kalshi.ws_ping_timeout_s) == (10, 20)
-    assert kalshi.ws_silence_timeout_s == 60
     assert settings.recorder == RecorderSettings(data_dir=tmp_path / "data")
     recorder = settings.recorder
     assert (recorder.max_connections, recorder.book_connections, recorder.group_size) == (
@@ -228,7 +227,6 @@ def test_environment_overrides_replace_and_add_values(
             "TAPE_KALSHI__PRIVATE_KEY_PATH": str(key),
             "TAPE_KALSHI__WS_PING_INTERVAL_S": "5",
             "TAPE_KALSHI__WS_PING_TIMEOUT_S": "15",
-            "TAPE_KALSHI__WS_SILENCE_TIMEOUT_S": "90",
             "TAPE_RECORDER__GROUP_SIZE": "200",
             "TAPE_RECORDER__BOOK_CONNECTIONS": "10",
             "TAPE_RECORDER__AUDIT_LEAD_MS": "5000",
@@ -247,7 +245,6 @@ def test_environment_overrides_replace_and_add_values(
     assert settings.kalshi.env == "prod"
     assert settings.kalshi.private_key_path == key
     assert (settings.kalshi.ws_ping_interval_s, settings.kalshi.ws_ping_timeout_s) == (5, 15)
-    assert settings.kalshi.ws_silence_timeout_s == 90
     assert (settings.recorder.group_size, settings.recorder.book_connections) == (200, 10)
     recorder = settings.recorder
     assert (recorder.audit_lead_ms, recorder.audit_settle_ms, recorder.audit_tap_max_events) == (
@@ -273,6 +270,10 @@ def test_environment_overrides_replace_and_add_values(
         ({"TAPE_NOPE__X": "1"}, r"there is no setting nope$"),
         ({"TAPE_RECORDER__UNIVERSE": "x"}, r"recorder\.universe is a section, not a setting"),
         ({"TAPE_KALSHI__ENV__X": "1"}, r"kalshi\.env is a setting, not a section"),
+        (
+            {"TAPE_KALSHI__WS_SILENCE_TIMEOUT_S": "60"},
+            r"TAPE_KALSHI__WS_SILENCE_TIMEOUT_S: there is no setting kalshi\.ws_silence_timeout_s$",
+        ),
         (
             {"TAPE_KALSHI__WS_PING_TIMEOUT_S": "61"},
             r"<= 60 - at `\$\.kalshi\.ws_ping_timeout_s` \(environment overrides: "
@@ -316,8 +317,12 @@ def test_an_override_into_a_value_that_is_not_a_table_is_refused(tmp_path: Path)
         (("kalshi", "ws_ping_interval_s"), 61, r"<= 60 - at `\$\.kalshi\.ws_ping_interval_s`"),
         (("kalshi", "ws_ping_timeout_s"), 0, r">= 1 - at `\$\.kalshi\.ws_ping_timeout_s`"),
         (("kalshi", "ws_ping_timeout_s"), 61, r"<= 60 - at `\$\.kalshi\.ws_ping_timeout_s`"),
-        (("kalshi", "ws_silence_timeout_s"), -1, r"at `\$\.kalshi\.ws_silence_timeout_s`"),
-        (("kalshi", "ws_silence_timeout_s"), 0, r">= 1 - at `\$\.kalshi\.ws_silence_timeout_s`"),
+        # Removed by ADR 0027: an old file that still sets it is refused by name.
+        (
+            ("kalshi", "ws_silence_timeout_s"),
+            60,
+            r"unknown field `ws_silence_timeout_s` - at `\$\.kalshi`",
+        ),
         (("recorder", "data_dir"), DELETE, "missing required field `data_dir`"),
         (("recorder", "max_connections"), 3, r"needs 6 connections.*max_connections = 3"),
         (("recorder", "book_connections"), 0, r"at `\$\.recorder\.book_connections`"),
@@ -529,7 +534,6 @@ def test_redacted_shows_identity_paths_and_endpoints_as_json(
         "rest_timeout_s": 10,
         "ws_ping_interval_s": 10,
         "ws_ping_timeout_s": 20,
-        "ws_silence_timeout_s": 60,
         "rest_url": "https://external-api.demo.kalshi.co/trade-api/v2",
         "ws_url": "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
     }

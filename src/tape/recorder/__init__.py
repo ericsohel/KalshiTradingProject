@@ -17,6 +17,7 @@ from tape.recorder.planner import (
     diff,
     group_sort_key,
     plan,
+    split_change,
     to_commands,
 )
 from tape.recorder.universe import (
@@ -67,5 +68,6 @@ __all__ = [
     "group_sort_key",
     "plan",
     "select",
+    "split_change",
     "to_commands",
 ]

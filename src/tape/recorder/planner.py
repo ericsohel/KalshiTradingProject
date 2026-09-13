@@ -4,8 +4,9 @@ Responsibility: decide which markets each order-book connection carries, and pro
 smallest ordered set of commands that turns the assignment the recorder is running into the
 one it wants (ADR 0020, docs/ARCHITECTURE.md 7.1). Kalshi keeps one subscription per channel
 per connection and merges every further ``subscribe`` into it, so a connection's markets are
-one group: one ``subscribe``, then ``update_subscription`` for every membership change. The
-module is pure: no clock, no socket, no state between calls.
+one group: one ``subscribe``, then ``update_subscription`` for every membership change. A
+change naming more markets than one command should carry is split into pieces that reach the
+same subscription. The module is pure: no clock, no socket, no state between calls.
 
 Invariants: a connection carries at most one group; a group holds at most ``max_per_group``
 tickers and is never empty; a ticker belongs to exactly one group; a plan is canonically
@@ -41,6 +42,7 @@ __all__ = [
     "diff",
     "group_sort_key",
     "plan",
+    "split_change",
     "to_commands",
 ]
 
@@ -331,11 +333,52 @@ def _must_rebuild(old: Group, new: Group) -> bool:
     return new.conn_id != old.conn_id or old.tickers.isdisjoint(new.tickers)
 
 
+def split_change(change: PlanChange, *, max_markets: int) -> tuple[PlanChange, ...]:
+    """Split a change so that no command realizing it names more than ``max_markets`` markets.
+
+    A group larger than the limit is subscribed with its first ``max_markets`` tickers in
+    ticker order, and the rest join that subscription through :class:`AddMarkets`, because
+    Kalshi keeps one subscription per channel per connection (ADR 0020). A membership change
+    is cut into consecutive pieces in the order of its tickers. :class:`RemoveGroup` names no
+    markets and is never split.
+
+    Args:
+        change: One change, as :func:`diff` produced it.
+        max_markets: Most markets one command may name.
+
+    Returns:
+        The pieces in the order they must be applied; applying all of them has the same
+        effect as applying ``change``. A change within the limit is returned alone.
+
+    Raises:
+        ValueError: If ``max_markets`` is below one.
+    """
+    if max_markets < 1:
+        raise ValueError(f"max_markets must be at least 1, got {max_markets}")
+    if isinstance(change, RemoveGroup):
+        return (change,)
+    if isinstance(change, AddGroup):
+        tickers = tuple(sorted(change.group.tickers))
+        if len(tickers) <= max_markets:
+            return (change,)
+        first = msgspec.structs.replace(change.group, tickers=frozenset(tickers[:max_markets]))
+        rest = AddMarkets(group_id=first.group_id, tickers=tickers[max_markets:])
+        return (AddGroup(group=first), *split_change(rest, max_markets=max_markets))
+    if isinstance(change, AddMarkets | RemoveMarkets):
+        if len(change.tickers) <= max_markets:
+            return (change,)
+        return tuple(
+            msgspec.structs.replace(change, tickers=change.tickers[start : start + max_markets])
+            for start in range(0, len(change.tickers), max_markets)
+        )
+    assert_never(change)
+
+
 def to_commands(
     changes: Iterable[PlanChange],
     *,
     channels: Sequence[str],
-    use_yes_price: bool,
+    use_yes_price: bool | None,
     sid_of: Mapping[str, tuple[int, ...]],
 ) -> tuple[Command, ...]:
     """Turn plan changes into the WebSocket commands that realize them.
@@ -350,7 +393,8 @@ def to_commands(
         changes: Changes in the order :func:`diff` produced them.
         channels: Channels each new group subscribes, e.g. ``("orderbook_delta",
             "trade")``.
-        use_yes_price: Put both book sides on the YES price scale (ADR 0006).
+        use_yes_price: Put both book sides on the YES price scale (ADR 0006); ``None`` omits
+            the flag, for subscriptions without an orderbook channel.
         sid_of: Every subscription id the server assigned to each group id, one per
             channel.
 

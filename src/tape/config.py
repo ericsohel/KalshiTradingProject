@@ -227,10 +227,8 @@ class KalshiSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_f
         rest_timeout_s: Timeout for each REST request.
         ws_ping_interval_s: Seconds between keepalive pings on every WebSocket (ADR 0019).
         ws_ping_timeout_s: Seconds to wait for a keepalive pong before closing the socket.
-        ws_silence_timeout_s: Seconds without an inbound frame after which the live-only
-            ``ticker`` connection is declared dead. It always carries traffic, so silence
-            there means the subscription stopped; no other connection has this timeout,
-            because a quiet connection is healthy.
+            The keepalive is the only liveness check; no connection has a data-silence
+            timeout, because a quiet connection is healthy (ADR 0019, ADR 0027).
     """
 
     env: Env
@@ -239,7 +237,6 @@ class KalshiSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_f
     rest_timeout_s: PositiveInt = 10
     ws_ping_interval_s: KeepaliveSeconds = 10
     ws_ping_timeout_s: KeepaliveSeconds = 20
-    ws_silence_timeout_s: PositiveInt = 60
 
     @property
     def endpoints(self) -> KalshiEndpoints:

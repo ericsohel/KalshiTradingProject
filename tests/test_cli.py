@@ -208,23 +208,27 @@ async def test_build_recorder_wires_the_environment_and_the_connection_layout(
         assert recorder.config == recorder_config(settings, host="box")
         assert recorder.config.ws_url == ENDPOINTS["demo"].ws_url
         assert recorder.config.universe == settings.recorder.universe.policy()
-        assert recorder.config.ticker_silence_timeout_s == settings.kalshi.ws_silence_timeout_s
         assert recorder.config.bus_refresh_s == settings.recorder.bus_refresh_s
         # No endpoint, no bus.
         assert recorder.status().bus is None
         supervisors = recorder.supervisors
         assert sorted(supervisors) == [0, 1, 2, 3, 4]
-        assert (supervisors[0].config.persist, supervisors[0].config.firehose_channels) == (
+        ticker = supervisors[0].config
+        assert (ticker.persist, ticker.group_channels, ticker.firehose_channels) == (
             False,
             ("ticker",),
+            (),
         )
         assert (supervisors[1].config.persist, supervisors[1].config.firehose_channels) == (
             True,
             ("market_lifecycle_v2",),
         )
+        for conn_id in (0, 2, 3, 4):
+            max_markets = supervisors[conn_id].config.max_markets_per_command
+            assert max_markets == settings.recorder.group_size
         for conn_id in (2, 3, 4):
             config = supervisors[conn_id].config
-            assert config.book_channels == ("orderbook_delta", "trade")
+            assert config.group_channels == ("orderbook_delta", "trade")
             assert config.use_yes_price
         # The auditor is wired in, on the configured interval.
         (task,) = recorder.periodic_tasks
@@ -233,7 +237,7 @@ async def test_build_recorder_wires_the_environment_and_the_connection_layout(
         await recorder.stop()
 
 
-async def test_build_recorder_gives_every_session_the_keepalive_and_the_chosen_silence(
+async def test_build_recorder_gives_every_session_the_keepalive_and_no_silence_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     built: list[dict[str, object]] = []
@@ -259,12 +263,14 @@ async def test_build_recorder_gives_every_session_the_keepalive_and_the_chosen_s
         build_recorder(settings, http=http, clock=FrozenClock(), host="box")
     (builder,) = builders
     assert callable(builder)
-    builder("wss://x", conn_id=0, silence_timeout_ns=60 * NS_PER_S)
-    builder("wss://x", conn_id=2, silence_timeout_ns=None)
+    builder("wss://x", conn_id=0)
+    builder("wss://x", conn_id=2)
+    # The live-only ticker connection is built like every other (ADR 0027): the session's
+    # default leaves data silence unchecked.
     keepalive = {"ping_interval_ns": 7 * NS_PER_S, "ping_timeout_ns": 9 * NS_PER_S}
     assert built == [
-        {"url": "wss://x", "conn_id": 0, "silence_timeout_ns": 60 * NS_PER_S, **keepalive},
-        {"url": "wss://x", "conn_id": 2, "silence_timeout_ns": None, **keepalive},
+        {"url": "wss://x", "conn_id": 0, **keepalive},
+        {"url": "wss://x", "conn_id": 2, **keepalive},
     ]
 
 

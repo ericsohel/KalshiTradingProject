@@ -17,19 +17,18 @@ key_id = "REPLACE-WITH-YOUR-READ-KEY-ID"
 private_key_path = "~/.config/tape/keys/prod-read.pem"
 rest_timeout_s = 10
 # Every WebSocket pings every ws_ping_interval_s and is closed when no pong arrives
-# within ws_ping_timeout_s; each is at most 60 (ADR 0019).
+# within ws_ping_timeout_s; each is at most 60. That is the only liveness check: a quiet
+# connection is healthy (ADR 0019, ADR 0027).
 ws_ping_interval_s = 10
 ws_ping_timeout_s = 20
-# Only the live-only ticker connection, which always carries traffic, is also closed
-# after this many seconds without a frame; quiet connections are healthy.
-ws_silence_timeout_s = 60
 
 [recorder]
 data_dir = "data"
 # One live-only ticker connection + one control connection + book_connections.
 max_connections = 16
 # Each book connection carries at most group_size (at most 500) markets in one subscription
-# per channel (ADR 0020), so book_connections * group_size must cover max_l2_markets.
+# per channel (ADR 0020), so book_connections * group_size must cover max_l2_markets. The
+# live-only ticker connection subscribes every recorded market, group_size per command (ADR 0027).
 book_connections = 4
 group_size = 500
 # Whole minutes that divide an hour.

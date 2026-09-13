@@ -966,20 +966,28 @@ async def test_a_firehose_connection_subscribes_every_market_once(tmp_path: Path
     async with (
         FakeKalshiWs() as fake,
         recording(
-            fake.url, tmp_path, book_channels=(), firehose_channels=("ticker",), persist=False
+            fake.url,
+            tmp_path,
+            group_channels=(),
+            firehose_channels=("market_lifecycle_v2",),
+            persist=False,
         ) as harness,
     ):
         harness.start()
         connection = await fake.wait_for_connection()
         commands = await connection.wait_for_commands(1)
-        assert commands == [{"id": 1, "cmd": "subscribe", "params": {"channels": ["ticker"]}}]
+        assert commands == [
+            {"id": 1, "cmd": "subscribe", "params": {"channels": ["market_lifecycle_v2"]}}
+        ]
         await until(lambda: len(harness.supervisor.subscriptions) == 1)
         assert harness.supervisor.subscriptions == (
-            SubscriptionInfo(sid=1, channel="ticker", group_id=FIREHOSE_GROUP_ID),
+            SubscriptionInfo(sid=1, channel="market_lifecycle_v2", group_id=FIREHOSE_GROUP_ID),
         )
-        await connection.push_message("ticker", {"market_ticker": "KXB-9", "ts_ms": 5}, sid=1)
-        await until(lambda: harness.count(Ticker) == 1)
-        with pytest.raises(ValueError, match="no book channels"):
+        await connection.push_sequenced(
+            "market_lifecycle_v2", {"event_type": "activated", "market_ticker": "KXB-9"}, sid=1
+        )
+        await until(lambda: harness.count(Lifecycle) == 1)
+        with pytest.raises(ValueError, match="no group channels"):
             await harness.supervisor.set_group(GROUP)
 
 
@@ -988,7 +996,7 @@ async def test_a_refused_firehose_subscribe_is_asked_again_on_the_next_change(
 ) -> None:
     async with (
         FakeKalshiWs() as fake,
-        recording(fake.url, tmp_path, firehose_channels=("ticker",)) as harness,
+        recording(fake.url, tmp_path, firehose_channels=("market_lifecycle_v2",)) as harness,
     ):
         harness.start()
         connection = await fake.wait_for_connection()
@@ -999,10 +1007,114 @@ async def test_a_refused_firehose_subscribe_is_asked_again_on_the_next_change(
         await harness.supervisor.set_group(GROUP)
         commands = await connection.wait_for_commands(3)
         assert [command["params"]["channels"] for command in commands] == [
-            ["ticker"],
-            ["ticker"],
+            ["market_lifecycle_v2"],
+            ["market_lifecycle_v2"],
             ["orderbook_delta", "trade"],
         ]
+
+
+def ticker_group(*tickers: str) -> Group:
+    return Group(group_id="tickers", conn_id=CONN_ID, tickers=frozenset(tickers))
+
+
+TICKER_ONLY: dict[str, Any] = {  # Any: SupervisorConfig field values of several types
+    "group_channels": ("ticker",),
+    "persist": False,
+    "max_markets_per_command": 2,
+}
+"""A live-only ticker connection whose commands name at most two markets (ADR 0027)."""
+
+
+async def test_a_ticker_group_reaches_one_subscription_in_batches_and_keeps_no_books(
+    tmp_path: Path,
+) -> None:
+    tickers = [f"KXT-{index}" for index in range(1, 6)]
+    async with FakeKalshiWs() as fake, recording(fake.url, tmp_path, **TICKER_ONLY) as harness:
+        await harness.supervisor.set_group(ticker_group(*tickers))
+        harness.start()
+        connection = await fake.wait_for_connection()
+        commands = await connection.wait_for_commands(3)
+        # No use_yes_price: the flag is for orderbook channels only.
+        assert [(c["cmd"], c["params"]) for c in commands] == [
+            ("subscribe", {"channels": ["ticker"], "market_tickers": tickers[:2]}),
+            (
+                "update_subscription",
+                {"sid": 1, "action": "add_markets", "market_tickers": tickers[2:4]},
+            ),
+            (
+                "update_subscription",
+                {"sid": 1, "action": "add_markets", "market_tickers": tickers[4:]},
+            ),
+        ]
+        assert connection.subscriptions == {1: {"channel": "ticker", "market_tickers": tickers}}
+        assert harness.supervisor.subscriptions == (
+            SubscriptionInfo(sid=1, channel="ticker", group_id="tickers"),
+        )
+        await connection.push_message("ticker", {"market_ticker": "KXT-5", "ts_ms": 5}, sid=1)
+        await until(lambda: harness.count(Ticker) == 1)
+
+        # Shrinking and growing at once: removals first, each command within the limit.
+        await harness.supervisor.set_group(ticker_group("KXT-1", "KXT-4", "KXT-6"))
+        commands = await connection.wait_for_commands(6)
+        assert [c["params"] for c in commands[3:]] == [
+            {"sid": 1, "action": "delete_markets", "market_tickers": ["KXT-2", "KXT-3"]},
+            {"sid": 1, "action": "delete_markets", "market_tickers": ["KXT-5"]},
+            {"sid": 1, "action": "add_markets", "market_tickers": ["KXT-6"]},
+        ]
+        assert connection.subscriptions == {
+            1: {"channel": "ticker", "market_tickers": ["KXT-1", "KXT-4", "KXT-6"]}
+        }
+        stats = harness.supervisor.stats
+        assert (dict(harness.supervisor.books), stats.snapshots_requested, stats.gaps) == ({}, 0, 0)
+
+
+async def test_markets_beyond_the_first_batch_wait_for_the_subscribe_s_reply(
+    tmp_path: Path,
+) -> None:
+    async with FakeKalshiWs() as fake, recording(fake.url, tmp_path, **TICKER_ONLY) as harness:
+        harness.start()
+        connection = await fake.wait_for_connection()
+        connection.go_silent()
+        await harness.supervisor.set_group(ticker_group("KXT-1", "KXT-2", "KXT-3"))
+        await connection.wait_for_commands(1)
+        # A second change while the subscribe awaits its sid is deferred, not half sent.
+        await harness.supervisor.set_group(ticker_group("KXT-1", "KXT-2", "KXT-3", "KXT-4"))
+        await connection.push(b'{"id":1,"type":"subscribed","msg":{"channel":"ticker","sid":1}}')
+        await until(lambda: len(harness.supervisor.subscriptions) == 1)
+        commands = await connection.wait_for_commands(2)
+        assert commands[1]["params"] == {
+            "sid": 1,
+            "action": "add_markets",
+            "market_tickers": ["KXT-3", "KXT-4"],
+        }
+        assert harness.supervisor.stats.errors_by_code == {}
+
+
+async def test_a_reconnect_resubscribes_the_current_ticker_group_in_batches(
+    tmp_path: Path,
+) -> None:
+    async with FakeKalshiWs() as fake, recording(fake.url, tmp_path, **TICKER_ONLY) as harness:
+        await harness.supervisor.set_group(ticker_group("KXT-1", "KXT-2", "KXT-3"))
+        harness.start()
+        first = await fake.wait_for_connection()
+        await first.wait_for_commands(2)
+        await harness.supervisor.set_group(ticker_group("KXT-2", "KXT-3", "KXT-4"))
+        await first.wait_for_commands(4)
+
+        await first.close_abruptly()
+        second = await fake.wait_for_connection(1)
+        commands = await second.wait_for_commands(2)
+        assert [(c["cmd"], c["params"]) for c in commands] == [
+            ("subscribe", {"channels": ["ticker"], "market_tickers": ["KXT-2", "KXT-3"]}),
+            (
+                "update_subscription",
+                {"sid": 1, "action": "add_markets", "market_tickers": ["KXT-4"]},
+            ),
+        ]
+        assert second.subscriptions == {
+            1: {"channel": "ticker", "market_tickers": ["KXT-2", "KXT-3", "KXT-4"]}
+        }
+        assert harness.supervisor.stats.reconnects == 1
 
 
 async def test_a_failing_consumer_is_counted_and_recording_continues(tmp_path: Path) -> None:
@@ -1061,12 +1173,13 @@ def test_a_sink_is_required_exactly_when_persisting(tmp_path: Path) -> None:
     ("overrides", "match"),
     [
         ({"conn_id": -1}, "conn_id"),
-        ({"book_channels": ()}, "channels"),
+        ({"group_channels": ()}, "channels"),
+        ({"max_markets_per_command": 0}, "max_markets_per_command must be positive"),
         ({"backoff_initial_ns": 0}, "backoff"),
         ({"backoff_max_ns": 1}, "backoff"),
         ({"max_consecutive_failures": -1}, "max_consecutive_failures"),
         ({"subscribe_timeout_ns": 0}, "subscribe_timeout_ns must be positive"),
-        ({"firehose_channels": ("trade",)}, r"\['trade'\] are both book and firehose"),
+        ({"firehose_channels": ("trade",)}, r"\['trade'\] are both group and firehose"),
     ],
 )
 def test_config_rejects_what_cannot_work(overrides: dict[str, Any], match: str) -> None:

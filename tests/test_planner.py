@@ -20,6 +20,7 @@ from tape.recorder import (
     diff,
     group_sort_key,
     plan,
+    split_change,
     to_commands,
 )
 
@@ -239,6 +240,32 @@ def test_to_commands_needs_a_channel() -> None:
         to_commands([], channels=(), use_yes_price=True, sid_of={})
 
 
+def test_to_commands_omits_the_yes_price_flag_when_told_to() -> None:
+    (command,) = to_commands(
+        [AddGroup(group=group(["a"]))], channels=("ticker",), use_yes_price=None, sid_of={}
+    )
+    assert command == SubscribeCommand(channels=("ticker",), market_tickers=("a",))
+
+
+def test_split_change_subscribes_a_large_group_with_its_first_batch_and_adds_the_rest() -> None:
+    large = group(["e", "a", "d", "c", "b"], group_id="g")
+    assert split_change(AddGroup(group=large), max_markets=2) == (
+        AddGroup(group=group(["a", "b"], group_id="g")),
+        AddMarkets(group_id="g", tickers=("c", "d")),
+        AddMarkets(group_id="g", tickers=("e",)),
+    )
+    assert split_change(RemoveMarkets(group_id="g", tickers=("a", "b", "c")), max_markets=2) == (
+        RemoveMarkets(group_id="g", tickers=("a", "b")),
+        RemoveMarkets(group_id="g", tickers=("c",)),
+    )
+    within = AddMarkets(group_id="g", tickers=("a", "b"))
+    assert split_change(within, max_markets=2) == (within,)
+    assert split_change(AddGroup(group=large), max_markets=5) == (AddGroup(group=large),)
+    assert split_change(RemoveGroup(group_id="g"), max_markets=1) == (RemoveGroup(group_id="g"),)
+    with pytest.raises(ValueError, match="max_markets must be at least 1"):
+        split_change(within, max_markets=0)
+
+
 # ------------------------------------------------------------------ properties
 
 universes = st.frozensets(st.text(alphabet="abcdefghij", min_size=1, max_size=2), max_size=40)
@@ -341,6 +368,43 @@ def test_applying_the_diff_yields_exactly_the_desired_plan(
         commands = to_commands(changes, channels=CHANNELS, use_yes_price=True, sid_of=sid_of)
         membership = sum(isinstance(c, AddMarkets | RemoveMarkets) for c in changes)
         assert len(commands) == len(changes) + membership * (width - 1)
+
+
+def markets_named(change: PlanChange) -> int:
+    """How many markets the command realizing a change names."""
+    if isinstance(change, AddGroup):
+        return len(change.group.tickers)
+    if isinstance(change, RemoveGroup):
+        return 0
+    return len(change.tickers)
+
+
+@given(
+    first=universes,
+    second=universes,
+    cap=caps,
+    conns=connection_counts,
+    limit=st.integers(1, 4),
+)
+@settings(max_examples=300)
+def test_split_changes_stay_within_the_limit_and_apply_like_the_changes_they_split(
+    *,
+    first: frozenset[str],
+    second: frozenset[str],
+    cap: int,
+    conns: int,
+    limit: int,
+) -> None:
+    current = plan(first, max_per_group=cap, max_connections=conns)
+    desired = plan(second, max_per_group=cap, max_connections=conns, previous=current)
+    for source, target in ((current, desired), (desired, current)):
+        pieces = [
+            piece
+            for change in diff(source, target)
+            for piece in split_change(change, max_markets=limit)
+        ]
+        assert all(markets_named(piece) <= limit for piece in pieces)
+        assert apply(pieces, source, max_per_group=cap) == target
 
 
 @given(

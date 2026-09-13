@@ -5,8 +5,12 @@ Responsibility: own the life of one WebSocket connection for the recorder
 the segment sink before anything parses it (ADR 0001); then its envelope is read and its
 sequence number checked per ``sid``; only then is the payload decoded into books and
 events. Kalshi keeps one subscription per channel per connection and merges every further
-``subscribe`` into it (ADR 0020), so a book connection subscribes its channels once, for its
-whole market set, and changes membership with ``update_subscription``. An ``ok`` reply to a
+``subscribe`` into it (ADR 0020), so a connection subscribes its group channels once, for its
+whole market set, and changes membership with ``update_subscription``. Books are kept only
+for ``orderbook_delta``; a group on ``ticker`` alone, as on the live-only ticker connection
+(ADR 0027), yields events and no books. No command names more than
+``max_markets_per_command`` markets: a larger group is subscribed with its first batch, and
+the rest join that subscription once its ``sid``s are known. An ``ok`` reply to a
 ``subscribe`` is such a merge and is bound to the existing ``sid``; a subscribe left without
 a reply for any channel past its deadline fails the connection. A sequence gap on a book
 subscription is written into the tape, every book of the connection is marked stale, and a
@@ -22,10 +26,12 @@ decoder can never lose a frame; a book is touched only by a frame on an orderboo
 subscription of the current connection for a market in the connection's market set, and it
 leaves the stale state only through such a snapshot; the subscription table holds only
 ``sid``s the current connection assigned; a membership change is sent to every ``sid`` of the
-group, and never while a subscribe still awaits a reply; no subscribe awaits a reply longer
-than ``subscribe_timeout_ns`` on a live connection; the reconnect loop ends on
-:meth:`ConnectionSupervisor.stop` or after ``max_consecutive_failures``; and the module
-sleeps, draws randomness, and reads time only through what was injected.
+group, and never while a subscribe still awaits a reply; at most one subscribe awaits replies
+at a time for the group; no command names more than ``max_markets_per_command`` markets; no
+subscribe awaits a reply longer than ``subscribe_timeout_ns`` on a live connection; the
+reconnect loop ends on :meth:`ConnectionSupervisor.stop` or after
+``max_consecutive_failures``; and the module sleeps, draws randomness, and reads time only
+through what was injected.
 """
 
 from __future__ import annotations
@@ -69,6 +75,7 @@ from tape.recorder.planner import (
     RemoveGroup,
     RemoveMarkets,
     diff,
+    split_change,
     to_commands,
 )
 from tape.recorder.tap import BookChange, LiveBookTap
@@ -98,6 +105,7 @@ __all__ = [
     "CAPACITY_ERROR_CODES",
     "DEFAULT_BACKOFF_INITIAL_NS",
     "DEFAULT_BACKOFF_MAX_NS",
+    "DEFAULT_MAX_MARKETS_PER_COMMAND",
     "DEFAULT_SUBSCRIBE_TIMEOUT_NS",
     "FIREHOSE_GROUP_ID",
     "MAX_RECENT_ERRORS",
@@ -123,6 +131,9 @@ DEFAULT_BACKOFF_MAX_NS: Final = 30 * NS_PER_S
 
 DEFAULT_SUBSCRIBE_TIMEOUT_NS: Final = 10 * NS_PER_S
 """How long a subscribe may wait for a reply on every channel before the connection fails."""
+
+DEFAULT_MAX_MARKETS_PER_COMMAND: Final = 500
+"""Most markets one subscribe or ``update_subscription`` names: the order-book group cap."""
 
 MAX_RECENT_ERRORS: Final = 64
 """Error frames kept in :attr:`ConnectionSupervisor.last_errors`; older ones are only counted."""
@@ -169,14 +180,18 @@ class SupervisorConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     Attributes:
         conn_id: Connection id; the group given to the supervisor must carry it.
-        book_channels: Channels the connection's group subscribes, one ``sid`` each.
+        group_channels: Channels the connection's group subscribes, one ``sid`` each. Books
+            are kept for ``orderbook_delta`` only, so ``("ticker",)`` yields ticker events
+            for the group's markets and no books.
         firehose_channels: Channels subscribed once per connection with no market filter,
-            for example ``("ticker",)`` on the control connection. A :class:`Group` cannot
-            express "every market", so these live outside the group.
+            for example ``("market_lifecycle_v2",)``, which accepts none. A :class:`Group`
+            cannot express "every market", so these live outside the group.
         use_yes_price: Request YES-leg prices for both book sides and convert accordingly
-            (ADR 0006).
+            (ADR 0006). Sent only when the group channels include ``orderbook_delta``.
         persist: Write frames, commands, gaps, and connection events to the sink. When
             false the connection is live-only: decoded and published, never written.
+        max_markets_per_command: Most markets one subscribe or ``update_subscription``
+            names; a larger change is sent as several commands on the same subscription.
         backoff_initial_ns: Nominal delay after the first consecutive failure.
         backoff_max_ns: Cap on the nominal delay.
         max_consecutive_failures: Failures in a row tolerated before :meth:`run` raises;
@@ -186,15 +201,17 @@ class SupervisorConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     Raises:
         ValueError: On a negative ``conn_id``, no channels at all, a channel that is both a
-            book and a firehose channel, a non-positive initial backoff or subscribe
-            timeout, a backoff cap below the initial backoff, or a negative failure limit.
+            group and a firehose channel, a non-positive market limit, initial backoff, or
+            subscribe timeout, a backoff cap below the initial backoff, or a negative
+            failure limit.
     """
 
     conn_id: int
-    book_channels: tuple[str, ...] = (ORDERBOOK_CHANNEL, "trade")
+    group_channels: tuple[str, ...] = (ORDERBOOK_CHANNEL, "trade")
     firehose_channels: tuple[str, ...] = ()
     use_yes_price: bool = True
     persist: bool = True
+    max_markets_per_command: int = DEFAULT_MAX_MARKETS_PER_COMMAND
     backoff_initial_ns: int = DEFAULT_BACKOFF_INITIAL_NS
     backoff_max_ns: int = DEFAULT_BACKOFF_MAX_NS
     max_consecutive_failures: int | None = None
@@ -203,14 +220,18 @@ class SupervisorConfig(msgspec.Struct, frozen=True, kw_only=True):
     def __post_init__(self) -> None:
         if self.conn_id < 0:
             raise ValueError(f"conn_id must be non-negative, got {self.conn_id}")
-        if not self.book_channels and not self.firehose_channels:
-            raise ValueError("a connection needs book_channels or firehose_channels")
-        shared = set(self.book_channels) & set(self.firehose_channels)
+        if not self.group_channels and not self.firehose_channels:
+            raise ValueError("a connection needs group_channels or firehose_channels")
+        shared = set(self.group_channels) & set(self.firehose_channels)
         if shared:
             # Kalshi would merge the filtered and unfiltered subscriptions into one (ADR 0020).
             raise ValueError(
-                f"channels {sorted(shared)} are both book and firehose channels; a connection "
+                f"channels {sorted(shared)} are both group and firehose channels; a connection "
                 f"holds one subscription per channel"
+            )
+        if self.max_markets_per_command <= 0:
+            raise ValueError(
+                f"max_markets_per_command must be positive, got {self.max_markets_per_command}"
             )
         if self.backoff_initial_ns <= 0 or self.backoff_max_ns < self.backoff_initial_ns:
             raise ValueError(
@@ -462,7 +483,7 @@ class ConnectionSupervisor:
 
         Raises:
             ValueError: If the group belongs to another connection, or is given to a
-                connection without book channels.
+                connection without group channels.
         """
         if group is not None:
             if group.conn_id != self._config.conn_id:
@@ -470,8 +491,8 @@ class ConnectionSupervisor:
                     f"group {group.group_id} is for connection {group.conn_id}, "
                     f"not {self._config.conn_id}"
                 )
-            if not self._config.book_channels:
-                raise ValueError(f"connection {self._config.conn_id} has no book channels")
+            if not self._config.group_channels:
+                raise ValueError(f"connection {self._config.conn_id} has no group channels")
         self._desired = group
         async with self._command_lock:
             session = self._session
@@ -910,7 +931,8 @@ class ConnectionSupervisor:
 
         Call with the command lock held. While any subscribe still awaits a reply the work
         is deferred until the last one arrives, because a membership change sent then would
-        miss the channel whose ``sid`` is still unknown.
+        miss the channel whose ``sid`` is still unknown. For the same reason the markets of
+        a group too large for one subscribe wait for that subscribe's replies.
 
         Raises:
             WsClosedError: If the connection closes while sending.
@@ -927,20 +949,29 @@ class ConnectionSupervisor:
             self._firehose_requested = True
             command_id = await self._send(session, SubscribeCommand(channels=firehose))
             self._await_replies(command_id, FIREHOSE_GROUP_ID, firehose)
+        channels = self._config.group_channels
+        use_yes_price = self._config.use_yes_price if ORDERBOOK_CHANNEL in channels else None
+        limit = self._config.max_markets_per_command
         for change in diff(_plan_of(self._applied), _plan_of(self._desired)):
-            commands = to_commands(
-                (change,),
-                channels=self._config.book_channels,
-                use_yes_price=self._config.use_yes_price,
-                sid_of=self._sid_of(),
-            )
-            for command in commands:
-                command_id = await self._send(session, command)
-                if isinstance(change, AddGroup):
-                    self._await_replies(
-                        command_id, change.group.group_id, self._config.book_channels
-                    )
-            self._record_change(change)
+            for piece in split_change(change, max_markets=limit):
+                if isinstance(piece, AddMarkets | RemoveMarkets) and self._subscribing(
+                    piece.group_id
+                ):
+                    # Resumed by the last reply, from the applied group, not from this diff.
+                    self._reconcile_deferred = True
+                    return
+                commands = to_commands(
+                    (piece,), channels=channels, use_yes_price=use_yes_price, sid_of=self._sid_of()
+                )
+                for command in commands:
+                    command_id = await self._send(session, command)
+                    if isinstance(piece, AddGroup):
+                        self._await_replies(command_id, piece.group.group_id, channels)
+                self._record_change(piece)
+
+    def _subscribing(self, group_id: str) -> bool:
+        """Whether a subscribe for the group still awaits a reply on some channel."""
+        return any(pending.group_id == group_id for pending in self._pending.values())
 
     def _record_change(self, change: PlanChange) -> None:
         """Update the applied group once a change's commands are on the wire."""

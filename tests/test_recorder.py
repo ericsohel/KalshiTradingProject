@@ -41,6 +41,7 @@ from tape.events import (
     ConnectionReport,
     GapEvent,
     Level,
+    Lifecycle,
     MarketCatalog,
     Side,
     StatusReport,
@@ -49,7 +50,11 @@ from tape.events import (
 from tape.fixedpoint import CountE2, PriceE4
 from tape.recorder.recorder import (
     CLOCK_JUMP_THRESHOLD_NS,
+    CLOSE_TICK_DELAY_S,
     CONTROL_CONN_ID,
+    FIRST_BOOK_CONN_ID,
+    RELIST_DEBOUNCE_S,
+    RELIST_MIN_INTERVAL_S,
     TICKER_CONN_ID,
     TICKER_GROUP_ID,
     BusStatus,
@@ -95,7 +100,13 @@ PROBE: Final = b"ctl.probe"
 """Topic of the messages a test publishes to learn that its bus subscriber has connected."""
 
 
-def market(ticker: str, volume: str, *, status: str = "active") -> dict[str, object]:
+def market(
+    ticker: str,
+    volume: str,
+    *,
+    status: str = "active",
+    close_time: str = "2026-12-31T00:00:00Z",
+) -> dict[str, object]:
     return {
         "ticker": ticker,
         "event_ticker": ticker.rsplit("-", 1)[0],
@@ -105,8 +116,8 @@ def market(ticker: str, volume: str, *, status: str = "active") -> dict[str, obj
         "created_time": "2026-01-01T00:00:00Z",
         "updated_time": "2026-01-01T00:00:00Z",
         "open_time": "2026-01-01T00:00:00Z",
-        "close_time": "2026-12-31T00:00:00Z",
-        "latest_expiration_time": "2026-12-31T00:00:00Z",
+        "close_time": close_time,
+        "latest_expiration_time": close_time,
         "settlement_timer_seconds": 60,
         "status": status,
         "notional_value_dollars": "1.0000",
@@ -171,13 +182,15 @@ class RecordingLimiter:
 
 
 class FakeRest:
-    """Canned REST answers by path; a queue serves in order, then repeats its last answer."""
+    """Canned REST answers by path, and for a ``/markets`` listing filtered by series by that
+    series; a queue serves in order, then repeats its last answer."""
 
     def __init__(self, markets: Sequence[Mapping[str, object]]) -> None:
         self.requests: list[httpx.Request] = []
         # A path listed here answers only once its event is set, so a test can hold a request
         # in flight, for example a universe refresh that a shutdown catches mid-listing.
         self.holds: dict[str, asyncio.Event] = {}
+        self.series_answers: dict[str, list[httpx.Response]] = {}
         self.answers: dict[str, list[httpx.Response]] = {
             "/exchange/status": [
                 httpx.Response(200, json={"exchange_active": True, "trading_active": True})
@@ -203,8 +216,18 @@ class FakeRest:
         hold = self.holds.get(path)
         if hold is not None:
             await hold.wait()
-        queue = self.answers[path]
+        series = request.url.params.get("series_ticker")
+        queue = self.answers[path] if series is None else self.series_answers[series]
         return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    def listings(self, series: str | None = None) -> int:
+        """``/markets`` requests so far: full listings, or those filtered by ``series``."""
+        return sum(
+            1
+            for request in self.requests
+            if request.url.path.endswith("/markets")
+            and request.url.params.get("series_ticker") == series
+        )
 
 
 class HostClock:
@@ -1533,3 +1556,351 @@ async def test_a_bus_consumer_rebuilds_the_recorder_s_books_through_loss_and_ref
     finally:
         subscriber.close()
         await asyncio.wait_for(consuming, timeout=5)
+
+
+# ------------------------------------------------------------- reacting to closes (ADR 0029)
+
+NOON_S: Final = NOON // NS_PER_S
+HOURLY: Final = "KXHOUR"
+CLOSING_POLICY: Final = UniversePolicy(
+    min_volume_24h=CountE2(100_000),
+    max_l2_markets=4,
+    groups=(
+        UniverseGroup(name="hourly", series=(HOURLY,), events=1, markets_per_event=1),
+        UniverseGroup(name="busiest", category=TEST_CATEGORY, events=1, markets_per_event=2),
+    ),
+)
+"""The nearest hourly event's one market, then the two busiest markets of the ``KXA`` event."""
+
+
+def closing(ticker: str, volume: str, *, after_s: int) -> dict[str, object]:
+    """A listed market that closes ``after_s`` seconds after noon."""
+    moment = datetime.fromtimestamp(NOON_S + after_s, tz=UTC)
+    return market(ticker, volume, close_time=f"{moment:%Y-%m-%dT%H:%M:%SZ}")
+
+
+HOUR_12: Final = closing("KXHOUR-26SEP1012-T1", "10.00", after_s=60)
+HOUR_13: Final = closing("KXHOUR-26SEP1013-T1", "10.00", after_s=3_600)
+HOUR_14: Final = closing("KXHOUR-26SEP1014-T1", "10.00", after_s=7_200)
+CLOSING_MARKETS: Final = (
+    HOUR_12,
+    HOUR_13,
+    closing("KXA-1", "5000.00", after_s=120),
+    market("KXA-2", "4000.00"),
+    market("KXA-3", "3000.00"),
+)
+"""At noon the universe is ``KXHOUR-26SEP1012-T1``, closing a minute later, ``KXA-1``, closing
+two minutes later, and ``KXA-2``; ``KXA-3`` is one market too many for its event."""
+
+
+def planned(recorder: Recorder) -> frozenset[str]:
+    """Every market the book connections are meant to carry."""
+    groups = [
+        supervisor.group
+        for conn_id, supervisor in recorder.supervisors.items()
+        if conn_id >= FIRST_BOOK_CONN_ID
+    ]
+    return frozenset(ticker for group in groups if group is not None for ticker in group.tickers)
+
+
+async def push_lifecycle(
+    control: FakeConnection, event_type: str, ticker: str, **fields: object
+) -> None:
+    await control.push_sequenced(
+        "market_lifecycle_v2", {"event_type": event_type, "market_ticker": ticker, **fields}, sid=1
+    )
+
+
+async def sleeps_again(harness: Harness, seconds: float, *, since: int) -> None:
+    """Wait until the universe loop, woken by an event, parks again for ``seconds``."""
+    time = harness.time
+    await until(
+        lambda: (
+            len(time.requested) > since
+            and time.requested[-1] == seconds
+            and time.sleepers == harness.loops
+        )
+    )
+
+
+async def test_a_close_leaves_the_plan_at_its_tick_and_only_its_series_group_is_listed_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, markets=CLOSING_MARKETS, universe=CLOSING_POLICY) as harness,
+    ):
+        recorder = harness.recorder
+        harness.rest.series_answers[HOURLY] = listing(HOUR_13)
+        harness.start()
+        books = [await harness.connection(fake, conn_id) for conn_id in (2, 3)]
+        await harness.subscribed(2, 3)
+        await harness.parked()
+        assert planned(recorder) == {"KXHOUR-26SEP1012-T1", "KXA-1", "KXA-2"}
+        # The loop waits for the first close and a few seconds, not for the next full refresh.
+        assert 60 + CLOSE_TICK_DELAY_S in harness.time.requested
+
+        harness.time.advance(60 + CLOSE_TICK_DELAY_S - 1)
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == 0
+        harness.time.advance(1)
+        await until(lambda: planned(recorder) == {"KXHOUR-26SEP1013-T1", "KXA-1", "KXA-2"})
+        await harness.parked()
+        deleted = [
+            command["params"]["market_tickers"]
+            for connection in books
+            for command in connection.commands
+            if command["params"].get("action") == "delete_markets"
+        ]
+        # One command per channel of the book subscription the market was on.
+        assert deleted == 2 * [["KXHOUR-26SEP1012-T1"]]
+        assert (harness.rest.listings(), harness.rest.listings(HOURLY)) == (1, 1)
+        (relisting,) = [r for r in harness.rest.requests if "series_ticker" in r.url.params]
+        assert dict(relisting.url.params) == {
+            "series_ticker": HOURLY,
+            "status": "open",
+            "limit": "1000",
+            "mve_filter": "exclude",
+        }
+
+        # A category group's market leaves at its close too, and nothing takes its place.
+        harness.time.advance(60)
+        await until(lambda: "KXA-1" not in planned(recorder))
+        await harness.parked()
+        assert planned(recorder) == {"KXHOUR-26SEP1013-T1", "KXA-2"}
+        assert (harness.rest.listings(), harness.rest.listings(HOURLY)) == (1, 1)
+        universe = recorder.universe
+        assert universe is not None
+        assert universe.group_of == {"KXHOUR-26SEP1013-T1": "hourly", "KXA-2": "busiest"}
+
+        # Until the full refresh, 300 seconds after the one at startup.
+        harness.time.advance(300 - 123)
+        await until(lambda: "KXA-3" in planned(recorder))
+        assert planned(recorder) == {"KXHOUR-26SEP1013-T1", "KXA-2", "KXA-3"}
+        assert harness.rest.listings() == 2
+
+    first, second = logged(caplog, "closed markets removed from the universe")
+    assert (first.__dict__["closed"], first.__dict__["relisting"]) == (
+        ["KXHOUR-26SEP1012-T1"],
+        ["hourly"],
+    )
+    assert (second.__dict__["closed"], second.__dict__["relisting"]) == (["KXA-1"], [])
+    assert second.__dict__["groups"]["busiest"] == {
+        "admitted": 1,
+        "events": 1,
+        "skipped_for_budget": 0,
+    }
+    (relisted,) = logged(caplog, "universe groups re-listed")
+    fields = relisted.__dict__
+    assert (fields["relisted"], fields["series"], fields["listed"]) == (["hourly"], [HOURLY], 1)
+    assert (fields["added"], fields["removed"], fields["selected"]) == (
+        ["KXHOUR-26SEP1013-T1"],
+        [],
+        3,
+    )
+
+
+async def test_lifecycle_events_tick_at_once_and_new_markets_are_listed_after_a_debounce(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, markets=CLOSING_MARKETS, universe=CLOSING_POLICY) as harness,
+    ):
+        recorder = harness.recorder
+        # The first re-listing still shows the determined market open; it is not admitted again.
+        harness.rest.series_answers[HOURLY] = [
+            listing(HOUR_12, HOUR_13)[0],
+            listing(HOUR_13, HOUR_14)[0],
+        ]
+        harness.start()
+        control = await harness.connection(fake, CONTROL_CONN_ID)
+        await harness.subscribed(CONTROL_CONN_ID, 2, 3)
+        await harness.parked()
+
+        # A determined category-group market leaves at once, with no listing and no clock change.
+        await push_lifecycle(control, "determined", "KXA-2", result="yes")
+        await until(lambda: "KXA-2" not in planned(recorder))
+        assert harness.rest.listings(HOURLY) == 0
+        # A settled series-group market leaves at once too, and its group is listed again.
+        await push_lifecycle(control, "settled", "KXHOUR-26SEP1012-T1")
+        await until(lambda: planned(recorder) == {"KXHOUR-26SEP1013-T1", "KXA-1"})
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == 1
+        # Events about markets no series group names, or not planned, change nothing.
+        since = len(harness.time.requested)
+        await push_lifecycle(control, "determined", "KXA-3")
+        await push_lifecycle(control, "created", "KXOTHER-26SEP10-T1")
+        await push_lifecycle(control, "deactivated", "KXA-1")
+        await until(lambda: recorder.supervisors[CONTROL_CONN_ID].stats.frames == 6)
+        await harness.parked()
+        assert len(harness.time.requested) == since
+
+        # A new market in the group's series is listed once the debounce has passed.
+        harness.time.advance(RELIST_MIN_INTERVAL_S)
+        await harness.parked()
+        since = len(harness.time.requested)
+        await push_lifecycle(control, "created", "KXHOUR-26SEP1014-T1", close_ts=NOON_S + 7_200)
+        await sleeps_again(harness, RELIST_DEBOUNCE_S, since=since)
+        harness.time.advance(RELIST_DEBOUNCE_S - 1)
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == 1
+        harness.time.advance(1)
+        await until(lambda: harness.rest.listings(HOURLY) == 2)
+        await harness.parked()
+
+        # A burst right after waits out the minimum interval and costs one re-listing.
+        since = len(harness.time.requested)
+        await push_lifecycle(control, "activated", "KXHOUR-26SEP1014-T1")
+        await sleeps_again(harness, RELIST_MIN_INTERVAL_S, since=since)
+        harness.time.advance(RELIST_MIN_INTERVAL_S - 1)
+        await harness.parked()
+        since = len(harness.time.requested)
+        await push_lifecycle(control, "created", "KXHOUR-26SEP1014-T2")
+        await sleeps_again(harness, 1, since=since)
+        assert harness.rest.listings(HOURLY) == 2
+        harness.time.advance(1)
+        await until(lambda: harness.rest.listings(HOURLY) == 3)
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == 3
+        assert harness.rest.listings() == 1
+        assert planned(recorder) == {"KXHOUR-26SEP1013-T1", "KXA-1"}
+
+    removals = logged(caplog, "closed markets removed from the universe")
+    assert [record.__dict__["closed"] for record in removals] == [
+        ["KXA-2"],
+        ["KXHOUR-26SEP1012-T1"],
+    ]
+    assert [r.__dict__["relisted"] for r in logged(caplog, "universe groups re-listed")] == 3 * [
+        ["hourly"]
+    ]
+
+
+async def test_a_moved_close_time_moves_the_tick_and_every_catalog_follows_lifecycle_events(
+    tmp_path: Path,
+) -> None:
+    publisher = RecordingPublisher()
+    async with (
+        FakeKalshiWs() as fake,
+        recording(
+            fake.url,
+            tmp_path,
+            markets=CLOSING_MARKETS,
+            universe=CLOSING_POLICY,
+            publisher=publisher,
+            bus_refresh_s=4,
+        ) as harness,
+    ):
+        recorder = harness.recorder
+        harness.rest.series_answers[HOURLY] = listing(HOUR_13)
+        harness.start()
+        control = await harness.connection(fake, CONTROL_CONN_ID)
+        await harness.subscribed(CONTROL_CONN_ID, 2, 3)
+        await harness.parked()
+
+        since = len(harness.time.requested)
+        await push_lifecycle(control, "close_date_updated", "KXA-2", close_ts=NOON_S + 10)
+        # Ten seconds after noon, and the few seconds every tick waits.
+        await sleeps_again(harness, 10 + CLOSE_TICK_DELAY_S, since=since)
+        await push_lifecycle(control, "determined", "KXA-1")
+        await until(lambda: "KXA-1" not in planned(recorder))
+        await harness.parked()
+
+        harness.time.advance(4)
+        await until(lambda: publisher.topics.count(CATALOG_TOPIC) == 2)
+        catalog = [e.event for e in publisher.envelopes if isinstance(e.event, MarketCatalog)][-1]
+        assert [(entry.ticker, entry.close_ts) for entry in catalog.markets] == [
+            ("KXA-2", NOON_S + 10),
+            ("KXHOUR-26SEP1012-T1", NOON_S + 60),
+        ]
+        await harness.parked()
+        harness.time.advance(10 + CLOSE_TICK_DELAY_S - 4 - 1)
+        await harness.parked()
+        assert "KXA-2" in planned(recorder)
+        harness.time.advance(1)
+        await until(lambda: "KXA-2" not in planned(recorder))
+        await harness.recorder.stop()
+
+    lifecycles = [e.event for e in publisher.envelopes if isinstance(e.event, Lifecycle)]
+    assert [(event.event_type, event.close_ts) for event in lifecycles] == [
+        ("close_date_updated", NOON_S + 10),
+        ("determined", None),
+    ]
+
+
+async def test_a_failed_relisting_is_logged_and_retried_after_the_interval_while_capture_goes_on(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, markets=CLOSING_MARKETS, universe=CLOSING_POLICY) as harness,
+    ):
+        recorder = harness.recorder
+        harness.rest.series_answers[HOURLY] = [httpx.Response(503), *listing(HOUR_13)]
+        fake.set_book("KXA-1", yes=[("0.4000", "10.00")])
+        harness.start()
+        control = await harness.connection(fake, CONTROL_CONN_ID)
+        await harness.subscribed(CONTROL_CONN_ID, 2, 3)
+        await until(lambda: fresh(recorder.books(), "KXA-1"))
+        await harness.parked()
+
+        await push_lifecycle(control, "determined", "KXHOUR-26SEP1012-T1")
+        await until(lambda: bool(logged(caplog, "targeted re-listing failed")))
+        await harness.parked()
+        assert planned(recorder) == {"KXA-1", "KXA-2"}
+        book_conn_id = next(
+            c for c, sink in harness.sinks.items() if sink is recorder.sink_for("KXA-1")
+        )
+        books = await harness.connection(fake, book_conn_id)
+        await books.push_sequenced("orderbook_delta", delta_msg("KXA-1", "0.4100", "1.00"), sid=1)
+        await until(
+            lambda: recorder.books()["KXA-1"].best_bid() == Level(PriceE4(4100), CountE2(100))
+        )
+
+        harness.time.advance(RELIST_MIN_INTERVAL_S - 1)
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == 1
+        harness.time.advance(1)
+        await until(lambda: "KXHOUR-26SEP1013-T1" in planned(recorder))
+        assert harness.task is not None
+        assert not harness.task.done()
+        assert all(s.stats.callback_errors == 0 for s in recorder.supervisors.values())
+
+    (failure,) = logged(caplog, "targeted re-listing failed")
+    assert failure.levelno == logging.ERROR
+    assert (failure.__dict__["relisting"], failure.__dict__["retry_in_s"]) == (
+        ["hourly"],
+        RELIST_MIN_INTERVAL_S,
+    )
+    assert harness.rest.listings(HOURLY) == 2
+    ((_, records, _),) = harness.tape(book_conn_id)
+    assert frame_types(records).count("orderbook_delta") == 1
+
+
+@pytest.mark.parametrize("caught", ["waiting for a close", "listing a series"])
+async def test_stop_does_not_wait_for_a_close_or_a_relisting_in_flight(
+    tmp_path: Path, caught: str
+) -> None:
+    async with (
+        FakeKalshiWs() as fake,
+        recording(
+            fake.url,
+            tmp_path,
+            markets=CLOSING_MARKETS,
+            universe=CLOSING_POLICY,
+            shutdown_timeout_s=30,
+        ) as harness,
+    ):
+        harness.start()
+        control = await harness.connection(fake, CONTROL_CONN_ID)
+        await harness.subscribed(CONTROL_CONN_ID, 2, 3)
+        await harness.parked()
+        if caught == "listing a series":
+            harness.rest.holds["/markets"] = asyncio.Event()
+            harness.rest.series_answers[HOURLY] = listing(HOUR_13)
+            await push_lifecycle(control, "settled", "KXHOUR-26SEP1012-T1")
+            await until(lambda: harness.rest.listings(HOURLY) == 1)
+        # Within the 30-second shutdown deadline only if the universe loop raced the stop.
+        await asyncio.wait_for(harness.recorder.stop(), timeout=5.0)

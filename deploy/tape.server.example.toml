@@ -35,29 +35,35 @@ series = ["KXBTC15M", "KXETH15M"]
 events = 1
 markets_per_event = 1
 
+# Strike ladders take the strikes nearest the current price, not the busiest, which on a new
+# event are arbitrary (ADR 0029).
 [[recorder.universe.groups]]
 name = "Bitcoin hourly"
 series = ["KXBTCD"]
 events = 1
 markets_per_event = 6
+market_order = "near_price"
 
 [[recorder.universe.groups]]
 name = "stock indexes hourly"
 series = ["KXINXU", "KXNASDAQ100U"]
 events = 1
 markets_per_event = 6
+market_order = "near_price"
 
 [[recorder.universe.groups]]
 name = "economy"
 series = ["KXFEDDECISION", "KXCPIYOY", "KXPAYROLLS", "KXAAAGASW"]
 events = 1
 markets_per_event = 6
+market_order = "near_price"
 
 [[recorder.universe.groups]]
 name = "weather"
 series = ["KXHIGHNY", "KXHIGHLAX", "KXHIGHCHI", "KXHIGHMIA"]
 events = 1
 markets_per_event = 6
+market_order = "near_price"
 
 [[recorder.universe.groups]]
 name = "politics"

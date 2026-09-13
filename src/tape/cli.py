@@ -71,7 +71,7 @@ from tape.client.rest import KalshiRest, build_client
 from tape.client.ws import WsSession
 from tape.config import Settings, load_settings, redacted, signing_credentials
 from tape.errors import ArchiveError, ConfigError, KalshiError, TapeCorruptionError, WireError
-from tape.fixedpoint import format_count
+from tape.fixedpoint import format_count, format_price
 from tape.recorder.auditor import Auditor
 from tape.recorder.listing import (
     DEFAULT_MAX_MARKET_PAGES,
@@ -81,7 +81,14 @@ from tape.recorder.listing import (
 )
 from tape.recorder.recorder import Recorder, RecorderConfig
 from tape.recorder.tap import BookTap
-from tape.recorder.universe import UniverseDecision, UniverseGroup, UniversePolicy, select
+from tape.recorder.universe import (
+    MarketSummary,
+    UniverseDecision,
+    UniverseGroup,
+    UniversePolicy,
+    select,
+    yes_mid,
+)
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.timeutil import NS_PER_MS, NS_PER_S, Clock, SystemClock
 
@@ -477,13 +484,15 @@ def render_universe_preview(preview: UniversePreview) -> str:
         lines.append("Series categories unknown: category groups admit nothing")
     if preview.series_without_markets:
         lines.append(f"Series with no open market: {', '.join(preview.series_without_markets)}")
-    lines.append("Markets: ticker, series, 24-hour volume, close time (UTC)")
+    lines.append("Markets: ticker, series, 24-hour volume, YES mid, close time (UTC)")
     summaries = {market.ticker: market for market in decision.markets}
     ticker_width = max((len(ticker) for ticker in summaries), default=0)
     series_width = max((len(market.series_ticker) for market in summaries.values()), default=0)
     volume_width = max(
         (len(format_count(market.volume_24h)) for market in summaries.values()), default=0
     )
+    mids = {ticker: _describe_mid(market) for ticker, market in summaries.items()}
+    mid_width = max((len(mid) for mid in mids.values()), default=0)
     for index, (group, selection) in enumerate(
         zip(policy.groups, decision.groups, strict=True), start=1
     ):
@@ -504,7 +513,8 @@ def render_universe_preview(preview: UniversePreview) -> str:
             close = "unknown" if market.close_ts is None else _utc(market.close_ts)
             lines.append(
                 f"     {ticker:<{ticker_width}}  {market.series_ticker:<{series_width}}  "
-                f"{format_count(market.volume_24h):>{volume_width}}  {close}"
+                f"{format_count(market.volume_24h):>{volume_width}}  "
+                f"{mids[ticker]:>{mid_width}}  {close}"
             )
     not_recorded = ", ".join(
         f"{reason} {count}" for reason, count in decision.reason_counts.items()
@@ -531,7 +541,14 @@ def _describe_group(group: UniverseGroup) -> str:
         parts.append(f"max_markets {group.max_markets}")
     if group.max_hours_to_close is not None:
         parts.append(f"max_hours_to_close {group.max_hours_to_close}")
+    parts.append(f"market_order {group.market_order}")
     return "; ".join(parts)
+
+
+def _describe_mid(market: MarketSummary) -> str:
+    """A market's YES mid as a dollar price, the value ``near_price`` ranks by (ADR 0029)."""
+    mid = yes_mid(market)
+    return "no price" if mid is None else format_price(mid)
 
 
 def _utc(unix_s: int) -> str:

@@ -235,6 +235,7 @@ def to_lifecycle(msg: MarketLifecycleV2Msg, envelope: Envelope, receipt: Receipt
         seq=envelope.seq,
         event_type=msg.event_type,
         payload_json=bytes(envelope.msg).decode("utf-8"),
+        close_ts=msg.close_ts,
     )
 
 

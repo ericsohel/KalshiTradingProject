@@ -68,9 +68,12 @@ exclude_mve = true
 # market an earlier group admitted is not counted again (ADR 0028). Each group sets exactly one of
 #   series:   events counts per series: the nearest events of each series, by earliest close;
 #   category: events counts across the group: the events with the highest summed 24-hour volume.
-# Each chosen event gives at most markets_per_event markets, busiest first, and max_markets caps
-# the whole group. max_hours_to_close keeps a group to events whose earliest close is within that
-# many hours, so a sports group records games in play rather than season futures. Markets of series groups are flagged showcase. See what the groups choose now
+# Each chosen event gives at most markets_per_event markets, busiest first, or with
+# market_order = "near_price" those nearest the current price first (ADR 0029), and max_markets
+# caps the whole group. max_hours_to_close keeps a group to events whose earliest close is within
+# that many hours, so a sports group records games in play rather than season futures. Markets of
+# series groups are flagged showcase. Between universe refreshes, a closed market leaves at once
+# and a series group lists its series again for a replacement. See what the groups choose now
 # with `uv run tape universe preview --config tape.toml`.
 [[recorder.universe.groups]]
 name = "crypto 15-minute"
@@ -83,6 +86,7 @@ name = "hourly"
 series = ["KXBTCD", "KXETHD", "KXINXU", "KXNASDAQ100U"]
 events = 1
 markets_per_event = 10
+market_order = "near_price"
 
 [[recorder.universe.groups]]
 name = "economy"

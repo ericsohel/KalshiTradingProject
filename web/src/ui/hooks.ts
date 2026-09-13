@@ -12,6 +12,7 @@ import { LiveFeed } from "../state/liveFeed";
 import type { PriceGrid } from "../state/priceGrid";
 import type { MarketSummary, TapeStore } from "../state/tapeStore";
 import { monotonicNow } from "./clock";
+import { lastCloseMs, watchCloses } from "./closes";
 
 export interface Polled<T> {
   readonly data: T | null;
@@ -74,6 +75,20 @@ export function useStoreSummary(store: TapeStore | null, intervalMs: number): Ma
   );
   const snapshot = useCallback(() => store?.summary() ?? null, [store]);
   return useSyncExternalStore(subscribe, snapshot);
+}
+
+/**
+ * The latest of `closeTimes` that has passed on the page's clock, in milliseconds, or `null`.
+ * It changes exactly when a close passes, so a list labels its closed markets at once without
+ * re-rendering on a timer (`closes.ts`). Keep `closeTimes` stable with `useMemo`.
+ */
+export function useLastClose(closeTimes: readonly (number | null)[]): number | null {
+  const subscribe = useCallback(
+    (onChange: () => void) => watchCloses(closeTimes, monotonicNow, onChange),
+    [closeTimes],
+  );
+  const snapshot = useCallback(() => lastCloseMs(closeTimes, monotonicNow()), [closeTimes]);
+  return useSyncExternalStore(subscribe, snapshot, snapshot);
 }
 
 /** The monotonic clock, quantized to `intervalMs` so renders are not wasted. */

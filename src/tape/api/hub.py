@@ -14,7 +14,7 @@ Fan-out, per bus message, after the books observed it:
 - an exchange snapshot applied to a book that stayed fresh: ``snapshot``; an applied delta:
   ``delta``;
 - trades and ticker updates: ``trade`` and ``ticker``, whatever the book's state;
-- catalogs, status reports, and ticker updates also update the directory.
+- catalogs, status reports, ticker updates, and lifecycle events also update the directory.
 
 Invariants: messages about one market reach each session in bus order, because every bus message
 is observed and offered without an await in between; a session is offered market messages only
@@ -66,6 +66,7 @@ from tape.events import (
     BookSnapshot,
     BusEvent,
     CatalogEntry,
+    Lifecycle,
     MarketCatalog,
     Side,
     StatusReport,
@@ -337,6 +338,8 @@ class LiveHub:
     def _update_directory(self, event: BusEvent) -> None:
         if isinstance(event, Ticker):
             self._directory.apply_ticker(event)
+        elif isinstance(event, Lifecycle):
+            self._directory.apply_lifecycle(event)
         elif isinstance(event, MarketCatalog):
             self._directory.apply_catalog(event)
         elif isinstance(event, StatusReport):

@@ -5,14 +5,17 @@ of parts tested on their own. At start it reads the exchange status and sizes th
 limiter from the account's tier; then it runs one ``ConnectionSupervisor`` per WebSocket
 connection, lists the open markets, selects the order-book universe by its groups (ADR 0028),
 and hands each book connection its subscription groups every ``universe_refresh_s`` (sooner, on
-a capped backoff, while a refresh is failing), writes keyframes, logs a status line, tapes a
-``clock_jump`` record when the host slept, and runs auxiliary periodic tasks such as the auditor,
-which reads books, sinks, and book taps through it (:meth:`Recorder.open_book_tap`). With a bus
-publisher it also publishes every event its supervisors decode; every ``bus_refresh_s``, the
-catalog of the markets it records followed by a refresh image of each book it holds, paced in
-slices across the interval (ADR 0022); and its status every ``status_interval_s`` (ADR 0023).
-Dependencies arrive fully built, so the orchestration is tested against a fake exchange in
-virtual time.
+a capped backoff, while a refresh is failing). Between those full refreshes it reacts to market
+closes (ADR 0029): a few seconds after a planned market's close time, or as soon as a lifecycle
+event says it was determined or settled, the market leaves the plan without a listing, and the
+series groups that lost a market, or whose series gained one, are listed again and re-applied
+alone. It also writes keyframes, logs a status line, tapes a ``clock_jump`` record when the host
+slept, and runs auxiliary periodic tasks such as the auditor, which reads books, sinks, and book
+taps through it (:meth:`Recorder.open_book_tap`). With a bus publisher it also publishes every
+event its supervisors decode; every ``bus_refresh_s``, the catalog of the markets it records
+followed by a refresh image of each book it holds, paced in slices across the interval (ADR
+0022); and its status every ``status_interval_s`` (ADR 0023). Dependencies arrive fully built, so
+the orchestration is tested against a fake exchange in virtual time.
 
 Connection layout (ADR 0018): connection 0 is live-only and carries the ``ticker`` channel
 for every market of the current plan, one group that follows each replan (ADR 0027), whose
@@ -23,7 +26,12 @@ because Kalshi keeps one subscription per channel per connection (ADR 0020). No 
 has a data-silence timeout; every one relies on the transport keepalive (ADR 0019).
 
 Invariants: the latest-ticker table holds only markets the ticker connection is meant to
-carry, so it never outgrows the plan; a supervisor, sink, or internal loop that fails ends
+carry, so it never outgrows the plan; only the universe loop changes the plan, one step at a
+time; a lifecycle event is noted without awaiting, and noting it never raises into the control
+connection's supervisor; a targeted re-listing starts at least :data:`RELIST_MIN_INTERVAL_S`
+after the previous one started, and only a full refresh replaces a category group's markets;
+every catalog leaves out the markets reported determined or settled and gives close times as
+lifecycle events last moved them; a supervisor, sink, or internal loop that fails ends
 the run with its exception after a full shutdown, never silently; a periodic task or the
 bus refresh cycle that fails is logged and capture continues, and nothing published can
 raise into a supervisor or wait on a consumer; a refresh image is read and published
@@ -41,7 +49,7 @@ import asyncio
 import contextlib
 import functools
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Protocol
@@ -58,9 +66,15 @@ from tape.client.rest import KalshiRest
 from tape.client.ws import WsSession
 from tape.errors import KalshiError, WireError
 from tape.events import (
+    LIFECYCLE_ACTIVATED,
+    LIFECYCLE_CLOSE_DATE_UPDATED,
+    LIFECYCLE_CREATED,
+    LIFECYCLE_DETERMINED,
+    LIFECYCLE_SETTLED,
     BookRefresh,
     CatalogEntry,
     ConnectionReport,
+    Lifecycle,
     MarketCatalog,
     MarketEvent,
     Receipt,
@@ -73,6 +87,7 @@ from tape.recorder.listing import (
     MarketListing,
     SeriesCategories,
     list_open_markets,
+    list_series_markets,
 )
 from tape.recorder.planner import Group, Plan, plan
 from tape.recorder.supervisor import (
@@ -82,7 +97,13 @@ from tape.recorder.supervisor import (
     backoff_delay_s,
 )
 from tape.recorder.tap import CompositeBookTap
-from tape.recorder.universe import UniverseDecision, UniversePolicy, select
+from tape.recorder.universe import (
+    MarketSummary,
+    UniverseDecision,
+    UniversePolicy,
+    select,
+    series_of,
+)
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.segment import Record, RecordKind, SegmentHeader, write_keyframe
 from tape.timeutil import NS_PER_S, Clock, Ns, wall_ns_to_datetime
@@ -91,6 +112,7 @@ __all__ = [
     "BOOK_CHANNELS",
     "BUS_REFRESH_SLICES_PER_S",
     "CLOCK_JUMP_THRESHOLD_NS",
+    "CLOSE_TICK_DELAY_S",
     "CONTROL_CONN_ID",
     "DEFAULT_BUS_REFRESH_S",
     "DEFAULT_KEYFRAME_WRITE_TIMEOUT_S",
@@ -99,6 +121,9 @@ __all__ = [
     "LIFECYCLE_CHANNEL",
     "MAX_GROUP_SIZE",
     "PINNED_SPEC_VERSIONS",
+    "RELIST_DEBOUNCE_S",
+    "RELIST_MAX_PAGES",
+    "RELIST_MIN_INTERVAL_S",
     "TICKER_CHANNEL",
     "TICKER_CONN_ID",
     "TICKER_GROUP_ID",
@@ -166,9 +191,43 @@ DEFAULT_BUS_REFRESH_S: Final = 10
 BUS_REFRESH_SLICES_PER_S: Final = 10
 """Most refresh slices per second of the cycle, so many books go out in steps of 100 ms."""
 
+CLOSE_TICK_DELAY_S: Final = 3
+"""Seconds after a planned market's close time before the tick that removes it (ADR 0029).
+
+A listing taken at the very second of a close can still show the closed market open and its
+successor not yet open; a few seconds later both have settled.
+"""
+
+RELIST_DEBOUNCE_S: Final = 5
+"""Seconds after a ``created`` or ``activated`` event in a series group's series before that group
+is listed again, so the markets of a new event, which appear together, are listed together."""
+
+RELIST_MIN_INTERVAL_S: Final = 30
+"""Least seconds between the starts of two targeted re-listings, so a burst costs one."""
+
+RELIST_MAX_PAGES: Final = 10
+"""Page cap per series on a targeted re-listing; one series lists a few hundred open markets."""
+
 _SECONDS_PER_MINUTE: Final = 60
 _SECONDS_PER_HOUR: Final = 3_600
 _NO_CATEGORIES: Final[Mapping[str, str]] = MappingProxyType({})
+_ENDED: Final = frozenset({LIFECYCLE_DETERMINED, LIFECYCLE_SETTLED})
+"""Lifecycle events after which a market is closed whatever its close time says."""
+_OPENED: Final = frozenset({LIFECYCLE_CREATED, LIFECYCLE_ACTIVATED})
+"""Lifecycle events after which a series may have a market its groups have not listed."""
+
+
+class _PendingRelist(msgspec.Struct, frozen=True, kw_only=True):
+    """A series group waiting for a targeted re-listing.
+
+    Attributes:
+        due_ns: Monotonic time from which the re-listing may run.
+        requested_ns: Monotonic time of the latest request; a re-listing that started later
+            covers it.
+    """
+
+    due_ns: int
+    requested_ns: int
 
 
 def check_connection_budget(*, book_connections: int, max_connections: int) -> None:
@@ -354,8 +413,8 @@ class RecorderConfig(msgspec.Struct, frozen=True, kw_only=True):
         group_size: Most markets on one book connection, and in one subscription command on
             any connection.
         keyframe_interval_s: Seconds between keyframes.
-        universe_refresh_s: Seconds between market listings; a failed listing is retried
-            sooner, see :func:`universe_retry_delay_s`.
+        universe_refresh_s: Seconds between full market listings; a failed listing is retried
+            sooner, see :func:`universe_retry_delay_s`. Closes are handled between them (ADR 0029).
         status_interval_s: Seconds between status log lines and clock-jump checks.
         max_market_pages: Page cap on one market listing.
         shutdown_timeout_s: Deadline for each shutdown stage.
@@ -567,7 +626,14 @@ class Recorder:
         )
         self._conn_of: dict[str, int] = {}
         self._universe_failures = 0
-        self._universe_wait_s: float = config.universe_refresh_s
+        self._refresh_due_ns = 0
+        # What lifecycle events said since the last full listing, for the universe loop (ADR 0029).
+        self._universe_wake = asyncio.Event()
+        self._ended: set[str] = set()
+        self._moved_close_ts: dict[str, int] = {}
+        self._relists: dict[str, _PendingRelist] = {}
+        self._relist_allowed_ns = 0
+        self._series_groups = _series_groups_by_series(config.universe)
         self._stop_requested = asyncio.Event()
         self._periodic_stop = asyncio.Event()
         self._finished = asyncio.Event()
@@ -819,22 +885,28 @@ class Recorder:
     def _event_consumer(self, conn_id: int) -> Callable[[MarketEvent], None] | None:
         """What one connection's supervisor hands each decoded event to.
 
-        The ticker connection's events update the latest-ticker table; with a bus, every
-        connection's events are also published, including ticker updates the table does not
-        keep. ``SequencedPublisher.publish`` never raises, and the supervisor would count and
-        log it if it did.
+        The ticker connection's events update the latest-ticker table, and the control
+        connection's lifecycle events are noted for the universe loop (ADR 0029); with a bus,
+        every connection's events are also published, including those nothing here keeps. Neither
+        consumer awaits or raises, ``SequencedPublisher.publish`` never raises, and the supervisor
+        would count and log it if one did.
         """
+        consumers: dict[int, Callable[[MarketEvent], None]] = {
+            TICKER_CONN_ID: self._remember_ticker,
+            CONTROL_CONN_ID: self._note_lifecycle,
+        }
+        consume = consumers.get(conn_id)
         bus = self._bus
-        if conn_id != TICKER_CONN_ID:
-            return None if bus is None else bus.publish
         if bus is None:
-            return self._remember_ticker
+            return consume
+        if consume is None:
+            return bus.publish
 
-        def remember_and_publish(event: MarketEvent) -> None:
-            self._remember_ticker(event)
+        def consume_and_publish(event: MarketEvent) -> None:
+            consume(event)
             bus.publish(event)
 
-        return remember_and_publish
+        return consume_and_publish
 
     def _held_books(self) -> dict[str, tuple[int, Book]]:
         """Every book across the book connections, with the connection holding it.
@@ -946,11 +1018,17 @@ class Recorder:
     # ---------------------------------------------------------------------- loops
 
     async def _universe_loop(self) -> None:
-        # The wait is set by the refresh before it, so a failure at startup is retried soon.
-        # The refresh itself also races the stop: listing a hundred-odd pages must not hold
-        # up shutdown, and a plan left half applied is harmless when every connection stops.
-        while await self._pause(self._universe_wait_s):
-            if not await self._until_stopped(self._refresh_universe_or_log):
+        # Each pass waits for the first universe work due: the full refresh, whose time the
+        # refresh before it set, so a failure at startup is retried soon; the close of a planned
+        # market; or a targeted re-listing (ADR 0029). A noted lifecycle event cuts the wait
+        # short, so the loop looks again. The work races the stop like the wait: listing a
+        # hundred-odd pages must not hold up shutdown, and a plan left half applied is harmless
+        # when every connection stops.
+        while True:
+            self._universe_wake.clear()
+            if not await self._pause_unless_woken(self._universe_delay_ns() / NS_PER_S):
+                return
+            if not await self._until_stopped(self._universe_step):
                 return
 
     async def _keyframe_loop(self) -> None:
@@ -1045,7 +1123,9 @@ class Recorder:
             # The catalog opens every cycle, so a consumer that has just started knows the
             # recorded markets within one interval, as it knows the books (ADR 0023).
             if self._universe is not None:
-                bus.publish(_catalog(self._universe))
+                bus.publish(
+                    _catalog(self._universe, ended=self._ended, moved_close_ts=self._moved_close_ts)
+                )
             # Markets are fixed per cycle; one that appears mid-cycle waits for the next.
             slices = refresh_slices(sorted(self._held_books()), interval_s=interval_s)
             for tickers in slices:
@@ -1085,6 +1165,30 @@ class Recorder:
         slept = await self._until_stopped(functools.partial(self._sleep, seconds))
         return slept and not self._stop_requested.is_set()
 
+    async def _pause_unless_woken(self, seconds: float) -> bool:
+        """Sleep like :meth:`_pause`, but end early once a lifecycle event wakes the universe loop.
+
+        Returns:
+            ``False`` if a stop came first; ``True`` once the time passed or the loop was woken,
+            at once when ``seconds`` is not positive.
+        """
+        if seconds <= 0:
+            return not self._stop_requested.is_set()
+
+        async def sleep_until_woken() -> None:
+            sleeping = asyncio.ensure_future(self._sleep(seconds))
+            waking = asyncio.ensure_future(self._universe_wake.wait())
+            try:
+                await asyncio.wait((sleeping, waking), return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                await _cancel(waking)
+                await _cancel(sleeping)
+            if not sleeping.cancelled():
+                sleeping.result()
+
+        slept = await self._until_stopped(sleep_until_woken)
+        return slept and not self._stop_requested.is_set()
+
     async def _until_stopped(self, work: Callable[[], Awaitable[None]]) -> bool:
         """Run ``work`` unless a stop is requested first, in which case cancel it.
 
@@ -1111,8 +1215,49 @@ class Recorder:
 
     # --------------------------------------------------------------------- universe
 
+    def _universe_delay_ns(self) -> int:
+        """Nanoseconds until the first universe work is due; zero when some is due now.
+
+        The work is the full refresh; the tick that removes a planned market, due
+        :data:`CLOSE_TICK_DELAY_S` after its close time, or at once when a lifecycle event
+        reported it determined or settled; and, once a full refresh has succeeded, a pending
+        targeted re-listing, when both its debounce and the minimum interval allow.
+        """
+        now_mono_ns = int(self._clock.mono_ns())
+        delays = [self._refresh_due_ns - now_mono_ns]
+        if self._universe is not None:
+            if any(ticker in self._conn_of for ticker in self._ended):
+                delays.append(0)
+            planned = self._as_last_reported(self._universe.markets)
+            close_ts = min((m.close_ts for m in planned if m.close_ts is not None), default=None)
+            if close_ts is not None:
+                close_tick_ns = (close_ts + CLOSE_TICK_DELAY_S) * NS_PER_S
+                delays.append(close_tick_ns - int(self._clock.wall_ns()))
+            if self._relists:
+                due_ns = min(pending.due_ns for pending in self._relists.values())
+                delays.append(max(due_ns, self._relist_allowed_ns) - now_mono_ns)
+        return max(0, min(delays))
+
+    async def _universe_step(self) -> None:
+        """Do the universe work due now: the full refresh, or the close tick and a re-listing."""
+        if int(self._clock.mono_ns()) >= self._refresh_due_ns:
+            await self._refresh_universe_or_log()
+            return
+        previous = self._universe
+        if previous is None:
+            return
+        current = await self._remove_closed_markets(previous)
+        now_ns = int(self._clock.mono_ns())
+        due = [
+            group.name
+            for group in self._config.universe.groups
+            if (pending := self._relists.get(group.name)) is not None and pending.due_ns <= now_ns
+        ]
+        if due and now_ns >= self._relist_allowed_ns:
+            await self._relist_or_log(current, due)
+
     async def _refresh_universe_or_log(self) -> None:
-        """Refresh the universe and set the wait before the next refresh.
+        """Refresh the universe and set when the next full refresh is due.
 
         An exchange or decoding failure keeps the current plan and schedules a retry on a
         capped, jittered backoff (:func:`universe_retry_delay_s`); a success waits the full
@@ -1127,7 +1272,7 @@ class Recorder:
                 jitter=self._jitter(),
             )
             self._universe_failures += 1
-            self._universe_wait_s = retry_in_s
+            self._refresh_due_ns = int(self._clock.mono_ns()) + round(retry_in_s * NS_PER_S)
             self._log.error(
                 "universe refresh failed; keeping the current plan and retrying",
                 extra={
@@ -1138,32 +1283,192 @@ class Recorder:
             )
             return
         self._universe_failures = 0
-        self._universe_wait_s = self._config.universe_refresh_s
+        refresh_ns = self._config.universe_refresh_s * NS_PER_S
+        self._refresh_due_ns = int(self._clock.mono_ns()) + refresh_ns
 
     async def _refresh_universe(self) -> None:
-        """List open markets, select the universe, replan, and hand each connection its group.
+        """List every open market, select the universe, and apply it.
 
-        Series categories are read first when a category group needs them (ADR 0028). Book
-        connections get their planner groups; the ticker connection gets every market of the
-        plan, and the latest-ticker table drops the markets it no longer carries. The book
-        connections carry every selected market, because a selection never exceeds
-        ``max_l2_markets`` and the configuration guarantees room for that many.
+        Series categories are read first when a category group needs them (ADR 0028). The
+        listing can predate a lifecycle event, so markets reported determined or settled are left
+        out and moved close times replace the listed ones; a market stays reported only while a
+        listing still shows it open. The refresh covers every targeted re-listing requested
+        before it started.
 
         Raises:
             KalshiError: If a listing page cannot be fetched.
             WireError: If a listing page does not decode.
         """
+        started_ns = int(self._clock.mono_ns())
         if not self._config.universe.groups:
             self._log.warning("no universe groups are configured; no market will be recorded")
         listing = await self._list_markets()
         categories = await self._series_categories()
         now_wall_ns = int(self._clock.wall_ns())
         decision = select(
-            listing.markets,
+            self._as_last_reported(listing.markets),
             self._config.universe,
             now_ts=now_wall_ns // NS_PER_S,
             categories=categories,
         )
+        await self._apply_universe(decision)
+        self._ended.intersection_update(market.ticker for market in listing.markets)
+        self._forget_relists(list(self._relists), started_ns=started_ns)
+        self._log.info(
+            "universe refreshed",
+            extra={
+                "listed": len(listing.markets),
+                "truncated": listing.truncated,
+                "selected": len(decision.l2_tickers),
+                "showcase": len(decision.showcase),
+                "dropped_for_cap": decision.dropped_for_cap,
+                "reason_counts": dict(decision.reason_counts),
+                "groups": _group_counts(decision),
+                "book_groups": len(self._plan.groups),
+            },
+        )
+
+    async def _remove_closed_markets(self, previous: UniverseDecision) -> UniverseDecision:
+        """Take the planned markets that closed out of the plan, without a listing (ADR 0029).
+
+        A market has closed once its close time, as last moved, has passed, or once a lifecycle
+        event reported it determined or settled. Every group is pinned to the markets it
+        admitted, so nothing takes a closed market's place here: a series group that lost one is
+        due a targeted re-listing at once, and a category group waits for the next full refresh.
+
+        Args:
+            previous: The decision the plan follows now.
+
+        Returns:
+            The decision the plan follows afterwards: ``previous`` when no market closed.
+        """
+        now_ts = int(self._clock.wall_ns()) // NS_PER_S
+        remaining = self._as_last_reported(previous.markets)
+        still_open = {m.ticker for m in remaining if m.close_ts is None or m.close_ts > now_ts}
+        closed = sorted(previous.l2_tickers - still_open)
+        if not closed:
+            return previous
+        emptied = {previous.group_of[ticker] for ticker in closed}
+        relisting = [
+            group.name
+            for group in self._config.universe.groups
+            if group.series is not None and group.name in emptied
+        ]
+        now_ns = int(self._clock.mono_ns())
+        for name in relisting:
+            self._request_relist(name, due_ns=now_ns, now_ns=now_ns)
+        decision = select(
+            remaining, self._config.universe, now_ts=now_ts, pinned=_admitted_by_group(previous)
+        )
+        await self._apply_universe(decision)
+        self._log.info(
+            "closed markets removed from the universe",
+            extra={
+                "closed": closed,
+                "selected": len(decision.l2_tickers),
+                "groups": _group_counts(decision),
+                "relisting": relisting,
+                "book_groups": len(self._plan.groups),
+            },
+        )
+        return decision
+
+    async def _relist_or_log(self, previous: UniverseDecision, names: Sequence[str]) -> None:
+        """Re-list some series groups; a failure keeps the plan and the groups' requests.
+
+        The next re-listing may start :data:`RELIST_MIN_INTERVAL_S` after this one started,
+        whatever its outcome, so a failure is retried then and a burst costs one re-listing.
+
+        Args:
+            previous: The decision the plan follows now.
+            names: The series groups to re-list, in policy order.
+        """
+        started_ns = int(self._clock.mono_ns())
+        self._relist_allowed_ns = started_ns + RELIST_MIN_INTERVAL_S * NS_PER_S
+        try:
+            await self._relist(previous, names, started_ns=started_ns)
+        except (KalshiError, WireError) as exc:
+            self._log.error(
+                "targeted re-listing failed; keeping the current plan and retrying",
+                extra={
+                    "error": repr(exc),
+                    "relisting": list(names),
+                    "retry_in_s": RELIST_MIN_INTERVAL_S,
+                },
+            )
+
+    async def _relist(
+        self, previous: UniverseDecision, names: Sequence[str], *, started_ns: int
+    ) -> None:
+        """List the series of some series groups again, re-apply those groups, and replan.
+
+        The listing replaces what was known of the markets of every series it lists. Every other
+        group is pinned to the markets it admitted, so a category group gains nothing here.
+
+        Args:
+            previous: The decision the plan follows now.
+            names: The series groups to re-list, in policy order.
+            started_ns: Monotonic time the re-listing started, which covers earlier requests.
+
+        Raises:
+            KalshiError: If a listing page cannot be fetched.
+            WireError: If a listing page does not decode.
+        """
+        policy = self._config.universe
+        relisted = frozenset(names)
+        series = tuple(
+            dict.fromkeys(
+                name
+                for group in policy.groups
+                if group.name in relisted
+                for name in group.series or ()
+            )
+        )
+        listing = await list_series_markets(
+            self._rest, series, exclude_mve=policy.exclude_mve, max_pages=RELIST_MAX_PAGES
+        )
+        unlisted = [market for market in previous.markets if market.series_ticker not in series]
+        decision = select(
+            self._as_last_reported([*listing.markets, *unlisted]),
+            policy,
+            now_ts=int(self._clock.wall_ns()) // NS_PER_S,
+            pinned={
+                name: tickers
+                for name, tickers in _admitted_by_group(previous).items()
+                if name not in relisted
+            },
+        )
+        await self._apply_universe(decision)
+        self._forget_relists(names, started_ns=started_ns)
+        self._log.info(
+            "universe groups re-listed",
+            extra={
+                "relisted": list(names),
+                "series": list(series),
+                "listed": len(listing.markets),
+                "truncated": listing.truncated,
+                "unreadable": listing.unreadable,
+                "first_error": listing.first_error,
+                "added": sorted(decision.l2_tickers - previous.l2_tickers),
+                "removed": sorted(previous.l2_tickers - decision.l2_tickers),
+                "selected": len(decision.l2_tickers),
+                "groups": _group_counts(decision),
+                "book_groups": len(self._plan.groups),
+            },
+        )
+
+    async def _apply_universe(self, decision: UniverseDecision) -> None:
+        """Replan for a decision, with the previous plan, and hand each connection its group.
+
+        Book connections get their planner groups; the ticker connection gets every market of the
+        plan, and the latest-ticker table drops the markets it no longer carries. The book
+        connections carry every selected market, because a selection never exceeds
+        ``max_l2_markets`` and the configuration guarantees room for that many. Moved close times
+        are kept only for planned markets.
+
+        Args:
+            decision: The universe to record from now on.
+        """
         desired = plan(
             decision.l2_tickers,
             max_per_group=self._config.group_size,
@@ -1188,19 +1493,79 @@ class Recorder:
             for group in desired.groups
             for ticker in group.tickers
         }
-        self._log.info(
-            "universe refreshed",
-            extra={
-                "listed": len(listing.markets),
-                "truncated": listing.truncated,
-                "selected": len(decision.l2_tickers),
-                "showcase": len(decision.showcase),
-                "dropped_for_cap": decision.dropped_for_cap,
-                "reason_counts": dict(decision.reason_counts),
-                "groups": _group_counts(decision),
-                "book_groups": len(desired.groups),
-            },
+        self._moved_close_ts = {
+            ticker: close_ts
+            for ticker, close_ts in self._moved_close_ts.items()
+            if ticker in self._conn_of
+        }
+
+    def _note_lifecycle(self, event: MarketEvent) -> None:
+        """Note what a lifecycle event means for the universe, and wake its loop (ADR 0029).
+
+        A planned market reported determined or settled is due for removal at once, and a planned
+        market's moved close time replaces its listed one. A market created or activated in a
+        series that a series group names makes that group due a targeted re-listing
+        :data:`RELIST_DEBOUNCE_S` after the first such event. Anything else is ignored. It runs
+        as the control connection's event consumer, so it never awaits, and nothing in it raises.
+
+        Args:
+            event: An event the control connection decoded.
+        """
+        if not isinstance(event, Lifecycle):
+            return
+        planned = event.ticker in self._conn_of
+        groups = self._series_groups.get(series_of(event.ticker), ())
+        if event.event_type in _ENDED and planned:
+            self._ended.add(event.ticker)
+        elif (
+            event.event_type == LIFECYCLE_CLOSE_DATE_UPDATED
+            and planned
+            and event.close_ts is not None
+        ):
+            self._moved_close_ts[event.ticker] = event.close_ts
+        elif event.event_type in _OPENED and groups:
+            now_ns = int(self._clock.mono_ns())
+            for name in groups:
+                self._request_relist(
+                    name, due_ns=now_ns + RELIST_DEBOUNCE_S * NS_PER_S, now_ns=now_ns
+                )
+        else:
+            return
+        self._universe_wake.set()
+
+    def _request_relist(self, name: str, *, due_ns: int, now_ns: int) -> None:
+        """Ask for a targeted re-listing of a series group, keeping an earlier due time."""
+        pending = self._relists.get(name)
+        self._relists[name] = _PendingRelist(
+            due_ns=due_ns if pending is None else min(pending.due_ns, due_ns),
+            requested_ns=now_ns,
         )
+
+    def _forget_relists(self, names: Iterable[str], *, started_ns: int) -> None:
+        """Drop the requests of groups that a listing started at ``started_ns`` covered.
+
+        A request made while the listing ran stays, because the listing may have missed what
+        it was made for.
+        """
+        for name in names:
+            pending = self._relists.get(name)
+            if pending is not None and pending.requested_ns <= started_ns:
+                del self._relists[name]
+
+    def _as_last_reported(self, markets: Iterable[MarketSummary]) -> list[MarketSummary]:
+        """Markets as lifecycle events last reported them.
+
+        Markets reported determined or settled are left out, and moved close times replace the
+        listed ones.
+        """
+        moved = self._moved_close_ts
+        return [
+            msgspec.structs.replace(market, close_ts=moved[market.ticker])
+            if market.ticker in moved
+            else market
+            for market in markets
+            if market.ticker not in self._ended
+        ]
 
     async def _list_markets(self) -> MarketListing:
         """Page through the open markets, logging a listing that skipped markets or was cut short.
@@ -1371,8 +1736,20 @@ def _ticker_group(desired: Plan) -> Group | None:
     return Group(group_id=TICKER_GROUP_ID, conn_id=TICKER_CONN_ID, tickers=tickers)
 
 
-def _catalog(decision: UniverseDecision) -> MarketCatalog:
-    """The bus catalog of a universe decision: one entry per recorded market, in ticker order."""
+def _catalog(
+    decision: UniverseDecision, *, ended: Collection[str], moved_close_ts: Mapping[str, int]
+) -> MarketCatalog:
+    """The bus catalog of a universe decision: one entry per recorded market, in ticker order.
+
+    Lifecycle events noted since the decision count at once (ADR 0029): a market reported
+    determined or settled is left out, and a moved close time replaces the listed one, so a
+    consumer that takes each catalog whole never shows a market the recorder knows has closed.
+
+    Args:
+        decision: The latest universe decision.
+        ended: Markets reported determined or settled.
+        moved_close_ts: Close times lifecycle events moved, by ticker.
+    """
     return MarketCatalog(
         markets=tuple(
             CatalogEntry(
@@ -1380,12 +1757,27 @@ def _catalog(decision: UniverseDecision) -> MarketCatalog:
                 series_ticker=market.series_ticker,
                 event_ticker=market.event_ticker,
                 volume_24h=market.volume_24h,
-                close_ts=market.close_ts,
+                close_ts=moved_close_ts.get(market.ticker, market.close_ts),
                 showcase=market.ticker in decision.showcase,
             )
             for market in decision.markets
+            if market.ticker not in ended
         )
     )
+
+
+def _admitted_by_group(decision: UniverseDecision) -> dict[str, tuple[str, ...]]:
+    """What each group admitted, in admission order: the pins of a decision between listings."""
+    return {group.name: group.tickers for group in decision.groups}
+
+
+def _series_groups_by_series(policy: UniversePolicy) -> dict[str, tuple[str, ...]]:
+    """The series groups that name each series, in policy order, by series ticker."""
+    names: dict[str, list[str]] = {}
+    for group in policy.groups:
+        for series in group.series or ():
+            names.setdefault(series, []).append(group.name)
+    return {series: tuple(groups) for series, groups in names.items()}
 
 
 def _group_counts(decision: UniverseDecision) -> dict[str, dict[str, int]]:

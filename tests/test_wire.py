@@ -218,8 +218,10 @@ def test_lifecycle_preserves_payload(receipt: Receipt) -> None:
     msg = decode_msg(env, MarketLifecycleV2Msg)
     assert msg.close_ts == 1694721600
     life = to_lifecycle(msg, env, receipt)
-    assert life.event_type == "created"
+    assert (life.event_type, life.close_ts) == ("created", 1694721600)
     assert json.loads(life.payload_json) == payload["msg"]
+    determined = MarketLifecycleV2Msg(event_type="determined", market_ticker="X", result="yes")
+    assert to_lifecycle(determined, env, receipt).close_ts is None
 
 
 @pytest.mark.parametrize(

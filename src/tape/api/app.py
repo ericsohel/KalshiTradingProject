@@ -47,7 +47,7 @@ from tape.api.contract import (
 )
 from tape.api.hub import LiveHub
 from tape.api.metadata import MetadataResolver
-from tape.timeutil import Clock
+from tape.timeutil import NS_PER_S, Clock
 
 __all__ = ["API_PREFIX", "create_app"]
 
@@ -89,7 +89,9 @@ def create_app(*, hub: LiveHub, resolver: MetadataResolver, clock: Clock) -> Sta
                 ERROR_BAD_REQUEST,
                 f"limit must be an integer from 1 to {MAX_MARKETS_LIMIT}, got {text!r}",
             )
-        entries = directory.top(limit)
+        # Closed markets leave the list at their close by this clock, not at the recorder's next
+        # catalog (ADR 0029).
+        entries = directory.top(limit, now_ts=int(clock.wall_ns()) // NS_PER_S)
         resolver.request(entries)
         rows = tuple(
             directory.row(entry, metadata=resolver.lookup(entry), book=hub.book(entry.ticker))

@@ -20,6 +20,11 @@ from tape.fixedpoint import CountE2, PriceE4
 from tape.timeutil import Ms, Ns
 
 __all__ = [
+    "LIFECYCLE_ACTIVATED",
+    "LIFECYCLE_CLOSE_DATE_UPDATED",
+    "LIFECYCLE_CREATED",
+    "LIFECYCLE_DETERMINED",
+    "LIFECYCLE_SETTLED",
     "MARKET_EVENT_TYPES",
     "BookDelta",
     "BookRefresh",
@@ -119,8 +124,31 @@ class Ticker(msgspec.Struct, frozen=True, kw_only=True, tag=True):
     open_interest: CountE2
 
 
+LIFECYCLE_CREATED: Final = "created"
+"""``event_type`` of a market that was just created."""
+LIFECYCLE_ACTIVATED: Final = "activated"
+"""``event_type`` of a market that opened for trading, or resumed after a pause."""
+LIFECYCLE_CLOSE_DATE_UPDATED: Final = "close_date_updated"
+"""``event_type`` of a market whose scheduled close moved; the event carries ``close_ts``."""
+LIFECYCLE_DETERMINED: Final = "determined"
+"""``event_type`` of a market whose outcome is known."""
+LIFECYCLE_SETTLED: Final = "settled"
+"""``event_type`` of a market that paid out."""
+
+
 class Lifecycle(msgspec.Struct, frozen=True, kw_only=True, tag=True):
-    """A market lifecycle transition with the raw payload preserved."""
+    """A market lifecycle transition with the raw payload preserved.
+
+    Attributes:
+        ticker: Market ticker.
+        receipt: Where and when the frame was received.
+        sid: Subscription id.
+        seq: Sequence number, if the frame carried one.
+        event_type: Kalshi's ``event_type`` verbatim, such as ``determined``.
+        payload_json: The message's payload, exactly as received.
+        close_ts: Unix seconds at which the market is scheduled to close, carried by ``created``
+            and ``close_date_updated`` events and absent from the others (ADR 0029).
+    """
 
     ticker: str
     receipt: Receipt
@@ -128,6 +156,7 @@ class Lifecycle(msgspec.Struct, frozen=True, kw_only=True, tag=True):
     seq: int | None
     event_type: str
     payload_json: str
+    close_ts: int | None = None
 
 
 class BookRefresh(msgspec.Struct, frozen=True, kw_only=True, tag=True):

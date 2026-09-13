@@ -1,14 +1,15 @@
 """What universe selection reads from Kalshi: the open markets and the series categories.
 
-Responsibility: page through ``GET /markets`` into the selector's summaries
-(:func:`list_open_markets`), and keep the map from series to category that category groups
-select by (ADR 0028), read from ``GET /series`` filtered by category
-(:class:`SeriesCategories`). Every request goes through :class:`tape.client.rest.KalshiRest`,
-whose rate limiter paces it, and ``tape record`` and ``tape universe preview`` share this
-module, so a preview lists exactly what the recorder would.
+Responsibility: page through ``GET /markets`` into the selector's summaries, for every series
+(:func:`list_open_markets`) or for a few named ones (:func:`list_series_markets`, ADR 0029), and
+keep the map from series to category that category groups select by (ADR 0028), read from
+``GET /series`` filtered by category (:class:`SeriesCategories`). Every request goes through
+:class:`tape.client.rest.KalshiRest`, whose rate limiter paces it, and ``tape record`` and
+``tape universe preview`` share this module, so a preview lists exactly what the recorder would.
 
-Invariants: a listing fetches at most ``max_pages`` pages and says whether that cap cut it
-short; a market that does not convert is skipped and counted, never fatal; the category map
+Invariants: a listing fetches at most ``max_pages`` pages, per series when it names series, and
+says whether that cap cut it short; a listing of named series holds only markets of those series;
+a market that does not convert is skipped and counted, never fatal; the category map
 holds only the configured categories and changes only when every one of them was fetched, so a
 failed fetch keeps the last known map whole; after a success, no request is made until
 ``refresh_s`` has passed on the monotonic clock; a failed fetch is logged, never raised, and
@@ -36,6 +37,7 @@ __all__ = [
     "MarketListing",
     "SeriesCategories",
     "list_open_markets",
+    "list_series_markets",
     "series_per_category",
 ]
 
@@ -72,7 +74,7 @@ class MarketListing(msgspec.Struct, frozen=True, kw_only=True):
 
 
 async def list_open_markets(
-    rest: KalshiRest, *, exclude_mve: bool, max_pages: int
+    rest: KalshiRest, *, exclude_mve: bool, max_pages: int, series_ticker: str | None = None
 ) -> MarketListing:
     """Page through the open markets, up to the page cap.
 
@@ -83,6 +85,8 @@ async def list_open_markets(
         rest: The REST client; its limiter paces every page.
         exclude_mve: Ask Kalshi to leave out legs of multivariate event collections.
         max_pages: Most pages fetched; positive.
+        series_ticker: Ask only for this series' markets, with ``GET /markets``'s
+            ``series_ticker`` filter; ``None`` lists every series.
 
     Returns:
         The summaries, and whether the listing was cut short or skipped any market.
@@ -106,6 +110,7 @@ async def list_open_markets(
             cursor=cursor,
             limit=MARKET_PAGE_LIMIT,
             mve_filter=mve_filter,
+            series_ticker=series_ticker,
         )
         for market in page.items:
             try:
@@ -122,6 +127,56 @@ async def list_open_markets(
         truncated=truncated,
         unreadable=unreadable,
         first_error=first_error,
+    )
+
+
+async def list_series_markets(
+    rest: KalshiRest, series: Iterable[str], *, exclude_mve: bool, max_pages: int
+) -> MarketListing:
+    """List the open markets of the named series only, one filtered listing per series.
+
+    This is the targeted listing that replaces a closed market between two full listings
+    (ADR 0029). A market whose ticker is not of the series asked for is left out, so a filter
+    the server ignored cannot bring in the rest of the exchange.
+
+    Args:
+        rest: The REST client; its limiter paces every page.
+        series: Series tickers, listed in this order; one named twice is listed once.
+        exclude_mve: Ask Kalshi to leave out legs of multivariate event collections.
+        max_pages: Most pages fetched for each series; positive.
+
+    Returns:
+        The markets of every series in the order listed; cut short when any series' listing
+        was, and counting the markets skipped in all of them.
+
+    Raises:
+        ValueError: If ``max_pages`` is not positive.
+        KalshiError: If a page cannot be fetched.
+        WireError: If a page does not decode.
+    """
+    if max_pages <= 0:
+        raise ValueError(f"max_pages must be positive, got {max_pages}")
+    listings = [
+        (
+            name,
+            await list_open_markets(
+                rest, exclude_mve=exclude_mve, max_pages=max_pages, series_ticker=name
+            ),
+        )
+        for name in dict.fromkeys(series)
+    ]
+    return MarketListing(
+        markets=tuple(
+            market
+            for name, listing in listings
+            for market in listing.markets
+            if market.series_ticker == name
+        ),
+        truncated=any(listing.truncated for _, listing in listings),
+        unreadable=sum(listing.unreadable for _, listing in listings),
+        first_error=next(
+            (listing.first_error for _, listing in listings if listing.first_error), ""
+        ),
     )
 
 

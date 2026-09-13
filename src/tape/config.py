@@ -41,7 +41,12 @@ from tape.recorder.recorder import (
     check_connection_budget,
     check_keyframe_interval,
 )
-from tape.recorder.universe import UniverseGroup, UniversePolicy
+from tape.recorder.universe import (
+    MARKET_ORDER_VOLUME,
+    MarketOrder,
+    UniverseGroup,
+    UniversePolicy,
+)
 from tape.recorder.writer import DEFAULT_MAX_QUEUED_RECORDS
 
 __all__ = [
@@ -253,10 +258,12 @@ class UniverseGroupSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_un
         category: Kalshi series category the group selects from, for example ``"Sports"``.
         events: Events admitted: per series, the nearest, for a series group; across the group,
             the busiest by 24-hour volume summed over the event, for a category group.
-        markets_per_event: Most markets admitted from one event, highest 24-hour volume first.
+        markets_per_event: Most markets admitted from one event, first in ``market_order``.
         max_markets: Most markets the group admits in all; unset, only the other caps apply.
         max_hours_to_close: Only events whose earliest close is within this many hours, inclusive,
             are eligible for the group; unset, events of any horizon are.
+        market_order: ``"volume"``, the default, takes an event's busiest markets first;
+            ``"near_price"`` takes those nearest the current price first (ADR 0029).
 
     Raises:
         ValueError: If the group sets both selectors or neither, or lists a series twice; the
@@ -270,6 +277,7 @@ class UniverseGroupSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_un
     markets_per_event: PositiveInt
     max_markets: PositiveInt | None = None
     max_hours_to_close: PositiveInt | None = None
+    market_order: MarketOrder = MARKET_ORDER_VOLUME
 
     def __post_init__(self) -> None:
         self.group()
@@ -291,6 +299,7 @@ class UniverseGroupSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_un
             category=self.category,
             max_markets=self.max_markets,
             max_hours_to_close=self.max_hours_to_close,
+            market_order=self.market_order,
         )
 
 

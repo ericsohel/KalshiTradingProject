@@ -16,6 +16,7 @@ from tape.recorder.listing import (
     MARKET_PAGE_LIMIT,
     SeriesCategories,
     list_open_markets,
+    list_series_markets,
     series_per_category,
 )
 from tape.timeutil import NS_PER_S, FrozenClock
@@ -116,6 +117,44 @@ async def test_a_listing_cut_short_by_the_page_cap_says_so(
     assert not any("mve_filter" in request.url.params for request in exchange.requests)
     with pytest.raises(ValueError, match="max_pages must be positive, got 0"):
         await list_open_markets(rest, exclude_mve=True, max_pages=0)
+
+
+async def test_a_series_listing_filters_each_series_and_keeps_only_its_markets(
+    exchange: Exchange, rest: KalshiRest
+) -> None:
+    """ADR 0029: one filtered listing per series, capped per series, merged in the order named."""
+
+    def by_series(request: httpx.Request) -> httpx.Response:
+        series = request.url.params["series_ticker"]
+        if series == "KXA":
+            cursor = request.url.params.get("cursor")
+            if cursor is None:
+                return page(market_payload("KXA-E-1"), cursor="page-2")
+            return page(market_payload("KXA-E-2"), market_payload("KXA-E-BAD", volume_24h="x"))
+        # A filter the server ignored brings in another series' market, which is left out.
+        return page(market_payload("KXB-E-1"), market_payload("KXOTHER-E-1"), cursor="more")
+
+    exchange.answers["/markets"] = [by_series]
+    listing = await list_series_markets(rest, ["KXB", "KXA", "KXB"], exclude_mve=True, max_pages=2)
+
+    assert [market.ticker for market in listing.markets] == [
+        "KXB-E-1",
+        "KXB-E-1",
+        "KXA-E-1",
+        "KXA-E-2",
+    ]
+    assert (listing.truncated, listing.unreadable) == (True, 1)
+    assert listing.first_error.startswith("FixedPointError(")
+    params = [dict(request.url.params) for request in exchange.requests]
+    base = {"status": "open", "limit": str(MARKET_PAGE_LIMIT), "mve_filter": "exclude"}
+    assert params == [
+        base | {"series_ticker": "KXB"},
+        base | {"series_ticker": "KXB", "cursor": "more"},
+        base | {"series_ticker": "KXA"},
+        base | {"series_ticker": "KXA", "cursor": "page-2"},
+    ]
+    with pytest.raises(ValueError, match="max_pages must be positive, got 0"):
+        await list_series_markets(rest, ["KXA"], exclude_mve=True, max_pages=0)
 
 
 # ----------------------------------------------------------------- categories

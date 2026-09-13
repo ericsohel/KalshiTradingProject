@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Final
 
+import msgspec
 import pytest
 
 from tape.api import UNRESOLVED, MarketDirectory, MarketMetadata
@@ -20,9 +21,14 @@ from tape.api.contract import (
 )
 from tape.book import Book
 from tape.events import (
+    LIFECYCLE_ACTIVATED,
+    LIFECYCLE_CLOSE_DATE_UPDATED,
+    LIFECYCLE_DETERMINED,
+    LIFECYCLE_SETTLED,
     CatalogEntry,
     ConnectionReport,
     Level,
+    Lifecycle,
     MarketCatalog,
     Receipt,
     StatusReport,
@@ -34,6 +40,8 @@ from tape.timeutil import NS_PER_S, Ms, Ns
 RECEIPT: Final = Receipt(conn_id=0, recv_mono_ns=Ns(1), recv_wall_ns=Ns(1))
 BUS: Final = BusHealth(epoch="7", last_seq=9, messages=9, resets=1, missed=0, books_known=2)
 CLOSE_TS: Final = 1_800_000_000
+NOW: Final = CLOSE_TS - 60
+"""A minute before every market of :func:`entry` closes."""
 METADATA: Final = MarketMetadata(
     title="Highest temperature in NYC today?",
     subtitle="84° to 85°",
@@ -89,16 +97,16 @@ def test_markets_rank_by_volume_then_ticker_and_the_limit_takes_the_top() -> Non
     directory = MarketDirectory()
     directory.apply_catalog(catalog(entry("KXB-1", 500), entry("KXA-1", 500), entry("KXC-1", 900)))
 
-    assert [e.ticker for e in directory.top(3)] == ["KXC-1", "KXA-1", "KXB-1"]
-    assert [e.ticker for e in directory.top(2)] == ["KXC-1", "KXA-1"]
-    assert [e.ticker for e in directory.top(200)] == ["KXC-1", "KXA-1", "KXB-1"]
+    assert [e.ticker for e in directory.top(3, now_ts=NOW)] == ["KXC-1", "KXA-1", "KXB-1"]
+    assert [e.ticker for e in directory.top(2, now_ts=NOW)] == ["KXC-1", "KXA-1"]
+    assert [e.ticker for e in directory.top(200, now_ts=NOW)] == ["KXC-1", "KXA-1", "KXB-1"]
     with pytest.raises(ValueError, match="limit must be positive"):
-        directory.top(0)
+        directory.top(0, now_ts=NOW)
 
 
 def test_a_catalog_replaces_the_previous_one_whole() -> None:
     directory = MarketDirectory()
-    assert directory.top(10) == ()
+    assert directory.top(10, now_ts=NOW) == ()
     directory.apply_catalog(catalog(entry("KXA-1"), entry("KXB-1")))
     directory.apply_catalog(catalog(entry("KXB-1", 7), entry("KXC-1")))
 
@@ -227,3 +235,87 @@ def test_the_recorder_counts_as_recording_while_its_report_is_within_two_interva
     )
     late = directory.service_status(now_mono_ns=1_001 + 120 * NS_PER_S, bus=BUS, clients=0)
     assert (late.recording, late.recorder) == (False, at_limit.recorder)
+
+
+def lifecycle(ticker: str, event_type: str, *, close_ts: int | None = None) -> Lifecycle:
+    return Lifecycle(
+        ticker=ticker,
+        receipt=RECEIPT,
+        sid=1,
+        seq=1,
+        event_type=event_type,
+        payload_json="{}",
+        close_ts=close_ts,
+    )
+
+
+def listed(directory: MarketDirectory, now_ts: int) -> list[str]:
+    return [market.ticker for market in directory.top(200, now_ts=now_ts)]
+
+
+def test_a_market_leaves_the_list_at_its_close_time_but_keeps_its_detail() -> None:
+    """ADR 0029: the list omits a closed market; its detail still answers, so a viewer on it
+    can show that it closed."""
+    directory = MarketDirectory()
+    soon = msgspec.structs.replace(entry("KXA-1", 900), close_ts=NOW + 30)
+    unknown = msgspec.structs.replace(entry("KXB-1", 100), close_ts=None)
+    directory.apply_catalog(catalog(soon, unknown, entry("KXC-1", 500)))
+
+    assert listed(directory, NOW + 29) == ["KXA-1", "KXC-1", "KXB-1"]
+    assert listed(directory, NOW + 30) == ["KXC-1", "KXB-1"]
+    assert listed(directory, CLOSE_TS) == ["KXB-1"]
+    assert directory.top(1, now_ts=CLOSE_TS) == (unknown,)
+    assert directory.entry("KXA-1") == soon
+    assert not directory.is_open(soon, now_ts=NOW + 30)
+    detail = directory.detail(soon, metadata=UNRESOLVED, book=None)
+    assert (detail.ticker, detail.close_ts) == ("KXA-1", NOW + 30)
+
+
+@pytest.mark.parametrize("event_type", [LIFECYCLE_DETERMINED, LIFECYCLE_SETTLED])
+def test_a_determined_or_settled_market_leaves_the_list_before_its_close_time(
+    event_type: str,
+) -> None:
+    directory = MarketDirectory()
+    directory.apply_catalog(catalog(entry("KXA-1", 900), entry("KXB-1", 100)))
+    directory.apply_lifecycle(lifecycle("KXA-1", LIFECYCLE_ACTIVATED))
+    assert listed(directory, NOW) == ["KXA-1", "KXB-1"]
+
+    directory.apply_lifecycle(lifecycle("KXA-1", event_type))
+    assert listed(directory, NOW) == ["KXB-1"]
+    assert "KXA-1" in directory
+
+
+def test_a_close_date_update_moves_the_close_the_list_and_rows_use() -> None:
+    directory = MarketDirectory()
+    market = entry("KXA-1", 900)
+    directory.apply_catalog(catalog(market, entry("KXB-1", 100)))
+
+    directory.apply_lifecycle(lifecycle("KXA-1", LIFECYCLE_CLOSE_DATE_UPDATED, close_ts=NOW + 1))
+    assert listed(directory, NOW) == ["KXA-1", "KXB-1"]
+    assert listed(directory, NOW + 1) == ["KXB-1"]
+    assert directory.row(market, metadata=UNRESOLVED, book=None).close_ts == NOW + 1
+
+    # Pushed later again, and an update without a close time changes nothing.
+    directory.apply_lifecycle(
+        lifecycle("KXA-1", LIFECYCLE_CLOSE_DATE_UPDATED, close_ts=CLOSE_TS + 9)
+    )
+    directory.apply_lifecycle(lifecycle("KXA-1", LIFECYCLE_CLOSE_DATE_UPDATED))
+    assert listed(directory, CLOSE_TS) == ["KXA-1"]
+    assert directory.close_ts(market) == CLOSE_TS + 9
+
+
+def test_lifecycle_notes_follow_the_catalog_and_a_new_catalog_replaces_them() -> None:
+    directory = MarketDirectory()
+    # Before any catalog, and for a market outside it, nothing is kept.
+    directory.apply_lifecycle(lifecycle("KXA-1", LIFECYCLE_DETERMINED))
+    directory.apply_catalog(catalog(entry("KXA-1", 900), entry("KXB-1", 100)))
+    directory.apply_lifecycle(lifecycle("KXZ-1", LIFECYCLE_DETERMINED))
+    assert listed(directory, NOW) == ["KXA-1", "KXB-1"]
+
+    directory.apply_lifecycle(lifecycle("KXA-1", LIFECYCLE_SETTLED))
+    directory.apply_lifecycle(lifecycle("KXB-1", LIFECYCLE_CLOSE_DATE_UPDATED, close_ts=NOW))
+    assert listed(directory, NOW) == []
+
+    directory.apply_catalog(catalog(entry("KXA-1", 900), entry("KXB-1", 100)))
+    assert listed(directory, NOW) == ["KXA-1", "KXB-1"]
+    assert directory.close_ts(entry("KXB-1")) == CLOSE_TS

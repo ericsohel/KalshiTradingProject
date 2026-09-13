@@ -221,24 +221,33 @@ def test_the_server_example_records_the_groups_of_adr_0028(tmp_path: Path, home:
             events=1,
             markets_per_event=1,
         ),
-        UniverseGroup(name="Bitcoin hourly", series=("KXBTCD",), events=1, markets_per_event=6),
+        UniverseGroup(
+            name="Bitcoin hourly",
+            series=("KXBTCD",),
+            events=1,
+            markets_per_event=6,
+            market_order="near_price",
+        ),
         UniverseGroup(
             name="stock indexes hourly",
             series=("KXINXU", "KXNASDAQ100U"),
             events=1,
             markets_per_event=6,
+            market_order="near_price",
         ),
         UniverseGroup(
             name="economy",
             series=("KXFEDDECISION", "KXCPIYOY", "KXPAYROLLS", "KXAAAGASW"),
             events=1,
             markets_per_event=6,
+            market_order="near_price",
         ),
         UniverseGroup(
             name="weather",
             series=("KXHIGHNY", "KXHIGHLAX", "KXHIGHCHI", "KXHIGHMIA"),
             events=1,
             markets_per_event=6,
+            market_order="near_price",
         ),
         UniverseGroup(name="politics", category="Politics", events=5, markets_per_event=1),
         UniverseGroup(
@@ -517,15 +526,18 @@ def test_universe_groups_are_read_in_order_into_the_policy(tmp_path: Path, table
             "markets_per_event": 2,
             "max_markets": 15,
             "max_hours_to_close": 6,
+            "market_order": "near_price",
         },
     )
     policy = settings.recorder.universe.policy()
+    # A group without market_order, as every configuration written before ADR 0029, keeps volume.
     assert policy.groups == (
         UniverseGroup(
             name="crypto 15-minute",
             series=("KXBTC15M", "KXETH15M"),
             events=1,
             markets_per_event=1,
+            market_order="volume",
         ),
         UniverseGroup(
             name="sports",
@@ -534,6 +546,7 @@ def test_universe_groups_are_read_in_order_into_the_policy(tmp_path: Path, table
             markets_per_event=2,
             max_markets=15,
             max_hours_to_close=6,
+            market_order="near_price",
         ),
     )
     assert policy.categories == frozenset({"Sports"})
@@ -545,6 +558,7 @@ def test_universe_groups_are_read_in_order_into_the_policy(tmp_path: Path, table
         "markets_per_event": 2,
         "max_markets": 15,
         "max_hours_to_close": 6,
+        "market_order": "near_price",
     }
 
 
@@ -577,6 +591,10 @@ def test_universe_groups_are_read_in_order_into_the_policy(tmp_path: Path, table
         (
             {"max_hours_to_close": 0},
             r">= 1 - at `\$\.recorder\.universe\.groups\[1\]\.max_hours_to_close`",
+        ),
+        (
+            {"market_order": "closest"},
+            r"'closest' - at `\$\.recorder\.universe\.groups\[1\]\.market_order`",
         ),
         (
             {"showcase": True},

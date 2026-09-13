@@ -11,9 +11,11 @@ from typing import Final
 import httpx
 import pytest
 
-from tape.cli import main, preview_universe, render_universe_preview
+from tape.cli import UniversePreview, main, preview_universe, render_universe_preview
 from tape.client.ratelimit import BucketLimits, BucketRateLimiter
 from tape.config import Settings, load_settings
+from tape.fixedpoint import CountE2, PriceE4
+from tape.recorder.universe import MarketSummary, UniverseGroup, UniversePolicy, select
 from tape.timeutil import NS_PER_MS, NS_PER_S, Clock, FrozenClock
 from tests.fakes.rest_payloads import market_payload, series_payload
 
@@ -80,18 +82,20 @@ EXPECTED: Final = "\n".join(
         "Universe at 2030-01-01T12:00:00Z: 7 open markets listed in 500 ms",
         "Series per category: Sports 3",
         "Series with no open market: KXGONE",
-        "Markets: ticker, series, 24-hour volume, close time (UTC)",
+        "Markets: ticker, series, 24-hour volume, YES mid, close time (UTC)",
         "",
-        "1. crypto 15-minute: series KXBTC15M, KXGONE; events 1 per series; markets_per_event 1",
+        "1. crypto 15-minute: series KXBTC15M, KXGONE; events 1 per series; markets_per_event 1; "
+        "market_order volume",
         "   admitted 1, events 1, skipped for budget 0",
         "   KXBTC15M-30JAN011215",
-        "     KXBTC15M-30JAN011215-15      KXBTC15M    900.00  2030-01-01T12:15:00Z",
+        "     KXBTC15M-30JAN011215-15      KXBTC15M    900.00  0.5000  2030-01-01T12:15:00Z",
         "",
-        "2. sports: category Sports; events 2; markets_per_event 2; max_markets 3",
+        "2. sports: category Sports; events 2; markets_per_event 2; max_markets 3; "
+        "market_order volume",
         "   admitted 2, events 1, skipped for budget 1",
         "   KXNFLGAME-30JAN01NYJBUF",
-        "     KXNFLGAME-30JAN01NYJBUF-NYJ  KXNFLGAME  7000.00  2030-01-01T20:00:00Z",
-        "     KXNFLGAME-30JAN01NYJBUF-BUF  KXNFLGAME  6000.00  2030-01-01T20:00:00Z",
+        "     KXNFLGAME-30JAN01NYJBUF-NYJ  KXNFLGAME  7000.00  0.5000  2030-01-01T20:00:00Z",
+        "     KXNFLGAME-30JAN01NYJBUF-BUF  KXNFLGAME  6000.00  0.5000  2030-01-01T20:00:00Z",
         "",
         "Total: admitted 3 of max_l2_markets 3, skipped for budget 1",
         "Not recorded: duplicate 0, not_active 0, mve 0, closed 0, beyond_horizon 0, no_group 0, "
@@ -230,7 +234,7 @@ async def test_a_group_horizon_is_shown_and_sets_aside_events_closing_later(
     text = await preview_with(settings, Exchange(clock), clock)
     assert (
         "2. sports: category Sports; events 2; markets_per_event 2; max_markets 3; "
-        "max_hours_to_close 10\n"
+        "max_hours_to_close 10; market_order volume\n"
         "   admitted 2, events 1, skipped for budget 0\n"
     ) in text
     # The game at 23:00 and the one after midnight close more than ten hours after noon.
@@ -278,7 +282,10 @@ def test_the_command_prints_the_preview_and_needs_no_credentials(
 
     out = capsys.readouterr().out
     assert "7 open markets listed in" in out
-    assert "     KXNFLGAME-30JAN01NYJBUF-NYJ  KXNFLGAME  7000.00  2030-01-01T20:00:00Z\n" in out
+    assert (
+        "     KXNFLGAME-30JAN01NYJBUF-NYJ  KXNFLGAME  7000.00  0.5000  2030-01-01T20:00:00Z\n"
+        in out
+    )
     assert out.endswith("over_max_markets 1, over_cap 1\n")
     assert str(exchange.requests[0].url).startswith(
         "https://external-api.kalshi.com/trade-api/v2/markets?"
@@ -303,3 +310,63 @@ def test_a_listing_that_fails_exits_1_and_prints_no_preview(
     assert captured.out == ""
     assert "universe preview failed" in captured.err
     assert exchange.paths() == ["/markets"]
+
+
+def test_the_preview_shows_each_group_s_market_order_and_each_market_s_mid() -> None:
+    group = UniverseGroup(
+        name="Bitcoin hourly",
+        series=("KXBTCD",),
+        events=1,
+        markets_per_event=4,
+        market_order="near_price",
+    )
+    policy = UniversePolicy(min_volume_24h=CountE2(0), max_l2_markets=5, groups=(group,))
+
+    def strike(suffix: str, *, bid: int | None, ask: int | None, last: int | None) -> MarketSummary:
+        return MarketSummary(
+            ticker=f"KXBTCD-30JAN0113-{suffix}",
+            series_ticker="KXBTCD",
+            event_ticker="KXBTCD-30JAN0113",
+            exchange_index=0,
+            status="active",
+            volume_24h=CountE2(100),
+            close_ts=NOON + 3_600,
+            is_mve=False,
+            strike_type="greater",
+            yes_bid=None if bid is None else PriceE4(bid),
+            yes_ask=None if ask is None else PriceE4(ask),
+            last_price=None if last is None else PriceE4(last),
+        )
+
+    markets = [
+        strike("T1", bid=4_800, ask=5_100, last=None),
+        strike("T2", bid=None, ask=None, last=None),
+        strike("T3", bid=None, ask=9_000, last=1_500),
+        strike("T4", bid=9_800, ask=9_900, last=None),
+    ]
+    preview = UniversePreview(
+        as_of_ts=NOON,
+        listed=len(markets),
+        truncated=False,
+        unreadable=0,
+        listing_ms=0,
+        categories_known=None,
+        series_by_category={},
+        series_without_markets=(),
+        policy=policy,
+        decision=select(markets, policy, now_ts=NOON),
+    )
+
+    assert render_universe_preview(preview).splitlines()[2:9] == [
+        "",
+        "1. Bitcoin hourly: series KXBTCD; events 1 per series; markets_per_event 4; "
+        "market_order near_price",
+        "   admitted 4, events 1, skipped for budget 0",
+        "   KXBTCD-30JAN0113",
+        "     KXBTCD-30JAN0113-T1  KXBTCD  1.00    0.4950  2030-01-01T13:00:00Z",
+        "     KXBTCD-30JAN0113-T3  KXBTCD  1.00    0.1500  2030-01-01T13:00:00Z",
+        "     KXBTCD-30JAN0113-T4  KXBTCD  1.00    0.9850  2030-01-01T13:00:00Z",
+    ]
+    assert "     KXBTCD-30JAN0113-T2  KXBTCD  1.00  no price  2030-01-01T13:00:00Z\n" in (
+        render_universe_preview(preview)
+    )

@@ -3,37 +3,44 @@
 Responsibility: turn a REST market listing into the set of tickers the recorder subscribes to
 on ``orderbook_delta`` and ``trade`` (docs/ARCHITECTURE.md 5.1) by applying the configured
 universe groups in order (ADR 0028), with the counts that explain every market not recorded
-and what each group admitted. The module is pure: it reads no clock and performs no I/O, so
-``now_ts`` and the series categories are supplied by the caller and the same input always
-produces the same decision.
+and what each group admitted. Within a chosen event a group takes markets by 24-hour volume or,
+with ``market_order = "near_price"``, nearest the current price first (ADR 0029). Between two
+full listings a caller may pin groups to the markets they admitted before, so that a decision
+re-applies only the groups whose markets it listed again. The module is pure: it reads no clock
+and performs no I/O, so ``now_ts`` and the series categories are supplied by the caller and the
+same input always produces the same decision.
 
 Invariants: a rejected market never appears in the decision; every admitted market was
 admitted by exactly one group, the first in order that chose it, and no group sees a market an
 earlier group chose; the decision holds at most ``max_l2_markets`` markets; a group admits at
 most ``markets_per_event`` markets of one event, at most ``max_markets`` in all, and at most
 ``events`` events, counted per series in a series group, and, when it sets
-``max_hours_to_close``, only events whose earliest close is within that horizon; the reason
-counts plus the size of
+``max_hours_to_close``, only events whose earliest close is within that horizon; a pinned group
+admits only markets it is pinned to, in the order given; the reason counts plus the size of
 ``l2_tickers`` account for every market handed in; the decision's summaries describe exactly
 the markets in ``l2_tickers``; and nothing depends on the order the markets arrive in.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Literal
 
 import msgspec
 
 from tape.errors import WireError
-from tape.fixedpoint import CountE2, parse_count
+from tape.fixedpoint import PRICE_MAX, PRICE_SCALE, CountE2, PriceE4, parse_count, parse_price
 from tape.wire.rest import Market
 
 __all__ = [
     "ACTIVE_STATUS",
     "DEFAULT_EXCHANGE_INDEX",
+    "MARKET_ORDERS",
+    "MARKET_ORDER_NEAR_PRICE",
+    "MARKET_ORDER_VOLUME",
+    "RANGE_STRIKE_TYPE",
     "REASONS",
     "REASON_BELOW_VOLUME",
     "REASON_BEYOND_HORIZON",
@@ -47,16 +54,37 @@ __all__ = [
     "REASON_OVER_CAP",
     "REASON_OVER_EVENT_CAP",
     "REASON_OVER_GROUP_CAP",
+    "THRESHOLD_STRIKE_TYPES",
     "GroupSelection",
+    "MarketOrder",
     "MarketSummary",
     "UniverseDecision",
     "UniverseGroup",
     "UniversePolicy",
     "select",
+    "series_of",
+    "yes_mid",
 ]
 
 ACTIVE_STATUS: Final = "active"
 """The only market status worth an order-book subscription; everything else is idle."""
+
+type MarketOrder = Literal["volume", "near_price"]
+"""How a group orders an event's markets before taking ``markets_per_event`` of them."""
+
+MARKET_ORDER_VOLUME: Final = "volume"
+"""Highest 24-hour volume first: the default."""
+MARKET_ORDER_NEAR_PRICE: Final = "near_price"
+"""Nearest the current price first (ADR 0029); see :func:`select`."""
+MARKET_ORDERS: Final = (MARKET_ORDER_VOLUME, MARKET_ORDER_NEAR_PRICE)
+
+RANGE_STRIKE_TYPE: Final = "between"
+"""``strike_type`` of a range bucket, which settles YES when the value falls between two strikes."""
+THRESHOLD_STRIKE_TYPES: Final = frozenset({"greater", "greater_or_equal", "less", "less_or_equal"})
+"""``strike_type`` values of a threshold, which settles YES on one side of one strike.
+
+The pinned spec also lists ``functional``, ``custom``, and ``structured``, which are neither.
+"""
 
 DEFAULT_EXCHANGE_INDEX: Final = 0
 """Shard assumed when a market omits ``exchange_index``.
@@ -112,7 +140,27 @@ _ONE_SECOND: Final = timedelta(seconds=1)
 _GO_ZERO_YEAR: Final = 1
 """Year of Go's zero time, which Kalshi sends for a timestamp it does not have."""
 _SECONDS_PER_HOUR: Final = 3_600
+_HALF_PRICE: Final = PRICE_SCALE // 2
 _NO_CATEGORIES: Final[Mapping[str, str]] = MappingProxyType({})
+_NOTHING_PINNED: Final[Mapping[str, Sequence[str]]] = MappingProxyType({})
+
+type _MarketRank = tuple[int, int, int, tuple[int, int], str]
+"""Sort key of a market within its event: priced first, distance from the price, then volume."""
+
+
+def series_of(ticker: str) -> str:
+    """The series a market or event belongs to: its ticker's first dash-separated segment.
+
+    The pinned spec carries no series on a market, and every Kalshi ticker follows this
+    convention (docs/DATA_FORMATS.md 1.4).
+
+    Args:
+        ticker: A market or event ticker, such as ``KXBTCD-26SEP1317-T77499.99``.
+
+    Returns:
+        The series ticker, such as ``KXBTCD``; a ticker without a dash is its own series.
+    """
+    return ticker.split(_SERIES_SEPARATOR, 1)[0]
 
 
 class UniverseGroup(msgspec.Struct, frozen=True, kw_only=True):
@@ -124,7 +172,7 @@ class UniverseGroup(msgspec.Struct, frozen=True, kw_only=True):
             open events of each series, by the earliest close among each event's markets. A
             category group counts across the group: the ``events`` events with the highest
             24-hour volume, summed over their markets, at or above the policy's floor.
-        markets_per_event: Most markets admitted from one event, highest 24-hour volume first.
+        markets_per_event: Most markets admitted from one event, first in ``market_order``.
         series: Series tickers the group selects from, in the order their events are admitted.
             Exactly one of ``series`` and ``category`` is set.
         category: Kalshi series category the group selects from, for example ``Sports``.
@@ -134,11 +182,14 @@ class UniverseGroup(msgspec.Struct, frozen=True, kw_only=True):
             hours after ``now_ts``, inclusive; an event with no known close is not. It applies
             before events are ranked, so a series group takes the nearest events within it and
             a category group ranks only events within it. ``None`` sets no horizon.
+        market_order: Which of a chosen event's markets come first: ``"volume"``, the highest
+            24-hour volume, or ``"near_price"``, the markets nearest the current price, as
+            :func:`select` defines it.
 
     Raises:
         ValueError: On an empty name, both selectors or neither, an empty or repeated series, an
-            empty category, or a count or horizon that is not positive. The message names the
-            group.
+            empty category, a count or horizon that is not positive, or an unknown market order.
+            The message names the group.
     """
 
     name: str
@@ -148,11 +199,17 @@ class UniverseGroup(msgspec.Struct, frozen=True, kw_only=True):
     category: str | None = None
     max_markets: int | None = None
     max_hours_to_close: int | None = None
+    market_order: MarketOrder = MARKET_ORDER_VOLUME
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("a universe group needs a non-empty name")
         label = f"universe group {self.name!r}"
+        if self.market_order not in MARKET_ORDERS:
+            raise ValueError(
+                f"{label}: market_order must be one of {', '.join(MARKET_ORDERS)}, "
+                f"got {self.market_order!r}"
+            )
         if (self.series is None) == (self.category is None):
             raise ValueError(f"{label} must set exactly one of series and category")
         if self.series is not None:
@@ -235,6 +292,12 @@ class MarketSummary(msgspec.Struct, frozen=True, kw_only=True):
         volume_24h: Contracts traded in the last 24 hours.
         close_ts: Unix seconds at which the market closes, or ``None`` when unknown.
         is_mve: Whether the market is a leg of a multivariate event collection.
+        strike_type: How the strike is defined, verbatim: :data:`RANGE_STRIKE_TYPE` for a range
+            bucket, one of :data:`THRESHOLD_STRIKE_TYPES` for a threshold, or ``None`` when the
+            listing omits it.
+        yes_bid: The best YES bid when the market was listed, or ``None`` when there was none.
+        yes_ask: The best YES ask when the market was listed, or ``None`` when there was none.
+        last_price: The price of the last trade, or ``None`` before the first one.
     """
 
     ticker: str
@@ -245,6 +308,10 @@ class MarketSummary(msgspec.Struct, frozen=True, kw_only=True):
     volume_24h: CountE2
     close_ts: int | None
     is_mve: bool
+    strike_type: str | None = None
+    yes_bid: PriceE4 | None = None
+    yes_ask: PriceE4 | None = None
+    last_price: PriceE4 | None = None
 
     @classmethod
     def from_wire(cls, market: Market, *, is_mve: bool = False) -> MarketSummary:
@@ -258,6 +325,10 @@ class MarketSummary(msgspec.Struct, frozen=True, kw_only=True):
         the universe query passes ``mve_filter=exclude`` anyway, so the flag is a second
         line of defence rather than the first.
 
+        The listing always carries the three prices. It sends ``"0.0000"`` for a bid or a last
+        price that does not exist and ``"1.0000"`` for an ask that does not exist, neither of
+        which a market can trade at, so those become ``None``, as does an empty string.
+
         Args:
             market: Decoded ``GET /markets`` entry.
             is_mve: Whether this market is a leg of a multivariate event collection.
@@ -267,11 +338,12 @@ class MarketSummary(msgspec.Struct, frozen=True, kw_only=True):
 
         Raises:
             WireError: If ``close_time`` is present but is not an ISO-8601 instant.
-            FixedPointError: If ``volume_24h_fp`` is not an exact fixed-point count.
+            FixedPointError: If ``volume_24h_fp`` is not an exact fixed-point count, or a price
+                is present but is not an exact fixed-point price.
         """
         return cls(
             ticker=market.ticker,
-            series_ticker=market.ticker.split(_SERIES_SEPARATOR, 1)[0],
+            series_ticker=series_of(market.ticker),
             event_ticker=market.event_ticker,
             exchange_index=(
                 DEFAULT_EXCHANGE_INDEX if market.exchange_index is None else market.exchange_index
@@ -280,6 +352,10 @@ class MarketSummary(msgspec.Struct, frozen=True, kw_only=True):
             volume_24h=parse_count(market.volume_24h_fp),
             close_ts=_parse_close_ts(market.close_time, ticker=market.ticker),
             is_mve=is_mve,
+            strike_type=market.strike_type,
+            yes_bid=_parse_quote(market.yes_bid_dollars, absent=PriceE4(0)),
+            yes_ask=_parse_quote(market.yes_ask_dollars, absent=PRICE_MAX),
+            last_price=_parse_quote(market.last_price_dollars, absent=PriceE4(0)),
         )
 
 
@@ -289,7 +365,7 @@ class GroupSelection(msgspec.Struct, frozen=True, kw_only=True):
     Attributes:
         name: The group's name.
         tickers: Markets the group admitted, in the order it ranked them: event by event, and
-            within an event by descending 24-hour volume.
+            within an event in the group's ``market_order``.
         events: Events with at least one admitted market.
         skipped_for_budget: Markets the group chose that did not fit in ``max_l2_markets``.
     """
@@ -354,6 +430,40 @@ def _parse_close_ts(close_time: str, *, ticker: str) -> int | None:
     return (parsed - _UNIX_EPOCH) // _ONE_SECOND
 
 
+def _parse_quote(text: str, *, absent: PriceE4) -> PriceE4 | None:
+    """Convert a listing's dollar price, reading its placeholder for no price as ``None``.
+
+    Args:
+        text: The price string, possibly empty.
+        absent: The price the listing sends when there is none.
+
+    Returns:
+        The price, or ``None`` for an empty string or the placeholder.
+
+    Raises:
+        FixedPointError: If the value is non-empty and not an exact fixed-point price.
+    """
+    if not text:
+        return None
+    price = parse_price(text)
+    return None if price == absent else price
+
+
+def yes_mid(market: MarketSummary) -> PriceE4 | None:
+    """The YES price that ``near_price`` measures a market by (ADR 0029).
+
+    Args:
+        market: A listed market.
+
+    Returns:
+        The average of the YES bid and ask, rounded down to a whole ``PriceE4``, when the listing
+        has both; otherwise the last price; ``None`` when it has neither.
+    """
+    if market.yes_bid is not None and market.yes_ask is not None:
+        return PriceE4((market.yes_bid + market.yes_ask) // 2)
+    return market.last_price
+
+
 def _rejection(market: MarketSummary, policy: UniversePolicy, *, now_ts: int) -> str | None:
     """Return the reason this market is not eligible, or ``None`` if it is.
 
@@ -389,6 +499,7 @@ def select(
     *,
     now_ts: int,
     categories: Mapping[str, str] = _NO_CATEGORIES,
+    pinned: Mapping[str, Sequence[str]] = _NOTHING_PINNED,
 ) -> UniverseDecision:
     """Choose the markets to capture in full.
 
@@ -405,18 +516,37 @@ def select(
     an event with no known close ranks last. A category
     group takes the ``events`` events of its category with the highest 24-hour volume summed
     over the event, among those at or above ``min_volume_24h``. From each chosen event a group
-    takes at most ``markets_per_event`` markets by descending volume, and of all those, the
-    first ``max_markets``. Ties break by close time, then ticker, so the result does not depend
+    takes at most ``markets_per_event`` markets in its ``market_order``, and of all those, the
+    first ``max_markets``.
+
+    - **``volume``** takes the highest 24-hour volume first.
+    - **``near_price``** takes the markets nearest the current price first, measured by
+      :func:`yes_mid`. In an event whose markets are all thresholds, the mid closest to 50 cents
+      comes first: those strikes are nearest the underlying's price. In any other event, the
+      highest mid comes first, because its markets are alternative outcomes, such as range
+      buckets and the open-ended thresholds at either end of their ladder, and the likeliest
+      are those around the price. Markets without a price come after every priced one, by
+      volume.
+
+    Remaining ties break by volume, then close time, then ticker, so the result does not depend
     on the order the pages arrived in. Chosen markets are admitted in that order until
     ``max_l2_markets`` is reached; the rest, and everything later groups choose, are skipped for
     budget.
+
+    A group named in ``pinned`` is not applied again. It admits the markets it is pinned to that
+    are still eligible and that no earlier group chose, in the order given, while the budget
+    lasts, and nothing else; a market handed in that only it could have chosen counts as
+    ``no_group``.
 
     Args:
         markets: Summaries of every market the recorder knows about.
         policy: The configured universe shape.
         now_ts: Unix seconds the decision is being made at.
-        categories: Category of each series, by series ticker. Only category groups read it,
-            and a series missing from it matches none of them.
+        categories: Category of each series, by series ticker. Only category groups that are not
+            pinned read it, and a series missing from it matches none of them.
+        pinned: Markets a group admitted at an earlier decision, in admission order, by group
+            name. Between full listings the recorder pins every group it does not re-apply
+            (ADR 0029).
 
     Returns:
         The decision, with the reason counts and what each group admitted.
@@ -430,14 +560,18 @@ def select(
     selections: list[GroupSelection] = []
     budget = policy.max_l2_markets
     for group in policy.groups:
-        candidates = [m for m in unchosen.values() if _selects(group, m, categories)]
-        chosen = _choose(
-            group,
-            candidates,
-            floor=policy.min_volume_24h,
-            now_ts=now_ts,
-            rejected=passed_over,
-        )
+        held = pinned.get(group.name)
+        if held is None:
+            candidates = [m for m in unchosen.values() if _selects(group, m, categories)]
+            chosen = _choose(
+                group,
+                candidates,
+                floor=policy.min_volume_24h,
+                now_ts=now_ts,
+                rejected=passed_over,
+            )
+        else:
+            chosen = [unchosen[ticker] for ticker in dict.fromkeys(held) if ticker in unchosen]
         admitted = chosen[:budget]
         budget -= len(admitted)
         for market in chosen:
@@ -546,7 +680,7 @@ def _choose(
         chosen_events = _nearest_events(events, group, group.series, rejected=rejected)
     chosen: list[MarketSummary] = []
     for event in chosen_events:
-        ranked = sorted(event, key=_busiest_market_first)
+        ranked = sorted(event, key=_market_ranking(group.market_order, event))
         chosen.extend(ranked[: group.markets_per_event])
         _reject(ranked[group.markets_per_event :], REASON_OVER_EVENT_CAP, rejected)
     if group.max_markets is not None:
@@ -660,12 +794,37 @@ def _busiest_event_first(
     )
 
 
-def _busiest_market_first(market: MarketSummary) -> tuple[int, tuple[int, int], str]:
-    """Order within an event: highest volume, then earliest close, then ticker."""
+def _market_ranking(
+    order: str, event: Sequence[MarketSummary]
+) -> Callable[[MarketSummary], _MarketRank]:
+    """The sort key of one event's markets in a group's ``market_order``; see :func:`select`."""
+    if order != MARKET_ORDER_NEAR_PRICE:
+        return _busiest_market_first
+    thresholds = all(market.strike_type in THRESHOLD_STRIKE_TYPES for market in event)
+
+    def nearest_price_first(market: MarketSummary) -> _MarketRank:
+        mid = yes_mid(market)
+        if mid is None:
+            return (1, 0, *_volume_order(market))
+        distance = abs(mid - _HALF_PRICE) if thresholds else PRICE_MAX - mid
+        return (0, distance, *_volume_order(market))
+
+    return nearest_price_first
+
+
+def _busiest_market_first(market: MarketSummary) -> _MarketRank:
+    """Volume order within an event, as a rank that treats every market as priced alike."""
+    return (0, 0, *_volume_order(market))
+
+
+def _volume_order(market: MarketSummary) -> tuple[int, tuple[int, int], str]:
+    """Highest volume, then earliest close, then ticker: the last word in every market order."""
     return (-market.volume_24h, _close_order(market.close_ts), market.ticker)
 
 
-def _freshness(market: MarketSummary) -> tuple[int, int, str, str, str, int, bool]:
+def _freshness(
+    market: MarketSummary,
+) -> tuple[int, int, str, str, str, int, bool, str, int, int, int]:
     """Total order used to pick one copy of a ticker seen twice in one listing.
 
     Volume first, because it only grows while a market trades, so the larger value is the
@@ -680,4 +839,8 @@ def _freshness(market: MarketSummary) -> tuple[int, int, str, str, str, int, boo
         market.series_ticker,
         market.exchange_index,
         market.is_mve,
+        "" if market.strike_type is None else market.strike_type,
+        -1 if market.yes_bid is None else market.yes_bid,
+        -1 if market.yes_ask is None else market.yes_ask,
+        -1 if market.last_price is None else market.last_price,
     )

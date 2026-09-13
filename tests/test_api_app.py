@@ -33,11 +33,13 @@ from tape.bus import BusEnvelope, encode_bus_envelope
 from tape.client.ratelimit import NullRateLimiter
 from tape.client.rest import KalshiRest
 from tape.events import (
+    LIFECYCLE_DETERMINED,
     BookDelta,
     BookRefresh,
     BusEvent,
     CatalogEntry,
     Level,
+    Lifecycle,
     MarketCatalog,
     Receipt,
     Side,
@@ -45,7 +47,7 @@ from tape.events import (
     Ticker,
 )
 from tape.fixedpoint import CountE2, PriceE4
-from tape.timeutil import NS_PER_MS, FrozenClock, Ms, Ns
+from tape.timeutil import NS_PER_MS, NS_PER_S, FrozenClock, Ms, Ns
 from tests.fakes import FakeSubscriber
 
 BASE_URL: Final = "https://kalshi.test/trade-api/v2"
@@ -375,3 +377,61 @@ def test_the_live_feed_serves_a_subscription_through_the_app() -> None:
                 break
             portal.call(asyncio.sleep, 0.01)
         assert api.hub.clients == 0
+
+
+def test_the_market_list_omits_closed_and_determined_markets_whose_detail_still_answers() -> None:
+    """ADR 0029, on the API's own clock: a close passes between two requests, and a lifecycle
+    event arrives, with no new catalog from the recorder."""
+    api = Api()
+    close_ts = 1_800_000_000
+    api.clock.advance((close_ts - 10) * NS_PER_S)
+
+    def market(ticker: str, volume: int, closes: int) -> CatalogEntry:
+        return CatalogEntry(
+            ticker=ticker,
+            series_ticker="KX",
+            event_ticker=ticker.rsplit("-", 1)[0],
+            volume_24h=CountE2(volume),
+            close_ts=closes,
+            showcase=False,
+        )
+
+    api.publish(
+        MarketCatalog(
+            markets=(
+                market("KXA-1", 900, close_ts),
+                market("KXB-1", 500, close_ts + 3_600),
+                market("KXC-1", 100, close_ts + 3_600),
+            )
+        )
+    )
+
+    def listed(client: TestClient) -> list[str]:
+        response = client.get("/api/v1/markets")
+        return [
+            row.ticker
+            for row in msgspec.json.decode(response.content, type=MarketsResponse).markets
+        ]
+
+    with TestClient(api.app) as client:
+        before = listed(client)
+        api.clock.advance(10 * NS_PER_S)
+        closed = listed(client)
+        api.publish(
+            Lifecycle(
+                ticker="KXB-1",
+                receipt=RECEIPT,
+                sid=1,
+                seq=1,
+                event_type=LIFECYCLE_DETERMINED,
+                payload_json='{"event_type":"determined","market_ticker":"KXB-1"}',
+            )
+        )
+        determined = listed(client)
+        detail = client.get("/api/v1/markets/KXA-1")
+
+    assert before == ["KXA-1", "KXB-1", "KXC-1"]
+    assert closed == ["KXB-1", "KXC-1"]
+    assert determined == ["KXC-1"]
+    assert detail.status_code == 200
+    assert msgspec.json.decode(detail.content, type=MarketDetail).close_ts == close_ts

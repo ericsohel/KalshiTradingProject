@@ -308,6 +308,16 @@ input {
   background: var(--panel-raised);
 }
 
+/* A market whose close passed after the list was fetched: still selectable, but set back. */
+.picker-item-closed .picker-text {
+  opacity: 0.55;
+}
+
+.badge-closed {
+  border-color: var(--border-strong);
+  color: var(--muted);
+}
+
 .picker-item[aria-current="true"] {
   border-color: var(--border-strong);
   background: var(--panel-raised);

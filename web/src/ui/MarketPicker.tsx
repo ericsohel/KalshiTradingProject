@@ -1,11 +1,16 @@
-/** Markets ranked by 24-hour volume, filterable, navigable with arrow keys. */
+/**
+ * Markets ranked by 24-hour volume, filterable, navigable with arrow keys. A market whose close
+ * time passes while it is listed is labelled closed at once, before the next poll drops it.
+ */
 
-import { useId, useState, type KeyboardEvent } from "react";
+import { useId, useMemo, useState, type KeyboardEvent } from "react";
 import type { BookState, MarketRow } from "../api/protocol";
 import type { ApiRequestError } from "../api/rest";
 import type { MarketSummary } from "../state/tapeStore";
 import { marketListNotice } from "./availability";
+import { isClosed } from "./closes";
 import { formatCompactContracts, marketLabel } from "./format";
+import { useLastClose } from "./hooks";
 
 export interface MarketPickerProps {
   readonly rows: readonly MarketRow[];
@@ -63,6 +68,8 @@ export function MarketPicker({
 }: MarketPickerProps) {
   const [query, setQuery] = useState("");
   const filterId = useId();
+  const closeTimes = useMemo(() => rows.map((row) => row.close_ts), [rows]);
+  const lastClose = useLastClose(closeTimes);
   const visible = rows.filter((row) => matches(row, query));
   const listNotice = marketListNotice(listed, error !== null);
   return (
@@ -100,11 +107,12 @@ export function MarketPicker({
           const selected = row.ticker === selectedTicker;
           const label = marketLabel(row);
           const book = selected && selectedSummary !== null ? selectedSummary.book : row.book;
+          const closed = lastClose !== null && isClosed(row.close_ts, lastClose);
           return (
             <li key={row.ticker}>
               <button
                 type="button"
-                className="picker-item"
+                className={closed ? "picker-item picker-item-closed" : "picker-item"}
                 data-ticker={row.ticker}
                 aria-current={selected ? "true" : undefined}
                 onClick={() => onSelect(row.ticker)}
@@ -118,6 +126,14 @@ export function MarketPicker({
                     <span className="picker-secondary">{label.secondary}</span>
                   ) : null}
                   <span className="picker-meta">
+                    {closed ? (
+                      <span
+                        className="badge badge-closed"
+                        title="Trading in this market has closed"
+                      >
+                        Closed
+                      </span>
+                    ) : null}
                     {row.showcase ? <span className="badge">Showcase</span> : null}
                     {row.category !== null ? <span>{row.category}</span> : null}
                     <span title="Contracts traded in the last 24 hours">

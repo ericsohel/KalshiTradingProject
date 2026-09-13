@@ -12,10 +12,13 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from tape.errors import FixedPointError, WireError
-from tape.fixedpoint import CountE2
+from tape.fixedpoint import CountE2, PriceE4
 from tape.recorder import (
     ACTIVE_STATUS,
     DEFAULT_EXCHANGE_INDEX,
+    MARKET_ORDER_NEAR_PRICE,
+    MARKET_ORDERS,
+    RANGE_STRIKE_TYPE,
     REASON_BELOW_VOLUME,
     REASON_BEYOND_HORIZON,
     REASON_CLOSED,
@@ -30,11 +33,13 @@ from tape.recorder import (
     REASON_OVER_GROUP_CAP,
     REASONS,
     GroupSelection,
+    MarketOrder,
     MarketSummary,
     UniverseDecision,
     UniverseGroup,
     UniversePolicy,
     select,
+    yes_mid,
 )
 from tape.wire.rest import Market
 
@@ -65,6 +70,25 @@ def summary(
     )
 
 
+def priced(
+    ticker: str,
+    *,
+    bid: int | None = None,
+    ask: int | None = None,
+    last: int | None = None,
+    strike: str | None = RANGE_STRIKE_TYPE,
+    volume: int = 1_000,
+) -> MarketSummary:
+    """A market as :func:`summary` makes it, with a strike type and listing prices."""
+    return msgspec.structs.replace(
+        summary(ticker, volume=volume),
+        strike_type=strike,
+        yes_bid=None if bid is None else PriceE4(bid),
+        yes_ask=None if ask is None else PriceE4(ask),
+        last_price=None if last is None else PriceE4(last),
+    )
+
+
 def by_series(
     name: str,
     *series: str,
@@ -72,6 +96,7 @@ def by_series(
     per_event: int = 10,
     max_markets: int | None = None,
     hours: int | None = None,
+    order: MarketOrder = "volume",
 ) -> UniverseGroup:
     return UniverseGroup(
         name=name,
@@ -80,6 +105,7 @@ def by_series(
         markets_per_event=per_event,
         max_markets=max_markets,
         max_hours_to_close=hours,
+        market_order=order,
     )
 
 
@@ -175,7 +201,7 @@ def wire_market(**overrides: object) -> Market:
 
 
 def test_from_wire_reads_fixed_point_fields_and_derives_the_series() -> None:
-    market = wire_market(exchange_index=2, volume_24h_fp="1234.56")
+    market = wire_market(exchange_index=2, volume_24h_fp="1234.56", strike_type="greater_or_equal")
     assert MarketSummary.from_wire(market, is_mve=True) == MarketSummary(
         ticker="KXBTC15M-26SEP092130-00",
         series_ticker="KXBTC15M",
@@ -185,7 +211,49 @@ def test_from_wire_reads_fixed_point_fields_and_derives_the_series() -> None:
         volume_24h=CountE2(123_456),
         close_ts=MIDNIGHT_2026_09_10,
         is_mve=True,
+        strike_type="greater_or_equal",
+        yes_bid=PriceE4(5000),
+        yes_ask=PriceE4(5100),
+        last_price=PriceE4(5000),
     )
+
+
+@pytest.mark.parametrize(
+    ("bid", "ask", "last", "expected"),
+    [
+        # Kalshi lists a missing bid or last trade as zero and a missing ask as one dollar.
+        ("0.0000", "1.0000", "0.0000", (None, None, None)),
+        ("0.0100", "0.9900", "0.0050", (100, 9_900, 50)),
+        ("", "", "", (None, None, None)),
+        ("0.0000", "0.0300", "1.0000", (None, 300, 10_000)),
+    ],
+)
+def test_from_wire_reads_a_placeholder_price_as_no_price(
+    bid: str, ask: str, last: str, expected: tuple[int | None, int | None, int | None]
+) -> None:
+    market = wire_market(yes_bid_dollars=bid, yes_ask_dollars=ask, last_price_dollars=last)
+    summary_ = MarketSummary.from_wire(market)
+    assert (summary_.yes_bid, summary_.yes_ask, summary_.last_price) == expected
+    assert summary_.strike_type is None
+
+
+@pytest.mark.parametrize(
+    ("bid", "ask", "last", "mid"),
+    [
+        (4_000, 4_300, 9_000, 4_150),
+        (4_000, 4_301, None, 4_150),  # rounded down to a whole PriceE4
+        (None, 4_300, 3_700, 3_700),
+        (4_000, None, 3_700, 3_700),
+        (None, None, 3_700, 3_700),
+        (None, 4_300, None, None),
+        (None, None, None, None),
+    ],
+)
+def test_the_mid_averages_bid_and_ask_or_falls_back_to_the_last_price(
+    bid: int | None, ask: int | None, last: int | None, mid: int | None
+) -> None:
+    market = priced("A-E-M", bid=bid, ask=ask, last=last)
+    assert yes_mid(market) == mid
 
 
 def test_from_wire_defaults_an_absent_shard_and_keeps_a_dashless_ticker_whole() -> None:
@@ -611,11 +679,141 @@ def test_only_markets_admitted_by_series_groups_carry_the_showcase_flag() -> Non
     assert [market.ticker for market in decision.markets] == ["A-E-M", "NFL-G-HOME"]
 
 
+# ---------------------------------------------------------------- market order
+
+
+def test_an_unknown_market_order_is_refused_with_the_group_s_name() -> None:
+    with pytest.raises(ValueError, match=r"'g': market_order must be one of volume, near_price"):
+        UniverseGroup(
+            name="g",
+            series=("A",),
+            events=1,
+            markets_per_event=1,
+            market_order="closest",  # type: ignore[arg-type]  # a value the Literal refuses
+        )
+    assert MARKET_ORDERS == ("volume", MARKET_ORDER_NEAR_PRICE)
+
+
+def test_near_price_takes_the_range_buckets_with_the_highest_mid_first() -> None:
+    markets = [
+        priced("A-E-B1", bid=100, ask=300, volume=90_000),
+        priced("A-E-B2", bid=3_000, ask=3_400),
+        priced("A-E-B3", bid=5_500, ask=5_900, volume=10),
+        priced("A-E-B4", bid=None, ask=2_000, last=1_000),
+    ]
+    near = select(markets, policy(by_series("g", "A", per_event=3, order="near_price")), now_ts=NOW)
+    busiest = select(markets, policy(by_series("g", "A", per_event=3)), now_ts=NOW)
+
+    assert admitted(near) == {"g": ("A-E-B3", "A-E-B2", "A-E-B4")}
+    assert admitted(busiest)["g"][0] == "A-E-B1"
+    assert reasons(near) == {REASON_OVER_EVENT_CAP: 1}
+
+
+def test_near_price_takes_the_thresholds_with_the_mid_closest_to_50_cents_first() -> None:
+    """Six strikes of an hourly ladder: the nearest to the underlying's price trade near 50."""
+    ladder = [
+        ("A-E-T1", 9_800, 9_900),
+        ("A-E-T2", 7_000, 7_200),
+        ("A-E-T3", 5_100, 5_300),
+        ("A-E-T4", 4_600, 4_800),
+        ("A-E-T5", 2_000, 2_300),
+        ("A-E-T6", 100, 200),
+    ]
+    markets = [
+        priced(ticker, bid=bid, ask=ask, strike="greater", volume=100 * index)
+        for index, (ticker, bid, ask) in enumerate(ladder)
+    ]
+    rules = policy(by_series("g", "A", per_event=4, order="near_price"))
+    assert admitted(select(markets, rules, now_ts=NOW)) == {
+        "g": ("A-E-T3", "A-E-T4", "A-E-T2", "A-E-T5")
+    }
+
+
+def test_near_price_ranks_an_event_with_any_bucket_or_outcome_by_the_highest_mid() -> None:
+    """A temperature event's open-ended tails are its outer buckets, and a Fed decision's
+    outcomes are alternatives: in both, the likeliest markets are those near the price."""
+    weather = [
+        priced("A-E-LOW", bid=3_500, ask=3_600, strike="less"),
+        priced("A-E-B80", bid=4_000, ask=4_200, strike=RANGE_STRIKE_TYPE),
+        priced("A-E-B82", bid=1_800, ask=2_000, strike=RANGE_STRIKE_TYPE),
+        priced("A-E-HIGH", bid=None, ask=100, last=100, strike="greater"),
+    ]
+    decision = select(
+        weather, policy(by_series("g", "A", per_event=3, order="near_price")), now_ts=NOW
+    )
+    assert admitted(decision) == {"g": ("A-E-B80", "A-E-LOW", "A-E-B82")}
+
+    fed = [
+        priced("B-E-CUT", bid=1_000, ask=2_000, strike="custom"),
+        priced("B-E-HOLD", bid=7_000, ask=8_000, strike="custom"),
+        priced("B-E-HIKE", bid=400, ask=600, strike=None),
+    ]
+    decision = select(fed, policy(by_series("g", "B", per_event=2, order="near_price")), now_ts=NOW)
+    assert admitted(decision) == {"g": ("B-E-HOLD", "B-E-CUT")}
+
+
+def test_near_price_puts_markets_without_a_price_last_by_volume_and_breaks_ties_by_volume() -> None:
+    markets = [
+        priced("A-E-DARKBUSY", strike="greater", volume=90_000),
+        priced("A-E-DARKQUIET", strike="greater", volume=10),
+        priced("A-E-ABOVE", bid=5_900, ask=6_100, strike="greater", volume=100),
+        priced("A-E-BELOW", bid=3_900, ask=4_100, strike="greater", volume=200),
+        priced("A-E-FAR", last=100, strike="greater", volume=50_000),
+        priced("A-E-TIE", bid=3_900, ask=4_100, strike="greater", volume=200),
+    ]
+    rules = policy(by_series("g", "A", per_event=6, order="near_price"))
+    decision = select(markets, rules, now_ts=NOW)
+    # ABOVE and BELOW are both 10 cents from 50; BELOW is busier, and TIE is BELOW's twin.
+    assert admitted(decision) == {
+        "g": ("A-E-BELOW", "A-E-TIE", "A-E-ABOVE", "A-E-FAR", "A-E-DARKBUSY", "A-E-DARKQUIET")
+    }
+    assert select(list(reversed(markets)), rules, now_ts=NOW) == decision
+
+
+# ---------------------------------------------------------------------- pinned
+
+
+def test_a_pinned_group_keeps_its_open_markets_in_order_and_takes_no_new_one() -> None:
+    markets = [
+        summary("NFL-G1-HOME", volume=100, close_ts=NOW - 1),
+        summary("NFL-G2-HOME", volume=200),
+        summary("NFL-G3-HOME", volume=300),
+        summary("NFL-G4-HOME", volume=90_000),
+    ]
+    rules = policy(by_category("sports", "Sports", events=3, per_event=1), floor=0)
+    pinned = {"sports": ("NFL-G3-HOME", "NFL-G1-HOME", "NFL-G2-HOME", "NFL-G3-HOME")}
+    decision = select(markets, rules, now_ts=NOW, categories=CATEGORIES, pinned=pinned)
+
+    # The closed game leaves, and the busiest open game is not admitted in its place.
+    assert admitted(decision) == {"sports": ("NFL-G3-HOME", "NFL-G2-HOME")}
+    assert reasons(decision) == {REASON_CLOSED: 1, REASON_NO_GROUP: 1}
+    assert decision.groups[0].events == 2
+
+
+def test_an_unpinned_group_is_applied_again_before_a_pinned_one_and_the_budget_still_holds() -> (
+    None
+):
+    markets = [
+        summary("A-NEW-M", close_ts=NOW + HOUR),
+        summary("A-OLD-M", close_ts=NOW + 2 * HOUR),
+        summary("B-E-1"),
+        summary("B-E-2"),
+    ]
+    rules = policy(by_series("a", "A", per_event=1), by_series("b", "B"), cap=2)
+    decision = select(markets, rules, now_ts=NOW, pinned={"b": ("B-E-2", "B-E-1")})
+
+    assert admitted(decision) == {"a": ("A-NEW-M",), "b": ("B-E-2",)}
+    assert decision.groups[1].skipped_for_budget == 1
+    assert decision.showcase == frozenset({"A-NEW-M", "B-E-2"})
+    assert reasons(decision) == {REASON_EVENT_NOT_CHOSEN: 1, REASON_OVER_CAP: 1}
+
+
 # ------------------------------------------------------------------ properties
 
 SERIES = ("S1", "S2", "S3")
 EVENTS = ("E1", "E2", "E3")
 CATEGORY_NAMES = ("C1", "C2")
+prices = st.none() | st.integers(1, 9_999).map(PriceE4)
 
 
 @st.composite
@@ -631,6 +829,10 @@ def market_summaries(draw: st.DrawFn) -> MarketSummary:
         volume_24h=CountE2(draw(st.integers(0, 1_000))),
         close_ts=draw(st.none() | st.integers(NOW - HOUR, NOW + 2 * HOUR)),
         is_mve=draw(st.booleans()),
+        strike_type=draw(st.sampled_from([None, RANGE_STRIKE_TYPE, "greater", "less", "custom"])),
+        yes_bid=draw(prices),
+        yes_ask=draw(prices),
+        last_price=draw(prices),
     )
 
 
@@ -639,6 +841,7 @@ positive = st.integers(1, 3)
 caps = st.none() | st.integers(1, 5)
 horizons = st.none() | st.integers(1, 2)
 """Hours; closes are drawn within two hours of ``NOW``, so both bounds cut."""
+orders = st.sampled_from(MARKET_ORDERS)
 group_rules = st.one_of(
     st.builds(
         UniverseGroup,
@@ -648,6 +851,7 @@ group_rules = st.one_of(
         markets_per_event=positive,
         max_markets=caps,
         max_hours_to_close=horizons,
+        market_order=orders,
     ),
     st.builds(
         UniverseGroup,
@@ -657,6 +861,7 @@ group_rules = st.one_of(
         markets_per_event=positive,
         max_markets=caps,
         max_hours_to_close=horizons,
+        market_order=orders,
     ),
 )
 policies = st.builds(
@@ -760,3 +965,36 @@ def test_the_budget_is_spent_in_group_order_and_later_groups_never_change_earlie
     if short:
         assert len(decision.l2_tickers) == rules.max_l2_markets
         assert all(not group.tickers for group in decision.groups[short[0] + 1 :])
+
+
+@given(listings, policies, category_maps, st.integers(0, 2 * HOUR), st.data())
+@settings(max_examples=200)
+def test_a_pinned_group_admits_what_it_admitted_before_in_order_and_every_cap_still_holds(
+    markets: list[MarketSummary],
+    rules: UniversePolicy,
+    categories: dict[str, str],
+    elapsed_s: int,
+    data: st.DataObject,
+) -> None:
+    """ADR 0029: between full listings, pinned groups only lose markets, and never break a cap."""
+    before = select(markets, rules, now_ts=NOW, categories=categories)
+    names = [group.name for group in rules.groups]
+    chosen_names = data.draw(st.sets(st.sampled_from(names))) if names else set()
+    pinned = {group.name: group.tickers for group in before.groups if group.name in chosen_names}
+    later = NOW + elapsed_s
+    after = select(markets, rules, now_ts=later, categories=categories, pinned=pinned)
+
+    by_ticker = {market.ticker: market for market in markets}
+    assert len(after.l2_tickers) <= rules.max_l2_markets
+    assert sum(after.reason_counts.values()) + len(after.l2_tickers) == len(markets)
+    for group, selection in zip(rules.groups, after.groups, strict=True):
+        held = pinned.get(group.name)
+        if held is None:
+            continue
+        assert list(selection.tickers) == [t for t in held if t in selection.tickers]
+        members = [by_ticker[ticker] for ticker in selection.tickers]
+        assert all(market.close_ts is None or market.close_ts > later for market in members)
+        per_event = Counter((market.series_ticker, market.event_ticker) for market in members)
+        assert all(n <= group.markets_per_event for n in per_event.values())
+        assert group.max_markets is None or len(members) <= group.max_markets
+        assert selection.events == len(per_event)

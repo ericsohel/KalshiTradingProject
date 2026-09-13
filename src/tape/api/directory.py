@@ -1,19 +1,24 @@
 """What ``tape serve`` knows about the recorded markets, and the REST views built from it.
 
-Responsibility: hold the recorder's latest catalog, the latest ticker update per market, and the
-recorder's latest status report, and turn them, with resolved metadata and the server's books,
-into the ``MarketRow``, ``MarketDetail``, and ``ServiceStatus`` of docs/FRONTEND.md 4.1. The
-module is pure: it performs no I/O and reads no clock, so callers pass times in.
+Responsibility: hold the recorder's latest catalog, what lifecycle events have said about its
+markets since, the latest ticker update per market, and the recorder's latest status report, and
+turn them, with resolved metadata and the server's books, into the ``MarketRow``,
+``MarketDetail``, and ``ServiceStatus`` of docs/FRONTEND.md 4.1. The module is pure: it performs
+no I/O and reads no clock, so callers pass times in.
 
-Invariants: a row exists exactly for each market of the latest catalog, which replaces the
-previous one whole; rows rank by 24-hour volume, highest first, then by ticker; a value not yet
-known is ``None``; depth is given exactly when a book is held, best levels first; and once a
-catalog has arrived, ticker updates are kept only for its markets, so memory follows the catalog
-(before the first one it follows the markets Kalshi lists).
+Invariants: an entry exists exactly for each market of the latest catalog, which replaces the
+previous one whole, together with everything lifecycle events said about the previous one's
+markets; the market list holds only open markets, those neither determined nor settled nor past
+their close time, as a ``close_date_updated`` event last moved it (ADR 0029); it ranks by 24-hour
+volume, highest first, then by ticker; a value not yet known is ``None``; depth is given exactly
+when a book is held, best levels first; and once a catalog has arrived, ticker updates and
+lifecycle notes are kept only for its markets, so memory follows the catalog (before the first one
+ticker updates follow the markets Kalshi lists, and lifecycle events are not kept).
 """
 
 from __future__ import annotations
 
+from itertools import islice
 from typing import Final
 
 import msgspec
@@ -31,7 +36,17 @@ from tape.api.contract import (
     ServiceStatus,
 )
 from tape.book import Book
-from tape.events import CatalogEntry, MarketCatalog, Side, StatusReport, Ticker
+from tape.events import (
+    LIFECYCLE_CLOSE_DATE_UPDATED,
+    LIFECYCLE_DETERMINED,
+    LIFECYCLE_SETTLED,
+    CatalogEntry,
+    Lifecycle,
+    MarketCatalog,
+    Side,
+    StatusReport,
+    Ticker,
+)
 from tape.timeutil import NS_PER_MS, NS_PER_S
 
 __all__ = [
@@ -44,6 +59,9 @@ __all__ = [
 
 RECORDING_INTERVALS: Final = 2
 """A recorder counts as recording while its latest report arrived within this many intervals."""
+
+_ENDED: Final = frozenset({LIFECYCLE_DETERMINED, LIFECYCLE_SETTLED})
+"""Lifecycle events after which a market is closed whatever its close time says."""
 
 
 class MarketMetadata(msgspec.Struct, frozen=True, kw_only=True):
@@ -93,6 +111,8 @@ class MarketDirectory:
         self._ranked: tuple[CatalogEntry, ...] = ()
         self._has_catalog = False
         self._tickers: dict[str, Ticker] = {}
+        self._ended: set[str] = set()
+        self._moved_close_ts: dict[str, int] = {}
         self._report: tuple[StatusReport, int] | None = None
 
     def __contains__(self, ticker: object) -> bool:
@@ -104,7 +124,11 @@ class MarketDirectory:
     # ------------------------------------------------------------------------ updates
 
     def apply_catalog(self, catalog: MarketCatalog) -> None:
-        """Replace the recorded markets with a new catalog, and forget other markets' tickers.
+        """Replace the recorded markets with a new catalog, and forget what was said of the old.
+
+        Other markets' ticker updates are dropped, and so is every lifecycle note: the recorder
+        leaves a determined or settled market out of every catalog it publishes after the event,
+        and gives a moved close time in it (ADR 0029).
 
         Args:
             catalog: The recorder's latest catalog.
@@ -117,6 +141,8 @@ class MarketDirectory:
         self._tickers = {
             ticker: update for ticker, update in self._tickers.items() if ticker in self._entries
         }
+        self._ended = set()
+        self._moved_close_ts = {}
 
     def apply_ticker(self, update: Ticker) -> None:
         """Keep a market's latest ticker update, if the market is recorded or no catalog came yet.
@@ -127,6 +153,23 @@ class MarketDirectory:
         if self._has_catalog and update.ticker not in self._entries:
             return
         self._tickers[update.ticker] = update
+
+    def apply_lifecycle(self, event: Lifecycle) -> None:
+        """Note what a lifecycle event says about a recorded market's end (ADR 0029).
+
+        A ``determined`` or ``settled`` event closes the market; a ``close_date_updated`` event
+        carrying a close time replaces the catalog's. Any other event, or one about a market
+        outside the latest catalog, is ignored.
+
+        Args:
+            event: A lifecycle event from the bus.
+        """
+        if event.ticker not in self._entries:
+            return
+        if event.event_type in _ENDED:
+            self._ended.add(event.ticker)
+        elif event.event_type == LIFECYCLE_CLOSE_DATE_UPDATED and event.close_ts is not None:
+            self._moved_close_ts[event.ticker] = event.close_ts
 
     def apply_status(self, report: StatusReport, *, received_mono_ns: int) -> None:
         """Keep the recorder's latest status report and when it arrived.
@@ -140,7 +183,7 @@ class MarketDirectory:
     # -------------------------------------------------------------------------- views
 
     def entry(self, ticker: str) -> CatalogEntry | None:
-        """The catalog entry of a market.
+        """The catalog entry of a market, open or closed.
 
         Args:
             ticker: Any string.
@@ -150,21 +193,51 @@ class MarketDirectory:
         """
         return self._entries.get(ticker)
 
-    def top(self, limit: int) -> tuple[CatalogEntry, ...]:
-        """The highest-ranked recorded markets.
+    def close_ts(self, entry: CatalogEntry) -> int | None:
+        """When a market closes, as the latest ``close_date_updated`` event or the catalog says.
+
+        Args:
+            entry: The market's catalog entry.
+
+        Returns:
+            Unix seconds, or ``None`` when unknown.
+        """
+        return self._moved_close_ts.get(entry.ticker, entry.close_ts)
+
+    def is_open(self, entry: CatalogEntry, *, now_ts: int) -> bool:
+        """Whether a market is still open: neither determined nor settled, nor past its close.
+
+        Args:
+            entry: The market's catalog entry.
+            now_ts: Unix seconds now, on the caller's clock.
+
+        Returns:
+            ``False`` once the market was determined or settled, or once ``now_ts`` reaches its
+            close time; a market whose close time is unknown stays open.
+        """
+        if entry.ticker in self._ended:
+            return False
+        close_ts = self.close_ts(entry)
+        return close_ts is None or now_ts < close_ts
+
+    def top(self, limit: int, *, now_ts: int) -> tuple[CatalogEntry, ...]:
+        """The highest-ranked recorded markets that are still open.
 
         Args:
             limit: Most entries to return; positive.
+            now_ts: Unix seconds now, on the caller's clock; see :meth:`is_open`.
 
         Returns:
-            Entries by 24-hour volume, highest first, then by ticker.
+            Open entries by 24-hour volume, highest first, then by ticker.
 
         Raises:
             ValueError: If ``limit`` is not positive.
         """
         if limit < 1:
             raise ValueError(f"limit must be positive, got {limit}")
-        return self._ranked[:limit]
+        return tuple(
+            islice((entry for entry in self._ranked if self.is_open(entry, now_ts=now_ts)), limit)
+        )
 
     def row(self, entry: CatalogEntry, *, metadata: MarketMetadata, book: Book | None) -> MarketRow:
         """One market's row in the market list.
@@ -175,7 +248,8 @@ class MarketDirectory:
             book: The server's copy of the market's book, or ``None``.
 
         Returns:
-            The row; prices come from the latest ticker update, or are ``None`` without one.
+            The row; prices come from the latest ticker update, or are ``None`` without one, and
+            the close time is :meth:`close_ts`.
         """
         update = self._tickers.get(entry.ticker)
         return MarketRow(
@@ -187,7 +261,7 @@ class MarketDirectory:
             category=metadata.category,
             showcase=entry.showcase,
             volume_24h_e2=entry.volume_24h,
-            close_ts=entry.close_ts,
+            close_ts=self.close_ts(entry),
             bid_e4=None if update is None else update.bid,
             ask_e4=None if update is None else update.ask,
             last_e4=None if update is None else update.last,

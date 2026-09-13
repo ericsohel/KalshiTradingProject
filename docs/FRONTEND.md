@@ -52,16 +52,24 @@ front end's TypeScript types from that file, so the two cannot drift (ADR 0023).
 
 | Route | Response |
 |---|---|
-| `GET /markets?limit=50` | `{"markets": [MarketRow]}`; `limit` 1 to 200; sorted by `volume_24h_e2` descending, then by ticker |
-| `GET /markets/{ticker}` | `MarketDetail`; 404 with code `unknown_ticker` when the market is not recorded |
+| `GET /markets?limit=50` | `{"markets": [MarketRow]}`; `limit` 1 to 200; open markets only; sorted by `volume_24h_e2` descending, then by ticker |
+| `GET /markets/{ticker}` | `MarketDetail`, for an open or closed market; 404 with code `unknown_ticker` when the market is not recorded |
 | `GET /status` | `ServiceStatus` |
 | `WS /live` | the feed in 4.2 |
 
 - **`MarketRow`**: `{ticker, event_ticker, series_ticker, title, subtitle, category,
   showcase, volume_24h_e2, close_ts, bid_e4, ask_e4, last_e4, book}`. `title` is the event
   title, `subtitle` the market's YES subtitle, and `category` the series category, each
-  `null` until resolved; `close_ts` is Unix seconds or `null`; the prices come from the
-  latest ticker update; `book` is `"unknown"`, `"fresh"`, or `"stale"`.
+  `null` until resolved; `close_ts` is Unix seconds or `null`, as the latest
+  `close_date_updated` lifecycle event moved it; the prices come from the latest ticker update;
+  `book` is `"unknown"`, `"fresh"`, or `"stale"`.
+- **Open markets** (ADR 0029). The list leaves out a market once its `close_ts` has passed on the
+  server's clock, or once the server has seen its `determined` or `settled` lifecycle event, so a
+  closed market leaves the list at its close rather than at the recorder's next universe change.
+  A new catalog from the recorder replaces what lifecycle events said. The detail route still
+  answers for a closed market in the catalog, so a page open on it can say that it closed, and
+  the page's market list labels a listed market closed once its close time passes on the
+  browser's clock, since the list it polled can be older than the close.
 - **`MarketDetail`**: the `MarketRow` fields plus `price_ranges`, a list of
   `{start_e4, end_e4, step_e4}` or `null` until resolved, and `depth`,
   `{ts_ms, bids: [[price_e4, count_e2]], asks: [...]}` with the best 20 levels per side,

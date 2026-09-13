@@ -224,6 +224,14 @@ enforces this (see
   leave the universe are dropped from the latest-ticker table at that refresh (ADR 0027).
   An `ok` reply to a `subscribe` is handled as a merge, and a subscribe that gets no
   reply within its deadline fails the connection rather than staying pending.
+- **Closes** (ADR 0029). A universe refresh lists every open market, so it runs only every
+  `universe_refresh_s`. Between refreshes the recorder removes a planned market a few seconds
+  after its close time, or at once when the control connection's lifecycle events report it
+  determined or settled, without a listing; it then lists again only the series of the series
+  groups that lost a market, and does the same, debounced, when a lifecycle event creates or
+  activates a market in such a series. Every other group keeps what it admitted, so a category
+  group is replenished only at the next refresh. Targeted re-listings start at least 30 seconds
+  apart, and a failed one is logged and retried without touching capture.
 
 ### 7.2 Book
 

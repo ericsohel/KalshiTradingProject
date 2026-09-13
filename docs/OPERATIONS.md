@@ -169,9 +169,10 @@ The preview lists the open markets and, when a group selects by category, that c
 from Kalshi's public endpoints without credentials. It opens no WebSocket and writes nothing.
 Holding no credentials, it cannot read its rate tier and paces itself at 2 requests a second, below
 Kalshi's unsigned allowance, so a listing of about 120 pages takes a minute. For
-each group it prints the chosen events and their markets with series, 24-hour volume, and close
-time, and what the group admitted, in how many events, and how many markets it chose that did not
-fit the budget; then the total against `max_l2_markets` and why every other listed market is not
+each group it prints its settings, `market_order` included, the chosen events and their markets
+with series, 24-hour volume, YES mid (`no price` when the listing has neither quotes nor a trade),
+and close time, and what the group admitted, in how many events, and how many markets it chose that
+did not fit the budget; then the total against `max_l2_markets` and why every other listed market is not
 recorded. It also counts the series in each category, where zero usually means a misspelled
 category, and names series of series groups with no open market, such as a monthly series between
 releases.
@@ -181,6 +182,11 @@ releases.
 - **Season futures in a category group:** summed volume favours long-lived events with many
   markets. Set `max_hours_to_close` so the group ranks only events whose earliest close is within
   that many hours; the production sports group uses 48 (ADR 0028).
+- **Strikes far from the price:** by default an event's busiest markets come first, which on an
+  event that opened minutes ago are arbitrary strikes. Set `market_order = "near_price"` on a
+  ladder group: thresholds whose YES mid is closest to 50 cents come first, and in an event of
+  buckets or outcomes, the highest mid; the preview's mid column shows the result (ADR 0029). The
+  production Bitcoin hourly, stock index, economy, and weather groups use it.
 - **Both books of a binary event:** raise `markets_per_event` for that group.
 - **Priority:** groups later in the list lose first when the budget runs out, and `skipped for
   budget` shows by how much. A market is admitted by the first group that chooses it and does not
@@ -202,6 +208,27 @@ category group, series categories are fetched at the first refresh and then at m
 `series categories fetched` gives the series per category, a failure logs `series categories not
 fetched; keeping the last known` and is retried at the next refresh, and until the first success
 every refresh warns `series categories unknown; category groups admit nothing`.
+
+Between refreshes the recorder reacts to closes (ADR 0029). Three seconds after a planned market's
+close time, or at once when the control connection reports it `determined` or `settled`, it
+removes the market from the plan without a listing and logs `closed markets removed from the
+universe` with `closed` (the tickers), `selected`, `groups`, `relisting` (the series groups that
+lost a market), and `book_groups`. Each such series group, and five seconds after a `created` or
+`activated` event any series group naming that series, is listed again with
+`GET /markets?series_ticker=<series>&status=open` for each of its series, at most 10 pages each,
+and re-applied alone; every other group keeps what it admitted. That logs `universe groups
+re-listed` with `relisted`, `series`, `listed`, `truncated`, `unreadable`, `first_error`, `added`,
+`removed`, `selected`, `groups`, and `book_groups`. Two re-listings start at least 30 seconds
+apart, so a burst of closes and new markets costs one. A failed re-listing logs `targeted
+re-listing failed; keeping the current plan and retrying` with `error`, `relisting`, and
+`retry_in_s`, and is retried after that interval; capture is unaffected, and the full refresh
+still converges on the same universe.
+
+- **A category group runs short:** its closed markets are removed at close but replaced only at
+  the next full refresh, so `universe_refresh_s` bounds how long it has fewer markets. Name a
+  series in a series group to have its replacements start within seconds.
+- **No re-listing after a close:** the group that lost the market is a category group, or the
+  series has no open market yet; a `created` or `activated` event for the series brings one.
 
 ## 5. Storage and retention
 

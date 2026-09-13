@@ -89,7 +89,8 @@ BookSnapshot(ticker, ts_ms, receipt, sid, seq, bids: tuple[Level, ...], asks: tu
 BookDelta(ticker, ts_ms, receipt, sid, seq, side, price, delta: int, own_client_order_id)
 Trade(ticker, ts_ms, receipt, sid, seq, trade_id, price, count, taker_side, is_block)
 Ticker(ticker, ts_ms, receipt, sid, last, bid, ask, bid_size, ask_size, volume, open_interest)
-Lifecycle(ticker, receipt, sid, seq, event_type, payload_json)
+Lifecycle(ticker, receipt, sid, seq, event_type, payload_json, close_ts: int | None = None)   # close_ts on created and close_date_updated
+LIFECYCLE_CREATED; LIFECYCLE_ACTIVATED; LIFECYCLE_CLOSE_DATE_UPDATED; LIFECYCLE_DETERMINED; LIFECYCLE_SETTLED   # event_type values the recorder and API act on
 GapEvent(receipt, sid, expected_seq, got_seq)
 BookRefresh(ticker, ts_ms, receipt, stale, bids, asks)    # the recorder's image of a live book (ADR 0022)
 CatalogEntry(ticker, series_ticker, event_ticker, volume_24h: CountE2, close_ts: int | None, showcase: bool)   # showcase: a series group admitted it (ADR 0028)
@@ -321,18 +322,25 @@ drive a live connection.
 ### 8.1 `tape.recorder.universe` and `tape.recorder.listing`
 
 ```python
+type MarketOrder = Literal["volume", "near_price"]
+RANGE_STRIKE_TYPE = "between"; THRESHOLD_STRIKE_TYPES = {"greater", "greater_or_equal", "less", "less_or_equal"}
 class UniverseGroup(Struct): name: str; events: int; markets_per_event: int;
                              series: tuple[str, ...] | None = None; category: str | None = None;
                              max_markets: int | None = None;    # exactly one of series, category
-                             max_hours_to_close: int | None = None
+                             max_hours_to_close: int | None = None;
+                             market_order: MarketOrder = "volume"
 class UniversePolicy(Struct): min_volume_24h: CountE2; max_l2_markets: int;
                               groups: tuple[UniverseGroup, ...]; exclude_mve: bool = True;
                               max_seconds_to_close: int | None = None
     categories: frozenset[str]                                  # those of its category groups
 class MarketSummary(Struct):  ticker; series_ticker; event_ticker; exchange_index; status;
-                              volume_24h: CountE2; close_ts: int | None; is_mve: bool
+                              volume_24h: CountE2; close_ts: int | None; is_mve: bool;
+                              strike_type: str | None = None; yes_bid: PriceE4 | None = None;
+                              yes_ask: PriceE4 | None = None; last_price: PriceE4 | None = None
     @classmethod
     def from_wire(cls, market: Market, *, is_mve: bool = False) -> MarketSummary
+def series_of(ticker: str) -> str                               # the first dash-separated segment
+def yes_mid(market: MarketSummary) -> PriceE4 | None            # (bid + ask) // 2, else last price
 class GroupSelection(Struct): name: str; tickers: tuple[str, ...];   # in admission order
                               events: int; skipped_for_budget: int
 class UniverseDecision(Struct): l2_tickers: frozenset[str]; showcase: frozenset[str];
@@ -359,10 +367,22 @@ no earlier group chose:
   bound is inclusive. A series group then takes the nearest events left, and a category group
   ranks only those.
 
-From each chosen event a group takes at most `markets_per_event` markets by descending volume,
-then keeps its first `max_markets`. Ties break by close time, then ticker. Chosen markets are
-admitted in that order until `max_l2_markets` is reached; the rest, and everything later groups
-choose, are skipped for budget, so the decision never exceeds the budget. `showcase` is the
+From each chosen event a group takes at most `markets_per_event` markets in its `market_order`,
+then keeps its first `max_markets` (ADR 0029):
+
+- **`volume`** takes the highest 24-hour volume first.
+- **`near_price`** ranks by `yes_mid`. In an event whose markets are all thresholds, the mid
+  closest to 50 cents comes first; in any other event (range buckets with their open-ended tails,
+  or outcomes such as a Fed decision's `custom` strikes), the highest mid. Markets without a price
+  come after every priced one. The listing's placeholders for no price, `"0.0000"` for a bid or last
+  price and `"1.0000"` for an ask, read as none.
+
+Remaining ties break by volume, then close time, then ticker. Chosen markets are admitted in that
+order until `max_l2_markets` is reached; the rest, and everything later groups choose, are skipped
+for budget, so the decision never exceeds the budget. `select(..., pinned=...)` takes, by group
+name, the markets a group admitted at an earlier decision: a pinned group is not applied again,
+and admits those of them still eligible and unchosen, in order, while the budget lasts. The
+recorder pins every group it does not re-list between full listings. `showcase` is the
 markets admitted by series groups. Every market handed in is admitted or counted once in
 `reason_counts`: `duplicate`, `not_active`, `mve`, `closed`, `beyond_horizon`, `no_group`,
 `event_beyond_horizon`, `below_volume`, `event_not_chosen`, `over_markets_per_event`, `over_max_markets`, or `over_cap`
@@ -621,6 +641,25 @@ the universe, replans with the previous plan, and gives each book connection its
 group through `set_group`, and the ticker connection a group of every planned market. The
 latest-ticker table then drops markets outside that group; an update for any other market is
 published but not kept, so `RecorderStatus.live_tickers` never exceeds the plan.
+
+One universe loop does all of this, one step at a time, and between full refreshes it reacts to
+closes (ADR 0029). It sleeps until the first of: the full refresh; `CLOSE_TICK_DELAY_S` (3) after
+the earliest close time among planned markets; and a pending targeted re-listing, no sooner than
+`RELIST_MIN_INTERVAL_S` (30) after the previous one started. The control connection's consumer
+notes lifecycle events without awaiting and wakes the loop: `determined` or `settled` for a planned
+market makes its removal due at once, `close_date_updated` replaces a planned market's close time,
+and `created` or `activated` in a series a series group names makes that group due a re-listing
+`RELIST_DEBOUNCE_S` (5) after the first such event; every event is still published. At a tick the
+recorder removes every planned market whose close time has passed or that was reported ended, with
+`select(..., pinned=...)` pinning every group to what it admitted, and requests a re-listing of
+each series group that lost one. A re-listing lists `GET /markets?series_ticker=<s>&status=open`
+for each series of the due groups (`list_series_markets`, at most `RELIST_MAX_PAGES` pages per
+series), re-applies those groups to it and pins every other group, then replans; a failure is
+logged and retried after the minimum interval. A full refresh leaves out markets reported ended
+while its listing still shows them open, applies moved close times, and covers every re-listing
+requested before it started. The catalog leaves out markets reported ended and carries moved close
+times, so a consumer that replaces its catalog whole never reinstates a market the recorder knows
+has closed.
 Every `keyframe_interval_s` it writes merged books to
 `data_dir/keyframes/YYYY-MM-DD/HH/MM.parquet`. Every `status_interval_s` it logs one
 structured status line. A failing periodic task is logged and does not stop capture; a
@@ -978,11 +1017,14 @@ CLOSE_GOING_AWAY = 1001; CLOSE_POLICY_VIOLATION = 1008; CLOSE_TRY_AGAIN_LATER = 
 class MarketMetadata(Struct): title; subtitle; category; price_ranges        # each None until resolved
 UNRESOLVED: MarketMetadata
 class MarketDirectory:
-    def apply_catalog(self, catalog: MarketCatalog) -> None                 # replaces the catalog whole
+    def apply_catalog(self, catalog: MarketCatalog) -> None                 # replaces the catalog and lifecycle notes whole
     def apply_ticker(self, update: Ticker) -> None
+    def apply_lifecycle(self, event: Lifecycle) -> None                     # determined, settled, close_date_updated
     def apply_status(self, report: StatusReport, *, received_mono_ns: int) -> None
-    def entry(self, ticker: str) -> CatalogEntry | None
-    def top(self, limit: int) -> tuple[CatalogEntry, ...]                   # volume desc, then ticker
+    def entry(self, ticker: str) -> CatalogEntry | None                     # open or closed
+    def close_ts(self, entry: CatalogEntry) -> int | None                   # as last moved
+    def is_open(self, entry: CatalogEntry, *, now_ts: int) -> bool
+    def top(self, limit: int, *, now_ts: int) -> tuple[CatalogEntry, ...]   # open only; volume desc, then ticker
     def row(self, entry, *, metadata: MarketMetadata, book: Book | None) -> MarketRow
     def detail(self, entry, *, metadata: MarketMetadata, book: Book | None) -> MarketDetail
     def service_status(self, *, now_mono_ns: int, bus: BusHealth, clients: int) -> ServiceStatus
@@ -1040,7 +1082,11 @@ resolver. The adapter cannot import `tape.config`, so the hub takes a `ServeConf
 reads the hub's configuration and directory rather than taking them twice.
 
 - **Directory.** Rows exist for the markets of the latest `MarketCatalog`. Ticker updates are kept
-  for every market until the first catalog and for catalog markets after it. `recording` is true
+  for every market until the first catalog and for catalog markets after it. `GET /markets` lists
+  only open markets (ADR 0029): the app passes its wall clock as `now_ts`, a market is closed once
+  `now_ts` reaches its close time, which a `close_date_updated` lifecycle event replaces, or once a
+  `determined` or `settled` event arrived, and a new catalog replaces these notes, since the
+  recorder's catalog already reflects them. `GET /markets/{ticker}` answers for any catalog market. `recording` is true
   while the latest `StatusReport` arrived within two of its own `interval_s`.
 - **Metadata.** One `GET /events/{event_ticker}` per event gives the event title and each market's
   `yes_sub_title` and price grid (converted with `parse_price`), and one `GET /series/{series_ticker}`
@@ -1150,9 +1196,10 @@ exclude_mve = true
 name = "crypto 15-minute"       # unique; names the group in the log and the preview
 series = ["KXBTC15M", "KXETH15M"]   # or category = "Sports"; exactly one of the two
 events = 1                      # per series for series; across the group for category
-markets_per_event = 1           # highest 24-hour volume first
+markets_per_event = 1           # first in market_order
 max_markets = 10                # optional cap on the whole group
 max_hours_to_close = 48         # optional; only events whose earliest close is within 48 hours
+market_order = "near_price"     # optional; "volume" (the default) or "near_price" (ADR 0029)
 ```
 
 ```python
@@ -1174,7 +1221,9 @@ Rules:
 - **Universe groups** (ADR 0028): `[[recorder.universe.groups]]` tables apply in order. Each has a
   unique `name` and exactly one of `series`, a non-empty list of distinct series tickers, and
   `category`, a Kalshi series category; `events` and `markets_per_event` are positive, and
-  `max_markets` and `max_hours_to_close`, when set, are positive. A group with both selectors or
+  `max_markets` and `max_hours_to_close`, when set, are positive. `market_order` is `"volume"`
+  or `"near_price"`; a group without it, as in every configuration written before ADR 0029,
+  orders by volume. A group with both selectors or
   neither is refused with its name and position. Without groups nothing is recorded, so
   `tape record` warns at every universe refresh, `tape config check` warns on standard error, and
   `tape universe preview` says so in its output. `showcase_series` is gone and is refused

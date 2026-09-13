@@ -19,7 +19,11 @@
 | **Bus** | The ZeroMQ PUB/SUB channel on which the recorder publishes live events to `tape serve` and the engine. Lossy per subscriber by design. |
 | **`bus_epoch` / `bus_seq`** | The publisher's start time, and the number of each message it attempts from 1. A new epoch or a skipped number means a subscriber lost messages. |
 | **Market catalog** | The recorder's list of the markets it records, with series, event, 24-hour volume, close time, and showcase flag, republished on `ctl.catalog` every `bus_refresh_s`. |
-| **Universe group** | One ordered rule of the recorded universe (ADR 0028): named series or a series category, how many events to take, how many markets per event, and optionally how soon an event must close (`max_hours_to_close`). Groups apply in order at every universe refresh until `max_l2_markets` is reached. |
+| **Universe group** | One ordered rule of the recorded universe (ADR 0028): named series or a series category, how many events to take, how many markets per event and in which market order, and optionally how soon an event must close (`max_hours_to_close`). Groups apply in order at every universe refresh until `max_l2_markets` is reached. |
+| **Market order** | How a universe group picks an event's markets: `volume`, the busiest first, or `near_price`, those nearest the current price first, by YES mid (ADR 0029). |
+| **YES mid** | The average of a market's YES bid and ask in a listing, or its last price when either is missing. |
+| **Close tick** | The recorder's universe step a few seconds after a planned market's close time, or at a `determined` or `settled` lifecycle event, that removes the market from the plan without a listing (ADR 0029). |
+| **Targeted re-listing** | A market listing filtered to the series of the series groups that lost a market or gained one, which re-applies only those groups between two universe refreshes (ADR 0029). |
 | **Showcase market** | A recorded market admitted by a series group; the catalog flags it. |
 | **Status report** | The recorder's health counters, published on `ctl.status` every `status_interval_s`; `tape serve` shows the latest in `/api/v1/status`. |
 | **Refresh image** | A `BookRefresh`: the recorder's own copy of one book, republished every `bus_refresh_s` so a bus consumer can recover that book after loss. |

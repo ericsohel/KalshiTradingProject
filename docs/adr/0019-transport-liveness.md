@@ -48,7 +48,8 @@ ping interval, the 20-second pong deadline, and a 2-second close timeout. The cl
 timeout was 5 seconds until a production shutdown showed it was the last wait before
 the recorder could stop; a recorder gains nothing from a long graceful goodbye. The client sends a small ping every 10 seconds per
 connection, which is negligible. The regression test that pins `recv` cancellation
-safety still matters for the one connection that polls for silence.
+safety still matters for any session given a silence timeout; since ADR 0027 the
+recorder gives none.
 
 ## What would reverse it
 

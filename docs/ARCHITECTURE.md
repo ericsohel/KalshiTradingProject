@@ -99,9 +99,10 @@ current hour, keyframes, or anything the recorder is writing.
    `GET /series` at start and every five minutes, and subscribes to
    `market_lifecycle_v2` (no ticker filter) for immediate created/activated/settled
    notifications. The L2 universe is every active market above a configurable 24-hour
-   volume floor plus an always-on showcase list, capped by count. The unfiltered ticker
-   channel covers every market on a live-only connection whose frames are held in memory
-   and published but never taped (ADR 0018).
+   volume floor plus an always-on showcase list, capped by count. The `ticker` channel
+   covers the recorded markets on a live-only connection whose frames are held in memory
+   and published but never taped (ADR 0018); its subscription follows every replan
+   (ADR 0027).
 2. **Subscriptions** (ADR 0020). Kalshi keeps one subscription per channel per
    connection: a second `subscribe` for a channel the connection already carries is
    merged into the existing `sid` and answered with `ok`. So each book connection carries
@@ -176,8 +177,10 @@ enforces this (see
 ### 7.1 Recorder
 
 - **Connections.** Every connection is either *taped* or *live-only* (ADR 0018). One
-  live-only connection carries the unfiltered `ticker` channel, 99% of all traffic; its
-  frames are decoded and published but never stored. One taped control connection
+  live-only connection carries the `ticker` channel for the markets of the current plan
+  (ADR 0027), as one subscription reached in commands of at most `group_size` markets; its
+  frames are decoded and published but never stored, and a market's latest value is kept
+  only while the market is recorded. One taped control connection
   carries `market_lifecycle_v2`, which is small and essential for replay. N "book" connections carry `orderbook_delta` and
   `trade` groups. N starts at 2 (`book_connections`) and grows when a connection's message rate or the
   server's buffer-overflow error (code 25) indicates saturation. The default account
@@ -191,9 +194,9 @@ enforces this (see
   library answers. The client also pings every 10 seconds and closes the connection if
   no pong arrives within 20, so a dead peer is detected regardless of market traffic,
   within about 32 seconds including the 2-second close timeout.
-  Data silence is not a liveness signal: an idle book connection or a quiet lifecycle
-  channel is healthy. Only the live-only unfiltered `ticker` connection, which always
-  carries traffic, also treats 60 seconds without data as a failed subscription.
+  Data silence is not a liveness signal on any connection: an idle book connection, a quiet
+  lifecycle channel, and recorded markets whose tickers do not change overnight are all
+  healthy (ADR 0027).
 - **Sequence gaps.** Each sequenced channel carries `seq` per `sid`. Every gap writes a
   GAP record and emits a `GapEvent`. On an `orderbook_delta` subscription it also marks every book on that connection stale and sends `update_subscription` with `action=get_snapshot`,
   naming all of the connection's markets; stale books ignore deltas until the snapshot arrives. A gap
@@ -214,6 +217,8 @@ enforces this (see
 - **Universe churn.** Each universe refresh replans with the previous plan, so new
   markets join the connection with room and existing markets stay put; the supervisor
   applies the difference with `update_subscription` `add_markets` and `delete_markets`.
+  The ticker connection receives the same difference for the whole plan, and markets that
+  leave the universe are dropped from the latest-ticker table at that refresh (ADR 0027).
   An `ok` reply to a `subscribe` is handled as a merge, and a subscribe that gets no
   reply within its deadline fails the connection rather than staying pending.
 
@@ -307,8 +312,8 @@ and redirects, and port 443 for Caddy. The recorder and API bind to localhost an
   frames and 99% of bytes; order-book traffic for those 50 markets was 3.3 deltas per
   second. Raw JSON compressed 11.8x with zstd level 3, extrapolating to about 1.7 GB
   per day, almost all of it `ticker`. Peak sports hours will be several times busier,
-  so the first week of recording still decides connection count and storage policy. The `ticker` firehose is live-only and not written to
-  the tape (ADR 0018).
+  so the first week of recording still decides connection count and storage policy. The `ticker` channel is live-only and not written to
+  the tape (ADR 0018), and covers only the recorded markets (ADR 0027).
 - Resolved 2026-09-10 against the demo exchange: `seq` starts at 1 per `sid` and the
   initial `orderbook_snapshot` messages are part of the same sequence as the deltas
   that follow (five snapshots and 1,240 deltas arrived as `seq` 1 to 1,245 with no

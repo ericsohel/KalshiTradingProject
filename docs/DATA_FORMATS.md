@@ -367,7 +367,7 @@ Tables not produced:
 
 | table | why |
 |---|---|
-| `tickers` | the unfiltered `ticker` channel is live-only (ADR 0018); top-of-book for recorded markets derives from `deltas` and `snapshots` |
+| `tickers` | the `ticker` channel is live-only (ADR 0018, ADR 0027); top-of-book for recorded markets derives from `deltas` and `snapshots` |
 | `markets`, `series`, `fee_changes` | raw segments hold only WebSocket traffic; these tables wait for a recorder change that tapes REST metadata (ADR 0025) |
 
 **Record accounting.** A bake counts every data record of the hour exactly once, and a record's rows

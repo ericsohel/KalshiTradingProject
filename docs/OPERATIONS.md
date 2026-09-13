@@ -80,6 +80,11 @@ dead-man ping and alerts, and `MemoryMax` per service.
   `errors`, and `refreshes`. A subscriber's own losses are not among them, because ZeroMQ
   drops a slow subscriber's copies without telling the publisher; the subscriber counts them
   from gaps in `bus_seq`.
+- The status line's `universe_size` counts the markets selected, `subscribed_markets` those
+  of book connections whose subscriptions are live, and `live_tickers` the recorded markets
+  with a latest `ticker` value in memory. `live_tickers` never exceeds the plan: a market is
+  dropped at the refresh that removes it from the universe (ADR 0027). It is lower while some
+  recorded markets have had no ticker change since they were subscribed.
 - A dead-man ping fires every minute while the control connection is open; a missed
   ping alerts within three minutes.
 - Alerts: recorder down, disk under 10% free, gap share over 1% in the last hour,

@@ -279,7 +279,7 @@ handling and reconnect policy belong to the recorder. It signs `timestamp + "GET
 heartbeat pings and also sends its own every `ping_interval_ns`; a pong missing for
 `ping_timeout_ns` fails the connection with close code 1011, and after the library's
 close timeout the pending read raises, so a dead peer surfaces as `WsClosedError` within about 32 seconds by default. Data silence is checked only when `silence_timeout_ns` is
-set, which the recorder does solely for the unfiltered ticker connection. A peer close,
+set, which the recorder never does (ADR 0027). A peer close,
 a missed pong, a set silence timeout, or a reader bug all raise `WsClosedError`, while a
 deliberate `close()` ends `frames()` cleanly. A session is single-use.
 
@@ -352,7 +352,8 @@ AddGroup(group) | RemoveGroup(group_id) | AddMarkets(group_id, tickers) | Remove
 def plan(tickers: Iterable[str], *, max_per_group: int, max_connections: int,
          previous: Plan | None = None) -> Plan
 def diff(current: Plan, desired: Plan) -> tuple[PlanChange, ...]
-def to_commands(changes, *, channels: Sequence[str], use_yes_price: bool,
+def split_change(change: PlanChange, *, max_markets: int) -> tuple[PlanChange, ...]
+def to_commands(changes, *, channels: Sequence[str], use_yes_price: bool | None,   # None omits it
                 sid_of: Mapping[str, tuple[int, ...]]) -> tuple[Command, ...]
 ```
 
@@ -366,7 +367,10 @@ overfilling a connection; configuration validation keeps a valid setup from reac
 case. `diff` orders removals before additions, and applying `diff(a, b)` to `a` yields
 exactly `b` (property-tested). `to_commands` maps a group to every `sid` it owns: a
 membership change emits one `update_subscription` per `sid`, and removing a group is one
-`unsubscribe`.
+`unsubscribe`. `split_change` cuts a change so that no command names more than
+`max_markets` markets: a larger group is subscribed with its first batch in ticker order and
+the rest join it through `AddMarkets`; every piece stays within the limit, and applying the
+pieces equals applying the change (property-tested).
 
 ### 8.3 `tape.recorder.gaps`
 
@@ -399,10 +403,11 @@ def segment_path(root, conn_id, wall_ns, counter) -> Path   # raw/YYYY-MM-DD/HH/
 
 class SupervisorConfig(Struct):
     conn_id: int
-    book_channels: tuple[str, ...] = ("orderbook_delta", "trade")   # one sid per channel
-    firehose_channels: tuple[str, ...] = ()      # unfiltered, e.g. ("ticker",); never also a book channel
-    use_yes_price: bool = True
+    group_channels: tuple[str, ...] = ("orderbook_delta", "trade")  # one sid per channel; books for orderbook_delta only
+    firehose_channels: tuple[str, ...] = ()      # unfiltered, e.g. ("market_lifecycle_v2",); never also a group channel
+    use_yes_price: bool = True                   # sent only when group_channels include orderbook_delta
     persist: bool = True                         # False = live-only (ADR 0018)
+    max_markets_per_command: int = 500           # a larger change is sent in batches on the same subscription
     backoff_initial_ns: int; backoff_max_ns: int; max_consecutive_failures: int | None = None
     subscribe_timeout_ns: int = 10e9             # a subscribe left unanswered fails the connection
 
@@ -429,8 +434,11 @@ segment, waits `min(max, initial * 2**failures) * (0.5 + jitter/2)`, then reconn
 resubscribes from its own group, never from old `sid`s. Error codes 25, 26, and 27 are
 counted and exposed for the recorder to act on.
 
-A book connection subscribes each book channel once; later membership changes use
-`update_subscription`. Because Kalshi merges a repeated `subscribe` into the existing
+A connection subscribes each group channel once; later membership changes use
+`update_subscription`. No command names more than `max_markets_per_command` markets: a larger
+group's subscribe carries its first batch, and the rest are added once every channel of that
+subscribe has answered, so the group stays one subscription per channel. A group on `ticker`
+alone yields `Ticker` events and keeps no books. Because Kalshi merges a repeated `subscribe` into the existing
 subscription (ADR 0020), an `ok` reply to a pending subscribe is handled as a merge: the
 supervisor keeps a per-connection map from `sid` to channel, adopts the reply's
 `market_tickers` as the membership, resolves the pending command, and requests snapshots
@@ -528,7 +536,7 @@ class Recorder:
     def books(self) -> Mapping[str, Book]                            # merged across book connections
     def sink_for(self, ticker: str) -> SegmentSink | None
     def open_book_tap(self, tickers: Iterable[str], *, max_events: int) -> CompositeBookTap
-    def latest_tickers(self) -> Mapping[str, Ticker]                 # live state, never taped
+    def latest_tickers(self) -> Mapping[str, Ticker]                 # the plan's markets only; never taped
     def status(self) -> RecorderStatus
     periodic_tasks: tuple[PeriodicTask, ...]
 ```
@@ -538,14 +546,14 @@ class Recorder:
 composition root that wires real dependencies and the auditor, including its tap
 opener and the audit lead, settle, and tap-bound settings.
 
-Connection layout: connection 0 is live-only and carries the unfiltered `ticker` channel
-(ADR 0018); connection 1 is taped and carries `market_lifecycle_v2`; connections
+Connection layout: connection 0 is live-only and carries the `ticker` channel for every
+market of the current plan, as one group (`TICKER_GROUP_ID`) that follows each replan, at
+most `group_size` markets per command (ADR 0018, ADR 0027); connection 1 is taped and carries `market_lifecycle_v2`; connections
 `2 .. 2 + book_connections - 1` are taped, and each carries exactly one planner group, its
 whole market set, on `orderbook_delta` and `trade` with `use_yes_price` (ADR 0020). The layout must fit `max_connections`.
 
-The session builder receives `conn_id` and `silence_timeout_ns`: the live-only ticker
-connection gets `RecorderConfig.ticker_silence_timeout_s`, every other connection gets
-none. A failed universe refresh keeps the current plan and retries after
+The session builder receives `conn_id` alone: no connection has a data-silence timeout,
+and every one relies on the transport keepalive (ADR 0019, ADR 0027). A failed universe refresh keeps the current plan and retries after
 `universe_retry_delay_s(failures, interval_s, jitter)`, which is
 `min(interval, 15 s * 2**failures) * (0.5 + jitter/2)`, rather than waiting a full
 interval. On every status tick `is_clock_jump(wall_delta_ns, mono_delta_ns)` compares
@@ -557,7 +565,9 @@ gap's length.
 Startup reads `GET /exchange/status` and resizes the rate limiter from
 `GET /account/limits`. Every `universe_refresh_s` the recorder pages the open,
 non-multivariate markets (logging when a listing is cut short by the page cap), selects the universe, replans with the previous plan, and gives each book connection its
-group through `set_group`.
+group through `set_group`, and the ticker connection a group of every planned market. The
+latest-ticker table then drops markets outside that group; an update for any other market is
+published but not kept, so `RecorderStatus.live_tickers` never exceeds the plan.
 Every `keyframe_interval_s` it writes merged books to
 `data_dir/keyframes/YYYY-MM-DD/HH/MM.parquet`. Every `status_interval_s` it logs one
 structured status line. A failing periodic task is logged and does not stop capture; a
@@ -1040,14 +1050,13 @@ key_id = "..."                  # the API key id, not a secret; only tape record
 private_key_path = "~/.config/tape/keys/prod-read.pem"   # must be mode 600; only tape record needs it
 rest_timeout_s = 10
 ws_ping_interval_s = 10          # 1 to 60; transport keepalive for every connection
-ws_ping_timeout_s = 20           # 1 to 60
-ws_silence_timeout_s = 60        # applies only to the live-only ticker connection
+ws_ping_timeout_s = 20           # 1 to 60; the only liveness check, as no connection has a data-silence timeout
 
 [recorder]
 data_dir = "data"
 max_connections = 16            # ticker + control + book_connections must fit
 book_connections = 4
-group_size = 500                # at most 500 (ADR 0010)
+group_size = 500                # at most 500; also the most markets one subscription command names
 keyframe_interval_s = 300       # whole minutes dividing an hour
 audit_interval_s = 300
 audit_sample = 200

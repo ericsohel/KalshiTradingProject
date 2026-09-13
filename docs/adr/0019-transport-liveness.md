@@ -1,6 +1,6 @@
 # 0019. Liveness is measured at the transport, not by data traffic
 
-Status: accepted. Date: 2026-09-10. Refines ADR 0001's operating assumptions for
+Status: accepted; ticker data-silence timeout removed by ADR 0027. Date: 2026-09-10. Refines ADR 0001's operating assumptions for
 connections, not its recording rule.
 
 ## Context

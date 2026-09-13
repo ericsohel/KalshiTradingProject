@@ -1,6 +1,6 @@
 # 0018. The unfiltered ticker channel is live-only, not taped
 
-Status: accepted. Date: 2026-09-10.
+Status: accepted; subscription scope amended by ADR 0027 (recorded markets only). Date: 2026-09-10.
 
 ## Context
 

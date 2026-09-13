@@ -9,4 +9,6 @@ The configuration of the production host described in ADR 0024 and
 | `tape.server.example.toml` | `/home/tapeops/tape.toml` (mode 600), with the real `key_id` |
 | `systemd/tape-record.service` | `/etc/systemd/system/tape-record.service` |
 | `systemd/tape-serve.service` | `/etc/systemd/system/tape-serve.service` |
+| `systemd/tape-bake.service` | `/etc/systemd/system/tape-bake.service` |
+| `systemd/tape-bake.timer` | `/etc/systemd/system/tape-bake.timer`, enabled with `systemctl enable --now` |
 | `caddy/Caddyfile` | `/etc/caddy/Caddyfile` |

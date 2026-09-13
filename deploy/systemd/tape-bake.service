@@ -1,0 +1,15 @@
+[Unit]
+Description=tape hourly bake and prune
+After=network-online.target
+RequiresMountsFor=/srv/tape
+
+[Service]
+Type=oneshot
+User=tapeops
+WorkingDirectory=/home/tapeops/tape
+# Capture keeps the CPUs and the disk: the bake yields to the recorder.
+Nice=10
+IOSchedulingClass=idle
+# The second command runs only if the first exits 0 (ADR 0025).
+ExecStart=/home/tapeops/tape/.venv/bin/tape bake --config /home/tapeops/tape.toml
+ExecStart=/home/tapeops/tape/.venv/bin/tape prune --config /home/tapeops/tape.toml --apply

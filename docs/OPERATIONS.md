@@ -52,7 +52,7 @@ The host of ADR 0024, as provisioned on 2026-09-12. Files named below are in `de
 7. Build the viewer on a development machine (`npm --prefix web run build`), copy
    `web/dist/` to `/srv/tape/www` with `rsync --delete`, install `caddy/Caddyfile`, and
    confirm that the certificate is issued.
-8. Bake and prune every hour. The maintainer installs a systemd timer, not yet in `deploy/`, that
+8. Bake and prune every hour. The maintainer installs `systemd/tape-bake.timer` and `systemd/tape-bake.service`, a timer that
    starts a oneshot service as `tapeops` at a quarter past every hour (`OnCalendar=*:15`), with
    `Nice=10` and `IOSchedulingClass=idle` so capture keeps the CPUs and the disk. The service runs
    `tape bake --config ~/tape.toml`, then, only if that exits 0,
@@ -68,7 +68,7 @@ To deploy new code: `git -C ~/tape pull --ff-only` and `uv sync --frozen`, then 
 `tape-serve`, and `tape-record` only when recorder code changed, because every recorder
 restart is a gap in the tape.
 
-Not yet in place: the bake timer of step 8, a check that time sync is healthy, backup timers, a
+Not yet in place: a check that time sync is healthy, backup timers, a
 dead-man ping and alerts, and `MemoryMax` per service.
 
 ## 4. Monitoring

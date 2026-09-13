@@ -35,3 +35,4 @@ choose and why, you have not made a decision; you have made a default.
 | [0023](0023-live-api-starlette-and-metadata.md) | The live API: Starlette on msgspec, recorder-published catalog, lazy public metadata | accepted |
 | [0024](0024-azure-for-students-host.md) | Host on Azure for Students, and serve the viewer from the same host | accepted |
 | [0025](0025-prune-raw-after-verified-bake.md) | Raw segments are pruned only after a verified bake and a retention window | accepted |
+| [0026](0026-catalog-on-pyarrow-datasets.md) | The catalog reads baked Parquet with pyarrow datasets, not DuckDB | accepted |

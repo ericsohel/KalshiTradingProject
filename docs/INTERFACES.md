@@ -304,10 +304,10 @@ class SegmentWriter:            # one file; rotation policy belongs to the recor
     records_written: int; bytes_written: int
 class SegmentReader:
     def __init__(self, path: Path) -> None        # parses the header; TapeCorruptionError if malformed
-    header: SegmentHeader; truncated: bool        # truncated is final after records() is exhausted
-    def records(self) -> Iterator[Record]         # stops cleanly at a truncated tail or unfinished frame
+    header: SegmentHeader; truncated: bool; damaged: bool   # final after records() is exhausted
+    def records(self) -> Iterator[Record]         # stops cleanly at a truncated tail, an unfinished frame, or damage
 def write_keyframe(path: Path, rows: Iterable[KeyframeRow]) -> int    # atomic (temp file + rename)
-def read_keyframe(path: Path) -> list[KeyframeRow]                    # TapeCorruptionError on schema mismatch
+def read_keyframe(path: Path, *, tickers: Collection[str] | None = None) -> list[KeyframeRow]   # TapeCorruptionError on schema mismatch
 ```
 
 `SegmentWriter.append` is called from a single writer thread fed by a bounded
@@ -711,15 +711,106 @@ at the publisher, and a fresh copy equals the publisher's book whenever that boo
 
 ## 10. `tape.bake` and `tape.store`
 
+Baking, manifests, and pruning are an adapter over the archive's files (ADR 0025); the formats are
+[DATA_FORMATS.md](DATA_FORMATS.md) 6 and 7.
+
 ```python
-def bake_hour(raw_dir: Path, out_dir: Path, *, date: date, hour: int, spec: DecoderSpec) -> BakeReport   # idempotent
-def write_manifest(day_dir: Path, reports: Sequence[BakeReport], *, clock_offset_ms: int) -> Manifest
-class Catalog:                      # DuckDB views over data/baked and data/keyframes
-    def book_at(self, ticker: str, at_wall_ns: Ns) -> Book         # nearest prior keyframe + deltas
-    def deltas(self, ticker: str, t0: Ns, t1: Ns) -> pa.Table
-    def trades(self, ticker: str, t0: Ns, t1: Ns) -> pa.Table
-    def integrity(self, day: date) -> Manifest
+# layout
+class HourKey(Struct): date; hour          # of_wall_ns, parse("YYYY-MM-DDTHH"), label, start_wall_ns, end_wall_ns
+class DataLayout(Struct): raw; keyframes; baked; manifests   # under(data_dir); every archive path
+def closed_hours(hours, *, now_wall_ns, grace_ns) -> tuple[HourKey, ...]
+
+# bake
+BAKE_VERSION = 1; DEFAULT_MAX_PART_ROWS = 500_000
+class BakeReport(Struct): hour; bake: HourBake; segments: tuple[SegmentEntry, ...];
+                          parts: dict[TableName, tuple[PartEntry, ...]]; failures: tuple[DecodeFailure, ...]
+def bake_hour(layout, hour, *, software_version, max_part_rows=500_000, flush_rows=50_000) -> BakeReport
+def record_bake(layout, report, *, software_version, clock_offset_ms: int | None) -> Manifest
+def bake_needed(manifest | None, hour, *, segments_on_disk: Mapping[str, int], parts_present: bool) -> bool
+def hours_to_bake(layout, *, now_wall_ns, grace_ns, force=False, candidates=None) -> tuple[HourKey, ...]
+@contextmanager
+def archive_lock(layout) -> Iterator[None]                    # ArchiveError while another holds it
+
+# interpret (pure) and spill
+class RowSink(Protocol): def add(self, table: TableName, row: Row) -> None
+class HourInterpreter:
+    def __init__(self, hour: HourKey, sink: RowSink)
+    def read_segment(self, name, header, records: Iterable[Record]) -> SegmentFacts
+    def corrupt_segment(self, name, *, detail, record_index=0) -> None
+    def finish(self) -> HourResult                            # accounting, integrity, failure samples
+class TableWriter: add(row); finish(out_dir) -> tuple[PartFile, ...]; close()
+class HourTables(RowSink): add(table, row); finish(out_dir: Callable[[TableName], Path]); close()
+
+# manifest
+class Manifest(Struct): version; date; software_version; segments; tables; bake; uptime; gaps; audits; clock; pruned
+def new_manifest(date, *, software_version) -> Manifest
+def with_hour(manifest, *, bake, segments, parts, software_version, clock_offset_ms) -> Manifest   # ValueError on a pruned hour
+def with_pruned(manifest, pruned: Iterable[PrunedSegment]) -> Manifest
+def decode_manifest(data: bytes, *, source: str) -> Manifest  # TapeCorruptionError
+def read_manifest(path) -> Manifest | None; def write_manifest(path, manifest) -> None     # atomic
+def parse_chrony_tracking(text: str) -> int | None
+
+# prune
+type PruneReason = Literal["inside_retention_window", "not_baked", "bake_version_stale", "segment_added",
+                           "segment_changed", "segment_missing", "decode_failures", "baked_file_missing",
+                           "baked_file_changed", "unverified"]
+class HourFacts(Struct): hour; segments: tuple[SegmentOnDisk, ...]; parts: tuple[PartOnDisk, ...]
+class PruneDecision(Struct): hour; prunable; reasons: tuple[PruneReason, ...]; segments   # bytes
+def decide(facts, manifest | None, *, now_wall_ns, retention_hours, bake_version) -> PruneDecision   # pure
+def survey(layout, *, now_wall_ns, retention_hours, bake_version) -> tuple[PruneDecision, ...]
+def apply(layout, decisions, *, clock: Clock) -> tuple[PrunedSegment, ...]
+
+# store
+class Catalog:
+    def __init__(self, layout: DataLayout, *, keyframe_lookback_hours: int = 24)
+    def book_at(self, ticker: str, at_wall_ns: int) -> Book
+    def books_at(self, at_wall_ns: int, *, tickers: Collection[str] | None = None,
+                 start_wall_ns: int | None = None) -> dict[str, Book]
+    def deltas(self, ticker: str, t0: int, t1: int) -> pa.Table     # recv_wall_ns in [t0, t1), receive order
+    def trades(self, ticker: str, t0: int, t1: int) -> pa.Table
+    def integrity(self, day: date) -> Manifest                       # ArchiveError when the day has none
+def replay(books: dict[str, Book], *, deltas: pa.Table, snapshots: pa.Table, gaps: pa.Table) -> None
 ```
+
+- **Bake.** `bake_hour` hashes each segment, reads it with `SegmentReader`, and feeds
+  `HourInterpreter`, which converts frames with `tape.wire.convert` as the supervisor does and counts
+  every record as baked, not baked, or a decode failure. Rows go to `HourTables`, which bounds memory
+  as DATA_FORMATS 6 describes. The hour's part files are swapped in only when all are written, and
+  `record_bake` then merges the bake into the day's manifest. A segment whose size or modification
+  time changes while it is read raises `ArchiveError` before anything is replaced, and so does baking
+  an hour that has a pruned segment, because its tables would lose rows. `bake_needed` is cheap: it
+  compares segment names and sizes, the bake version, and the presence of part files, and leaves
+  hashes to prune.
+- **Prune.** `decide` implements ADR 0025 and returns every reason an hour is kept, in the order of
+  `PruneReason`; a hash missing from the facts yields `unverified` only when no other reason applies.
+  `survey` gathers facts without hashes and hashes an hour's files only when `unverified` is all that
+  remains, so each run hashes little more than the hours newly past the window. `apply` records every
+  deletion of a day in its manifest and syncs it before unlinking any file of that day, deletes only
+  raw segment files and the hour and day directories they leave empty, and completes a deletion an
+  earlier run recorded but did not finish. `tape bake` and `tape prune` hold `archive_lock`.
+- **Catalog.** pyarrow datasets serve the catalog, not the DuckDB views ADR 0013 foresaw. Every
+  query here names a market and a receive-time range. Part files are sorted by ticker in row groups
+  of 65,536 rows, and a filter on the plain string `ticker` column and on `recv_wall_ns` reads only
+  the row groups whose statistics can match; measured on 2 million rows, that skipped 30 of 31 row
+  groups and answered six times faster than the same filter on a dictionary-typed column, which
+  pyarrow does not prune. That costs no dependency and holds no second columnar engine in the memory
+  of the 1 GB production host (ADR 0024); DuckDB can still read the same files for analysis on a
+  larger machine, and would earn its place when queries join or aggregate across markets.
+- **`book_at`** starts from the latest keyframe taken at or before the instant, searching back
+  `keyframe_lookback_hours`, and applies with `replay` the snapshots, deltas, and gaps received after
+  it and at or before the instant, in the order the recorder applied them: by monotonic receive
+  time, a gap just before the frame that revealed it. Neither wall time nor sequence numbers can
+  order them, because the wall clock can step backwards and a reconnected connection's subscription
+  gets the same `sid` and restarts its sequence. Since a monotonic clock restarts with its host,
+  changes are split, in wall-clock order, wherever a monotonic reading falls more than ten minutes
+  below an earlier one, and each stretch is applied whole. A gap marks a book stale when it names
+  the connection and `sid` that last changed the book; a change that breaks an invariant leaves
+  the book stale; a market with no keyframe row starts stale. Partitions are read from the keyframe's
+  hour through the hour after the instant, because a record can be filed in the next hour's segment.
+  `books_at` with `start_wall_ns` replays from an earlier keyframe, which is how a later keyframe is
+  checked. Known limits: a lost connection is not in the baked tables, so a book shows its last known
+  state until its reconnect snapshot, and a straggler the supervisor ignored after a market left its
+  subscription is applied.
 
 ## 11. `tape.engine`
 
@@ -924,6 +1015,7 @@ TapeError
   WireError                # also a ValueError
   BookInvariantError(ticker, detail)
   TapeCorruptionError
+  ArchiveError             # an hour not closed, a segment changed mid-bake, a pruned hour, the archive lock held, no manifest
   ConfigError
   BusError                 # endpoint taken, bind or receive failure; never raised by publish
   KalshiError
@@ -982,6 +1074,11 @@ metadata_ttl_s = 3600            # 60 to 86400 seconds resolved metadata is serv
 # The API follows the bus at recorder.bus_endpoint; there is no second setting for it, and
 # `tape serve` refuses to start without it.
 
+[bake]
+grace_s = 600                    # 60 to 86400 seconds after an hour ends before tape bake bakes it
+raw_retention_hours = 72         # 24 to 8760 hours after an hour ends before tape prune may delete it
+max_part_rows = 500000           # 10000 to 50000000 rows a bake sorts in memory at once
+
 [recorder.universe]
 min_volume_24h = "1000.00"      # fixed-point string, never a float
 max_l2_markets = 2000
@@ -990,7 +1087,7 @@ exclude_mve = true
 ```
 
 ```python
-class Settings(Struct): kalshi: KalshiSettings; recorder: RecorderSettings; serve: ServeSettings
+class Settings(Struct): kalshi: KalshiSettings; recorder: RecorderSettings; serve: ServeSettings; bake: BakeSettings
 def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings   # ConfigError on any problem
 def signing_credentials(settings: Settings) -> SigningCredentials          # ConfigError unless key_id and a mode-600 key file are set
 def redacted(settings: Settings) -> dict[str, object]                      # for `tape config check`
@@ -1028,6 +1125,11 @@ Rules:
   1 to 1000 and `max_tickers_per_client` 1 to 50; `client_queue_max` is 100 to 100000, room for a
   resync and a snapshot of each followed market; `bus_receive_hwm` has the bounds of
   `bus_send_hwm`; `metadata_requests_per_s` is 1 to 10 and `metadata_ttl_s` 60 to 86400.
+- **Bake**: every `[bake]` key has a default, so the section may be left out. `grace_s` is 60 to
+  86400 seconds, room for a segment sink to close and flush an hour's files; `raw_retention_hours` is
+  24 to 8760, a day being the least time to notice a baker bug in a manifest while raw data remains
+  (ADR 0025); `max_part_rows` is 10000 to 50000000. `tape bake` and `tape prune` work on the archive
+  under `recorder.data_dir` and hold no credentials.
 - **Secrets are paths, never values.** `tape config check` prints the effective settings
   with nothing to redact beyond what is already only a path.
 

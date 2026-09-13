@@ -23,8 +23,14 @@
 | **Refresh image** | A `BookRefresh`: the recorder's own copy of one book, republished every `bus_refresh_s` so a bus consumer can recover that book after loss. |
 | **Segment** | One raw tape file: every frame received on one connection during one hour (or until rotation). |
 | **Tape** | The whole recorded archive: segments, keyframes, baked tables, manifests. |
-| **Bake** | Converting raw segments into typed Parquet tables. |
-| **Manifest** | The daily JSON summary of what was recorded and how well. |
+| **Bake** | Converting one closed hour of raw segments into typed Parquet tables, and recording it in the day's manifest. |
+| **Part file** | One Parquet file of a baked table for one hour, `part-<n>.parquet`, sorted by the table's keys. |
+| **Bake version** | The baker's output version, recorded with each hour's bake. A bake by an older version is stale: the hour is baked again before its raw segments may be pruned. |
+| **Record accounting** | A bake's count of every raw record as baked, intentionally not baked, or a decode failure. Pruning an hour requires every record accounted for and no failure. |
+| **Manifest** | The daily JSON document of what was recorded, baked, and pruned, and how well: segments with hashes, part files with hashes, per-hour record accounting, and the integrity numbers. |
+| **Prune** | Deleting an hour's raw segments once a verified bake of it exists and its retention window has passed (ADR 0025). |
+| **Retention window** | `bake.raw_retention_hours`: how long after an hour ends its raw segments are kept. |
+| **Catalog** | The read side of the archive: books at an instant, deltas and trades over a range, and a day's manifest. |
 | **Gap epoch** | An interval during which a group's books were stale because of a sequence gap or disconnect. |
 | **Audit** | A comparison of the recorder's book against an independent REST orderbook fetch. |
 | **Shard (`exchange_index`)** | One of Kalshi's matching-engine instances (0 default, 1 combos, 2 crypto and commodities, 3 sports). Collateral is per shard. |

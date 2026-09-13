@@ -267,7 +267,9 @@ Data record
 ```
 
 Readers validate the magic and version, tolerate a truncated final record (crash), and
-expose records as an iterator. Records are never rewritten.
+expose records as an iterator. A decompression error, or bytes after the end of the zstd
+frame, is damage rather than truncation: a writer never produces it, so readers stop there
+and report it. Records are never rewritten.
 
 The header's `subscriptions` list reflects the connection at the moment the file was
 opened. A segment opens when a connection begins, before it subscribes, so that list is
@@ -297,45 +299,164 @@ rather than the interval slot, so it never overwrites that slot's periodic keyfr
 
 ## 6. Baked Parquet tables (version 1)
 
-Path: `data/baked/<table>/dt=YYYY-MM-DD/hour=HH/part-<n>.parquet`, zstd, sorted by
-`(ticker, ts_ms, seq)` within a file. All strings dictionary-encoded.
+Path: `data/baked/<table>/dt=YYYY-MM-DD/hour=HH/part-<n>.parquet`. One bake of one closed hour of
+raw segments (`raw/YYYY-MM-DD/HH/`) writes every table's part files for that hour and replaces the
+hour's earlier files whole (ADR 0025). A table with no rows in an hour has no file for it. The hour
+of a partition is the hour directory of the segments it was baked from; a record received in the
+last moments of an hour can sit in the next hour's segment, because the writer files records by
+the time it writes them (docs/INTERFACES.md 8.4).
 
-| table | columns |
+Every column is an integer, a boolean, or a string, in the encodings of section 1.1; no column is
+floating point. Strings are plain Arrow strings, so row-group statistics on `ticker` let a reader
+skip every other market's rows. Files are zstd level 6, in row groups of 65,536 rows, with
+statistics on every column and the sort order in the file metadata. Low-cardinality columns are
+dictionary-encoded and rising ones delta-encoded, as the second table says; every other column is
+plain. These settings were chosen by measuring the recorded archive (docs/OPERATIONS.md 5) and are
+fixed, so baking the same segments again writes byte-identical files.
+
+| table | columns (`?` nullable) |
 |---|---|
-| `deltas` | `ticker`, `ts_ms` i64, `recv_mono_ns` i64, `recv_wall_ns` i64, `conn_id` i16, `sid` i32, `seq` i64, `side` i8, `price_e4` i32, `delta_e2` i64, `own_client_order_id` string? |
-| `snapshots` | `ticker`, `recv_wall_ns`, `sid`, `seq`, `side`, `price_e4`, `count_e2`, `reason` i8 (0 initial, 1 gap resync, 2 reconnect) |
-| `trades` | `ticker`, `trade_id` string, `ts_ms`, `recv_wall_ns`, `sid`, `seq`, `price_e4`, `count_e2`, `taker_side` i8 (0 bid, 1 ask), `is_block` bool |
-| `tickers` | Not produced. The unfiltered `ticker` channel is live-only (ADR 0018); top-of-book for recorded markets is derived from `deltas` and `snapshots` |
-| `lifecycle` | `ticker`, `ts_s` i64, `recv_wall_ns`, `event_type` string, `payload_json` string |
-| `gaps` | `conn_id`, `sid`, `recv_wall_ns`, `expected_seq`, `got_seq`, `resolved_recv_wall_ns` i64? |
-| `audits` | `ticker`, `recv_wall_ns`, `levels_rest` i32, `levels_local` i32, `mismatched_levels` i32, `max_abs_diff_e2` i64 |
-| `markets` | slowly changing dimension: `ticker`, `valid_from_ns`, `valid_to_ns`?, `event_ticker`, `series_ticker`, `exchange_index`, `status`, `open_ts`, `close_ts`, `price_level_structure`, `price_ranges_json`, `strike_type`, `floor_strike` f64?, `cap_strike` f64?, `rules_primary` |
-| `series` | `ticker`, `valid_from_ns`, `valid_to_ns`?, `category`, `fee_type`, `fee_multiplier` (stored as `fee_multiplier_e4` i32), `settlement_sources_json` |
-| `fee_changes` | `series_ticker`, `fee_type`, `fee_multiplier_e4`, `scheduled_ts` |
+| `deltas` | `ticker` string, `ts_ms` i64?, `recv_mono_ns` i64, `recv_wall_ns` i64, `conn_id` i16, `sid` i32, `seq` i64?, `side` i8, `price_e4` i32, `delta_e2` i64, `own_client_order_id` string? |
+| `snapshots` | `ticker` string, `recv_wall_ns` i64, `recv_mono_ns` i64, `conn_id` i16, `sid` i32, `seq` i64?, `side` i8, `price_e4` i32, `count_e2` i64, `reason` i8 |
+| `trades` | `ticker` string, `trade_id` string, `ts_ms` i64, `recv_wall_ns` i64, `sid` i32, `seq` i64?, `price_e4` i32, `count_e2` i64, `taker_side` i8 (0 bid, 1 ask), `is_block` bool |
+| `lifecycle` | `ticker` string, `msg_type` string, `event_type` string?, `ts_s` i64?, `recv_wall_ns` i64, `sid` i32, `seq` i64?, `payload_json` string |
+| `gaps` | `conn_id` i16, `sid` i32, `recv_wall_ns` i64, `recv_mono_ns` i64, `expected_seq` i64, `got_seq` i64, `resolved_recv_wall_ns` i64? |
+| `audits` | `ticker` string, `recv_wall_ns` i64, `conn_id` i16, `outcome` string, `send_wall_ns` i64, `send_mono_ns` i64, `recv_mono_ns` i64, `window_open_mono_ns` i64, `window_close_mono_ns` i64, `window_events` i32, `match_index` i32?, `levels_rest` i32, `levels_local` i32?, `mismatched_levels` i32?, `max_abs_diff_e2` i64?, `fault` string?, `rest_levels_json` string?, `local_levels_json` string? |
 
-Strike values are the only floating-point columns; they are metadata, never money.
+| table | sorted by, within a file | dictionary-encoded | delta-encoded |
+|---|---|---|---|
+| `deltas` | `ticker, ts_ms, seq, recv_wall_ns` | `ticker, conn_id, sid, side, price_e4, delta_e2, own_client_order_id` | `ts_ms, recv_mono_ns, recv_wall_ns, seq` |
+| `snapshots` | `ticker, recv_wall_ns, seq, side, price_e4` | `ticker, recv_wall_ns, recv_mono_ns, conn_id, sid, side, reason` | |
+| `trades` | `ticker, ts_ms, seq, trade_id` | `ticker, sid, price_e4, taker_side` | `recv_wall_ns, seq` |
+| `lifecycle` | `ticker, recv_wall_ns, seq` | `ticker, msg_type, event_type` | |
+| `gaps` | `conn_id, recv_wall_ns, sid` | | |
+| `audits` | `ticker, recv_wall_ns` | `ticker, outcome, fault` | |
+
+Nulls sort last, and rows equal on every sort key keep the order of their records. Every table
+that changes a book carries `recv_mono_ns`, because the order the recorder applied changes in is
+their monotonic receive order: the wall clock can step backwards, and a reconnected connection's
+subscription gets the same `sid` again and restarts its sequence. A market's rows
+(a connection's, for `gaps`) share one part file of the hour, unless its spill bucket holds more
+rows than one part may; then they are spread over consecutive part files, each sorted on its own.
+
+- **`deltas`**: one row per `orderbook_delta` frame, in YES space (section 1.3), converted by the
+  same functions the recorder applies to its books.
+- **`snapshots`**: one row per level of an `orderbook_snapshot` frame, bids with `side` 0 and asks
+  with `side` 1; an empty book is one row with `side = -1`, `price_e4 = 0`, `count_e2 = 0`, as in
+  keyframes. `reason` is read from the segment alone: 1 (resync) when the snapshot answers a
+  `get_snapshot` command earlier in the segment or repeats a market already snapshotted on that
+  `sid` in the segment; otherwise 2 (reconnect) when the segment begins a new connection and the
+  previous segment of the same connection in the hour ended with a lost connection, a `close`
+  whose detail is not `stopped`; otherwise 0 (initial). A reconnect across an hour boundary shows
+  as 0.
+- **`trades`**: one row per `trade` frame; `price_e4` is the YES price.
+- **`lifecycle`**: one row per message on the lifecycle channel. `market_lifecycle_v2` rows carry the
+  market ticker and `event_type`; `event_lifecycle` and `event_fee_update` rows carry the event
+  ticker in `ticker`, their message type in `msg_type`, and no `event_type`. `ts_s` is `settled_ts`
+  for `settled` and `determination_ts` for `determined`, and null otherwise. `payload_json` is the
+  `msg` object exactly as received, so fee multipliers and metadata never pass through a float.
+- **`gaps`**: one row per `GAP` record. A gap on an orderbook subscription stales every book received
+  on that `sid` in the segment; `resolved_recv_wall_ns` is when the last of them was resnapshotted,
+  and null when the gap staled no book (a gap on `trade`, for example) or one still awaited its
+  snapshot when the segment ended.
+- **`audits`**: one row per `AUDIT` record (ADR 0021), `recv_*` being the REST reply;
+  `rest_levels_json` and `local_levels_json` are the level lists an inconsistent audit recorded, so
+  a finding stays diagnosable after its raw hour is pruned.
+
+Tables not produced:
+
+| table | why |
+|---|---|
+| `tickers` | the unfiltered `ticker` channel is live-only (ADR 0018); top-of-book for recorded markets derives from `deltas` and `snapshots` |
+| `markets`, `series`, `fee_changes` | raw segments hold only WebSocket traffic; these tables wait for a recorder change that tapes REST metadata (ADR 0025) |
+
+**Record accounting.** A bake counts every data record of the hour exactly once, and a record's rows
+are written only after all of it decoded (ADR 0025, condition 3):
+
+| outcome | key | records |
+|---|---|---|
+| baked | the frame's type | `orderbook_delta`, `orderbook_snapshot`, `trade`, `market_lifecycle_v2`, `event_lifecycle`, `event_fee_update` |
+| baked | `gap`, `audit` | `GAP` and `AUDIT` records |
+| not baked | `command` | outbound commands |
+| not baked | `connection` | connection events; their spans, sleeps, and overflow counts go to the manifest |
+| not baked | the reply's type | `subscribed`, `ok`, `unsubscribed`, and `error` frames |
+| not baked | `ticker` | `ticker` frames, should one reach a segment (ADR 0018) |
+| decode failure | `frame_envelope` | a frame that is not a JSON object with a string `type` |
+| decode failure | `frame_payload` | a frame of a known type whose payload does not match its struct, lacks `sid`, or holds a malformed number |
+| decode failure | `frame_unknown_type` | a frame of any other type, so a message Kalshi adds blocks pruning until the baker knows it |
+| decode failure | `gap_payload`, `audit_payload`, `connection_payload`, `command_payload` | a malformed annotation record |
+
+A truncated final record is tolerated, as section 4 says, and its segment is marked `truncated`. A
+segment with a malformed header, an unknown record kind, or damage (section 4) counts as a corrupt
+segment: the records read before the fault are baked, and like a decode failure it keeps its hour
+from being pruned.
+
+**Memory.** A bake streams each segment's records and never holds an hour in memory. A table's rows
+are buffered 50,000 at a time and spilled to an Arrow IPC file, one record batch per spill bucket,
+the bucket being the CRC-32 of the row's ticker (connection for `gaps`) modulo 64. Once the hour is
+read, buckets are laid out in order into parts of at most `bake.max_part_rows` rows (500,000 by
+default): a bucket that fits goes whole into a part, and a larger one, which a single busy market can
+fill, is cut in the order its rows were added. Each part alone is read back, sorted by index, and
+written one row group at a time, so a bake holds at most one part's rows, their order, and one
+sorted row group. How rows fall into buckets and parts depends only on the rows. Parts are written
+under `baked/.staging/` and moved into place once every part of the hour exists.
 
 ## 7. Manifests
 
-One JSON document per day at `data/manifests/YYYY-MM-DD.json`, rewritten by each bake:
+One JSON document per UTC day at `data/manifests/YYYY-MM-DD.json`. Each bake of an hour rewrites it,
+and `tape prune --apply` rewrites it before deleting a file; a rewrite goes to a synced temporary
+file renamed into place. Decoding is strict: an unknown or missing field, another version, or
+inconsistent contents is an error. Paths are POSIX paths relative to `raw/` and `baked/`.
 
 ```
 {
   "version": 1,
   "date": "2026-09-10",
-  "software_version": "...",
-  "segments": [{"path", "bytes", "sha256", "records", "first_recv_wall_ns", "last_recv_wall_ns"}],
-  "tables": {"deltas": {"rows", "files"}, ...},
-  "coverage": {"subscribed_markets_max", "rest_open_markets_max", "ratio"},
-  "uptime": {"seconds_recording", "seconds_in_day", "ratio"},
-  "gaps": {"count", "market_seconds_affected", "share"},
-  "audits": {"books_sampled", "books_exact", "exact_ratio", "levels_mismatched"},
-  "clock": {"chrony_offset_ms"}
+  "software_version": "0.1.0",
+  "segments": [{"path", "hour", "bytes", "sha256", "records",
+                "first_recv_wall_ns", "last_recv_wall_ns", "truncated"}],
+  "tables": {"deltas": {"rows", "files": [{"path", "hour", "rows", "bytes", "sha256"}]}, ...},
+  "bake": {"hours": [{"hour", "bake_version", "software_version",
+                      "accounting": {"records": {kind: n}, "baked": {source: n},
+                                     "not_baked": {reason: n}, "decode_failures": {class: n},
+                                     "corrupt_segments"},
+                      "integrity": {"spans": [{"conn_id", "start_wall_ns", "end_wall_ns",
+                                               "opened", "closed"}],
+                                    "sleeps": [{"start_wall_ns", "end_wall_ns"}],
+                                    "gaps": {"count", "stale_market_ns", "observed_market_ns"},
+                                    "audits": {"exact", "consistent", "inconsistent",
+                                               "undecidable", "levels_mismatched"},
+                                    "writer_overflow_dropped"}}]},
+  "uptime": {"seconds_recording", "seconds_in_day", "ratio": [n, d]},
+  "gaps": {"count", "market_seconds_affected", "market_seconds_observed", "share": [n, d]},
+  "audits": {"books_sampled", "books_exact", "books_consistent", "books_inconsistent",
+             "books_undecidable", "levels_mismatched", "exact_ratio": [n, d],
+             "consistency_ratio": [n, d]},
+  "clock": {"chrony_offset_ms"},
+  "pruned": [{"path", "bytes", "sha256", "pruned_wall_ns"}]
 }
 ```
 
-The three integrity numbers published on the status page are `uptime.ratio`,
-`gaps.share`, and `audits.exact_ratio`.
+- **Ratios** are exact `[numerator, denominator]` integer pairs; `[0, 0]` means no data.
+- **Segments** lists every segment a bake read, pruned or not, and `pruned` records when each was
+  deleted, so the record of what was captured outlives the files (ADR 0025). An hour's `bake` entry,
+  segments, and part files are replaced together by the next bake of that hour; an hour with a pruned
+  segment is never baked again.
+- **`uptime`**: seconds of the day with at least one taped connection open, less host sleep. A
+  segment's span runs from its `open` record, or from the start of its hour when the segment continues
+  a connection, to its `close` record or its last record; a span left open is joined to the span of
+  the same connection that continues it without an `open`. Sleeps come from `clock_jump` records.
+- **`gaps`**: `market_seconds_affected` sums, over markets, the time from a gap on a market's book
+  subscription to the market's next snapshot or the end of its segment; `market_seconds_observed` sums
+  the time from a market's first book message in a segment to the end of the segment or the market's
+  removal from the subscription. Connection outages count against uptime, not here.
+- **`audits`** counts outcomes as ADR 0021 defines them; undecidable audits are in neither ratio.
+- **`clock.chrony_offset_ms`** is the system clock's offset as `chronyc -c tracking` reported it at the
+  latest bake, rounded to milliseconds, or null where chrony is unavailable.
+- **Not in version 1:** coverage of the REST-listed open markets, which raw segments cannot give.
+
+The integrity numbers are recomputed from `bake.hours` on every write. The three published on the
+status page are `uptime.ratio`, `gaps.share`, and `audits.consistency_ratio`.
 
 ## 8. Public API formats
 
@@ -356,6 +477,12 @@ every REST body and live message to `web/src/api/schema.json` from the structs i
   opens an issue; decoders are updated; old raw segments remain readable because the
   decoder version is chosen from the segment header's `spec_versions`.
 - Tape and Parquet versions are bumped only with an ADR and a migration note.
+- Baked tables are the long-term record once raw hours are pruned (ADR 0025). A change to what a
+  bake writes for the same segments, a decoder fix included, raises `BAKE_VERSION` in
+  `tape.bake.bake`. Every hour baked by an older version is then stale: `tape bake` bakes it again
+  and `tape prune` keeps its raw segments until it has been. Hours already pruned keep their older
+  tables, so readers must accept every bake version of a table version. Byte-identical re-bakes hold
+  for one bake version, part size, and pyarrow version.
 
 ## 10. Bus messages (version 1)
 

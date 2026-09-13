@@ -1,6 +1,6 @@
 # 0013. Parquet files and DuckDB instead of a database server
 
-Status: accepted. Date: 2026-09-09.
+Status: accepted; query engine amended by ADR 0026 (pyarrow datasets, not DuckDB). Date: 2026-09-09.
 
 ## Context
 

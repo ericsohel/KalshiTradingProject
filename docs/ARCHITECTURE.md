@@ -76,7 +76,7 @@ not overlap.
 | Process | Command | Reads | Writes | State | May fail without affecting |
 |---|---|---|---|---|---|
 | Recorder | `tape record` | Kalshi WS + REST | `data/raw/`, `data/keyframes/`, ZeroMQ PUB, metrics | In-memory books for subscribed markets | everything else |
-| Baker | `tape bake` | `data/raw/` | `data/baked/`, `data/manifests/` | none (idempotent per hour) | recorder, API |
+| Baker | `tape bake`, then `tape prune --apply`, hourly | `data/raw/`, `data/manifests/` | `data/baked/`, `data/manifests/`; prune deletes raw segments of verified hours (ADR 0025) | none: each hour's bake is idempotent, and one lock admits one bake or prune | recorder, API |
 | API | `tape serve` | ZeroMQ SUB (events, catalog, status), Kalshi's public event and series endpoints; `data/keyframes/` and `data/baked/` after M4 | HTTP/WS responses | live books, per-client subscriptions, metadata cache | recorder, baker |
 | Replayer | `tape replay` | `data/` | reports | none | all |
 | Prober | `tape probe` | Kalshi WS + REST (write::trade key) | `data/probes/` | resting penny orders | recorder, API |
@@ -84,6 +84,14 @@ not overlap.
 
 Only the recorder and the API run continuously in v1. The engine is designed now and
 implemented after the simulator is calibrated (see [ROADMAP.md](ROADMAP.md)).
+
+The baker is a short-lived batch process started by a timer (OPERATIONS 3). It bakes one closed
+hour at a time: it streams records from each segment, spills each table's rows to disk in hashed
+buckets, and sorts one part file at a time, so its memory is bounded by the largest part rather than
+by the hour (DATA_FORMATS 6), on a host whose memory it shares with the recorder. It writes the
+hour's part files, then the day's manifest; `tape prune` then deletes raw segments only of hours
+whose bake it has verified against the manifest, after the retention window. Neither touches the
+current hour, keyframes, or anything the recorder is writing.
 
 ## 5. Data flow
 

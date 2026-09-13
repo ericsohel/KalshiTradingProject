@@ -38,3 +38,4 @@ choose and why, you have not made a decision; you have made a default.
 | [0026](0026-catalog-on-pyarrow-datasets.md) | The catalog reads baked Parquet with pyarrow datasets, not DuckDB | accepted |
 | [0027](0027-ticker-channel-for-recorded-markets.md) | The ticker channel covers the recorded markets, not every market | accepted |
 | [0028](0028-universe-by-rule-groups.md) | The recorded universe is chosen by ordered rule groups, not volume alone | accepted |
+| [0029](0029-react-to-market-closes.md) | React to market closes, and choose strikes near the price | accepted |

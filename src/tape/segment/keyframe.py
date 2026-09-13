@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import Final
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from tape.book import KeyframeRow
@@ -51,13 +52,21 @@ def write_keyframe(path: Path, rows: Iterable[KeyframeRow]) -> int:
     return len(materialized)
 
 
-def read_keyframe(path: Path) -> list[KeyframeRow]:
+def read_keyframe(path: Path, *, tickers: Collection[str] | None = None) -> list[KeyframeRow]:
     """Read a keyframe file back into rows.
+
+    Args:
+        path: The keyframe file.
+        tickers: Read only these markets' rows; ``None`` reads every row.
 
     Raises:
         TapeCorruptionError: If the file's schema does not match ``KEYFRAME_SCHEMA``.
     """
-    table = pq.read_table(path)
+    if tickers is None:
+        table = pq.read_table(path)
+    else:
+        wanted = pa.array(sorted(set(tickers)), type=pa.string())
+        table = pq.read_table(path, filters=pc.field("ticker").isin(wanted))
     if not table.schema.equals(KEYFRAME_SCHEMA):
         raise TapeCorruptionError(f"{path}: unexpected keyframe schema {table.schema}")
     columns = table.to_pydict()

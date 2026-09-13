@@ -17,6 +17,8 @@ from tape.errors import WireError
 __all__ = [
     "Envelope",
     "ErrorMsg",
+    "EventFeeUpdateMsg",
+    "EventLifecycleMsg",
     "FillMsg",
     "MarketLifecycleV2Msg",
     "OkMsg",
@@ -148,6 +150,31 @@ class MarketLifecycleV2Msg(msgspec.Struct, frozen=True, kw_only=True):
     floor_strike: float | None = None
     cap_strike: float | None = None
     yes_sub_title: str | None = None
+
+
+class EventLifecycleMsg(msgspec.Struct, frozen=True, kw_only=True):
+    """Payload of ``event_lifecycle``, sent on the ``market_lifecycle_v2`` channel for an event."""
+
+    event_ticker: str
+    series_ticker: str | None = None
+    exchange_index: int | None = None
+    title: str | None = None
+    subtitle: str | None = None
+    collateral_return_type: str | None = None
+    strike_date: int | None = None
+    strike_period: str | None = None
+
+
+class EventFeeUpdateMsg(msgspec.Struct, frozen=True, kw_only=True):
+    """Payload of ``event_fee_update``: an event-level fee override was set or cleared.
+
+    ``fee_multiplier_override`` is a JSON number that feeds fee arithmetic, so it is left
+    undecoded rather than passed through a float; the raw payload keeps it.
+    """
+
+    event_ticker: str
+    # Inbound taxonomy: a fee type Kalshi adds must not break decoding (ADR 0017).
+    fee_type_override: str | None = None
 
 
 class FillMsg(msgspec.Struct, frozen=True, kw_only=True):

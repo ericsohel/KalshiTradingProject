@@ -83,3 +83,14 @@ bus_receive_hwm = 10000
 # at most this many requests per second (1 to 10), each result kept this many seconds (60 to 86400).
 metadata_requests_per_s = 2
 metadata_ttl_s = 3600
+
+[bake]
+# `tape bake` turns an hour of raw segments into Parquet tables and records it in the day's
+# manifest once grace_s seconds (60 to 86400) have passed since the hour ended, so that no
+# segment of it is still being written.
+grace_s = 600
+# `tape prune --apply` deletes an hour's raw segments only after a verified bake of it, and only
+# once raw_retention_hours (24 to 8760) have passed since it ended (ADR 0025).
+raw_retention_hours = 72
+# Rows a bake sorts in memory at once (10000 to 50000000); lower it on a host short of memory.
+max_part_rows = 500000

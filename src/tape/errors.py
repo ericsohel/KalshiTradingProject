@@ -8,6 +8,7 @@ structured context as attributes, never only as formatted text.
 from __future__ import annotations
 
 __all__ = [
+    "ArchiveError",
     "BookInvariantError",
     "BusError",
     "ConfigError",
@@ -53,6 +54,15 @@ class BookInvariantError(TapeError):
 
 class TapeCorruptionError(TapeError):
     """A raw segment or keyframe file is malformed beyond a truncated tail."""
+
+
+class ArchiveError(TapeError):
+    """The archive cannot safely do what was asked (docs/adr/0025-prune-raw-after-verified-bake.md).
+
+    Raised when an hour is not closed yet, raw segments change while they are baked, an hour
+    whose segments were already pruned would be baked again, another bake or prune holds the
+    archive, or a manifest that must exist does not.
+    """
 
 
 class ConfigError(TapeError):

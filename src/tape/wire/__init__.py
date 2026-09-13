@@ -17,6 +17,8 @@ from tape.wire.convert import (
 from tape.wire.ws import (
     Envelope,
     ErrorMsg,
+    EventFeeUpdateMsg,
+    EventLifecycleMsg,
     FillMsg,
     MarketLifecycleV2Msg,
     OkMsg,
@@ -33,6 +35,8 @@ from tape.wire.ws import (
 __all__ = [
     "Envelope",
     "ErrorMsg",
+    "EventFeeUpdateMsg",
+    "EventLifecycleMsg",
     "FillMsg",
     "MarketLifecycleV2Msg",
     "OkMsg",

@@ -33,3 +33,12 @@ listen_host = "127.0.0.1"
 listen_port = 8080
 allowed_origins = ["https://kalshi-tape-live.northcentralus.cloudapp.azure.com", "https://ericsohel.com"]
 max_clients = 200
+
+[bake]
+# An hourly timer runs `tape bake`, then `tape prune --apply` (docs/OPERATIONS.md 3).
+grace_s = 600
+# Raw segments stay three days after a verified bake of their hour (ADR 0025).
+raw_retention_hours = 72
+# Half the default, for a host with 1 GB of memory shared with the recorder: it lowers a bake's
+# peak by about 60 MB at the same speed (docs/OPERATIONS.md 5).
+max_part_rows = 250000

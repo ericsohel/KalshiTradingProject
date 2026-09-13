@@ -71,6 +71,42 @@ def test_truncated_tail_is_tolerated(tmp_path: Path) -> None:
         records = list(reader.records())
     assert [r.recv_mono_ns for r in records] == list(range(10))
     assert reader.truncated is True
+    assert reader.damaged is False
+
+
+def json_segment(path: Path, count: int) -> bytes:
+    """A segment of compressible JSON frames, flushed as the recorder flushes them."""
+    with SegmentWriter(path, header()) as writer:
+        for i in range(count):
+            writer.append(
+                record(
+                    i, payload=b'{"type":"orderbook_delta","seq":%d,"delta":"%d.00"}' % (i, i % 97)
+                )
+            )
+            if i % 500 == 0:
+                writer.flush()
+    return path.read_bytes()
+
+
+def test_bytes_after_the_frame_are_damage_not_truncation(tmp_path: Path) -> None:
+    whole = json_segment(tmp_path / "whole.tape.zst", 200)
+    appended = tmp_path / "appended.tape.zst"
+    appended.write_bytes(whole + b"not written by a segment writer")
+    with SegmentReader(appended) as reader:
+        assert len(list(reader.records())) == 200
+    assert (reader.truncated, reader.damaged) == (False, True)
+
+
+def test_corruption_past_the_first_read_is_damage_and_stops_reading(tmp_path: Path) -> None:
+    whole = json_segment(tmp_path / "whole.tape.zst", 60_000)
+    assert len(whole) > 3 * (1 << 16)
+    middle = len(whole) * 3 // 4
+    corrupt = tmp_path / "corrupt.tape.zst"
+    corrupt.write_bytes(whole[:middle] + bytes(4096) + whole[middle + 4096 :])
+    with SegmentReader(corrupt) as reader:
+        count = sum(1 for _ in reader.records())
+    assert 0 < count < 60_000
+    assert (reader.truncated, reader.damaged) == (False, True)
 
 
 def test_bad_magic_and_version_raise(tmp_path: Path) -> None:

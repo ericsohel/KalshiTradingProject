@@ -30,6 +30,7 @@ from typing import Annotated, Any, Final, Literal
 import msgspec
 import msgspec.inspect
 
+from tape.bake.bake import DEFAULT_MAX_PART_ROWS
 from tape.bus.sockets import DEFAULT_SEND_HWM, check_endpoint
 from tape.errors import ConfigError, FixedPointError
 from tape.fixedpoint import parse_count
@@ -48,6 +49,7 @@ __all__ = [
     "ENDPOINTS",
     "ENV_PREFIX",
     "ENV_SEPARATOR",
+    "BakeSettings",
     "Env",
     "KalshiEndpoints",
     "KalshiSettings",
@@ -136,6 +138,29 @@ _MIN_METADATA_TTL_S: Final = 60
 _MAX_METADATA_TTL_S: Final = 86_400
 """Ceiling on how long resolved metadata is served; a corrected title appears within a day."""
 
+_MIN_BAKE_GRACE_S: Final = 60
+"""Floor on the bake grace period. A segment sink closes an hour's file within a poll interval of
+the hour ending and flushes every second (docs/INTERFACES.md 8.4); a minute leaves room for a
+drain that a slow disk delays."""
+
+_MAX_BAKE_GRACE_S: Final = 86_400
+"""Ceiling on the bake grace period. Beyond a day, hours wait so long that raw retention and disk
+space run out before they are baked."""
+
+_MIN_RAW_RETENTION_HOURS: Final = 24
+"""Floor on raw retention. Raw segments are the only way to repair a baker bug (ADR 0001); a day
+leaves time to notice one in the day's manifest before its hours are pruned (ADR 0025)."""
+
+_MAX_RAW_RETENTION_HOURS: Final = 8_760
+"""Ceiling on raw retention: a year. A host meant to keep raw data longer does not run prune."""
+
+_MIN_PART_ROWS: Final = 10_000
+"""Floor on rows per part file; below it an hour of a busy market becomes hundreds of tiny files."""
+
+_MAX_PART_ROWS: Final = 50_000_000
+"""Ceiling on rows per part file. A bake sorts one part in memory at a time, at about 80 bytes a
+delta row, several copies deep; far beyond the default no host of this project has the memory."""
+
 _INTEGER: Final = re.compile(r"[+-]?[0-9]+")
 _TRUE: Final = frozenset({"true", "1", "yes"})
 _FALSE: Final = frozenset({"false", "0", "no"})
@@ -156,6 +181,11 @@ TickersPerClient = Annotated[int, msgspec.Meta(ge=1, le=_MAX_TICKERS_PER_CLIENT)
 ClientQueueMax = Annotated[int, msgspec.Meta(ge=_MIN_CLIENT_QUEUE, le=_MAX_CLIENT_QUEUE)]
 MetadataRequestsPerS = Annotated[int, msgspec.Meta(ge=1, le=_MAX_METADATA_REQUESTS_PER_S)]
 MetadataTtlSeconds = Annotated[int, msgspec.Meta(ge=_MIN_METADATA_TTL_S, le=_MAX_METADATA_TTL_S)]
+BakeGraceSeconds = Annotated[int, msgspec.Meta(ge=_MIN_BAKE_GRACE_S, le=_MAX_BAKE_GRACE_S)]
+RawRetentionHours = Annotated[
+    int, msgspec.Meta(ge=_MIN_RAW_RETENTION_HOURS, le=_MAX_RAW_RETENTION_HOURS)
+]
+PartRows = Annotated[int, msgspec.Meta(ge=_MIN_PART_ROWS, le=_MAX_PART_ROWS)]
 
 
 class KalshiEndpoints(msgspec.Struct, frozen=True, kw_only=True):
@@ -366,6 +396,25 @@ class ServeSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fi
     metadata_ttl_s: MetadataTtlSeconds = 3600
 
 
+class BakeSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """``[bake]``: when hours are baked, how long raw data stays, and what a bake holds (ADR 0025).
+
+    ``tape bake`` and ``tape prune`` read the archive under ``recorder.data_dir``.
+
+    Attributes:
+        grace_s: Seconds after an hour ends before ``tape bake`` bakes it, so that no segment of it
+            is still being written; 60 to 86400.
+        raw_retention_hours: Hours after an hour ends before ``tape prune`` may delete its raw
+            segments, and then only after a verified bake; 24 to 8760.
+        max_part_rows: Rows a part file holds before a bake starts another, which bounds the rows
+            sorted in memory at once; 10000 to 50000000.
+    """
+
+    grace_s: BakeGraceSeconds = 600
+    raw_retention_hours: RawRetentionHours = 72
+    max_part_rows: PartRows = DEFAULT_MAX_PART_ROWS
+
+
 class Settings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     """Every setting of a ``tape`` process (docs/INTERFACES.md 17).
 
@@ -373,11 +422,13 @@ class Settings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
         kalshi: The ``[kalshi]`` section.
         recorder: The ``[recorder]`` section.
         serve: The ``[serve]`` section; every key has a default.
+        bake: The ``[bake]`` section; every key has a default.
     """
 
     kalshi: KalshiSettings
     recorder: RecorderSettings
     serve: ServeSettings = ServeSettings()
+    bake: BakeSettings = BakeSettings()
 
 
 class SigningCredentials(msgspec.Struct, frozen=True, kw_only=True):
@@ -438,6 +489,7 @@ def load_settings(path: Path, *, environ: Mapping[str, str]) -> Settings:
             recorder, data_dir=_resolve(recorder.data_dir, base, environ, "recorder.data_dir")
         ),
         serve=parsed.serve,
+        bake=parsed.bake,
     )
     _check_data_dir(settings.recorder.data_dir)
     return settings

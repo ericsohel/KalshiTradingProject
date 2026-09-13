@@ -2,15 +2,15 @@
 
 Responsibility: parse arguments, configure logging, load settings, and construct the real
 dependencies (clock, signer, rate limiter, REST client, WebSocket sessions, segment sinks, the
-bus publisher and subscriber, the live API and its server) that the adapters receive already
-built (docs/ENGINEERING_STANDARDS.md 2.2). It is the only module that constructs ``SystemClock``,
-reads ``os.environ``, installs signal handlers, binds the API's listening socket, or writes to
-standard output.
+bus publisher and subscriber, the live API and its server, the archive the baker and pruner work
+on) that the adapters receive already built (docs/ENGINEERING_STANDARDS.md 2.2). It is the only
+module that constructs ``SystemClock``, reads ``os.environ``, installs signal handlers, binds the
+API's listening socket, runs ``chronyc``, or writes to standard output.
 
 Invariants: exit status 0 means the command did what it was asked and, for ``record`` and
 ``serve``, shut down cleanly; 1 means a configuration error or a failure, with the reason on
-standard error or in the log; 2 is argparse's usage error. Logging is configured once per
-invocation, before any adapter is built.
+standard error or in the log, and for ``bake`` that at least one hour failed; 2 is argparse's
+usage error. Logging is configured once per invocation, before any adapter is built.
 """
 
 from __future__ import annotations
@@ -20,9 +20,12 @@ import asyncio
 import contextlib
 import logging
 import os
+import resource
 import secrets
+import shutil
 import signal
 import socket
+import subprocess
 import sys
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -32,9 +35,11 @@ from typing import Final
 
 import httpx
 import msgspec
+import pyarrow as pa
 import uvicorn
 from starlette.applications import Starlette
 
+from tape import __version__
 from tape.api import (
     LiveHub,
     MarketDirectory,
@@ -44,6 +49,19 @@ from tape.api import (
     metadata_limits,
 )
 from tape.api.contract import CLOSE_GOING_AWAY
+from tape.bake import (
+    BAKE_VERSION,
+    DataLayout,
+    HourKey,
+    archive_lock,
+    bake_hour,
+    closed_hours,
+    hours_to_bake,
+    record_bake,
+    survey,
+)
+from tape.bake import apply as apply_prune
+from tape.bake.manifest import parse_chrony_tracking
 from tape.book import Book
 from tape.bus.ports import Subscriber
 from tape.bus.sockets import ZmqPublisher, ZmqSubscriber
@@ -52,7 +70,7 @@ from tape.client.ratelimit import BucketRateLimiter
 from tape.client.rest import KalshiRest, build_client
 from tape.client.ws import WsSession
 from tape.config import Settings, load_settings, redacted, signing_credentials
-from tape.errors import ConfigError
+from tape.errors import ArchiveError, ConfigError, TapeCorruptionError
 from tape.recorder.auditor import Auditor
 from tape.recorder.recorder import Recorder, RecorderConfig
 from tape.recorder.tap import BookTap
@@ -64,14 +82,22 @@ __all__ = [
     "LOG_FORMATS",
     "SERVE_SHUTDOWN_TIMEOUT_S",
     "AuditTask",
+    "BakeSummary",
+    "BakedHour",
+    "FailedHour",
     "JsonLogFormatter",
     "LiveApi",
+    "PruneSummary",
+    "PrunedHour",
     "TextLogFormatter",
+    "bake_archive",
     "build_api",
     "build_recorder",
+    "chrony_offset_ms",
     "configure_logging",
     "listen_socket",
     "main",
+    "prune_archive",
     "recorder_config",
     "serve_api",
     "serve_config",
@@ -101,6 +127,9 @@ _WS_MAX_FRAME_BYTES: Final = 64 * 1024
 by the session, sits well below it; this bound only keeps a hostile frame out of memory."""
 
 _LISTEN_BACKLOG: Final = 128
+
+_CHRONY_TIMEOUT_S: Final = 5
+"""Deadline for ``chronyc`` to report the clock offset recorded in a manifest."""
 
 _log = logging.getLogger(__name__)
 
@@ -148,7 +177,36 @@ def _parser() -> argparse.ArgumentParser:
         "serve", parents=[common], help="serve the live API until SIGINT or SIGTERM"
     )
     serve.set_defaults(command=_serve)
+    bake = commands.add_parser(
+        "bake", parents=[common], help="bake closed hours of raw segments into tables and manifests"
+    )
+    bake.add_argument(
+        "--hour",
+        type=_hour,
+        default=None,
+        help="bake only this closed UTC hour, YYYY-MM-DDTHH (default: every hour that needs it)",
+    )
+    bake.add_argument(
+        "--force", action="store_true", help="bake again hours whose manifest is up to date"
+    )
+    bake.set_defaults(command=_bake)
+    prune = commands.add_parser(
+        "prune",
+        parents=[common],
+        help="report which raw hours may be deleted (ADR 0025); --apply deletes them",
+    )
+    prune.add_argument(
+        "--apply", action="store_true", help="delete the raw segments of every prunable hour"
+    )
+    prune.set_defaults(command=_prune)
     return parser
+
+
+def _hour(text: str) -> HourKey:
+    try:
+        return HourKey.parse(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _config_check(args: argparse.Namespace) -> int:
@@ -208,6 +266,299 @@ def _serve(args: argparse.Namespace) -> int:
         _log.exception("live API stopped by a failure")
         return _EXIT_FAILURE
     return _EXIT_OK
+
+
+def _bake(args: argparse.Namespace) -> int:
+    configure_logging(log_format=args.log_format, level=args.log_level)
+    settings = _load(args.config)
+    if settings is None:
+        return _EXIT_FAILURE
+    _use_system_allocator()
+    try:
+        summary = bake_archive(
+            settings,
+            clock=SystemClock(),
+            hour=args.hour,
+            force=args.force,
+            clock_offset_ms=chrony_offset_ms(),
+        )
+    except (ArchiveError, TapeCorruptionError, OSError) as exc:
+        _log.error("bake stopped", extra={"error": str(exc)})
+        return _EXIT_FAILURE
+    sys.stdout.write(f"{msgspec.json.format(msgspec.json.encode(summary), indent=2).decode()}\n")
+    return _EXIT_FAILURE if summary.failed else _EXIT_OK
+
+
+def _prune(args: argparse.Namespace) -> int:
+    configure_logging(log_format=args.log_format, level=args.log_level)
+    settings = _load(args.config)
+    if settings is None:
+        return _EXIT_FAILURE
+    try:
+        summary = prune_archive(settings, clock=SystemClock(), apply=args.apply)
+    except (ArchiveError, TapeCorruptionError, OSError) as exc:
+        _log.error("prune stopped", extra={"error": str(exc)})
+        return _EXIT_FAILURE
+    sys.stdout.write(f"{msgspec.json.format(msgspec.json.encode(summary), indent=2).decode()}\n")
+    return _EXIT_OK
+
+
+class BakedHour(msgspec.Struct, frozen=True, kw_only=True):
+    """One hour ``tape bake`` baked.
+
+    Attributes:
+        hour: ``YYYY-MM-DDTHH``.
+        records: Data records read.
+        decode_failures: Decode failures and corrupt segments; any blocks pruning.
+        rows: Rows written per table.
+        raw_bytes: Size of the hour's segments.
+        baked_bytes: Size of the part files written.
+        elapsed_ms: Time the bake and its manifest took.
+        peak_rss_bytes: The process's peak resident memory so far.
+    """
+
+    hour: str
+    records: int
+    decode_failures: int
+    rows: dict[str, int]
+    raw_bytes: int
+    baked_bytes: int
+    elapsed_ms: int
+    peak_rss_bytes: int
+
+
+class FailedHour(msgspec.Struct, frozen=True, kw_only=True):
+    """One hour ``tape bake`` could not bake.
+
+    Attributes:
+        hour: ``YYYY-MM-DDTHH``.
+        error: Why.
+    """
+
+    hour: str
+    error: str
+
+
+class BakeSummary(msgspec.Struct, frozen=True, kw_only=True):
+    """What ``tape bake`` did.
+
+    Attributes:
+        baked: Hours baked and recorded in their manifests.
+        failed: Hours that failed; the others were still baked.
+    """
+
+    baked: tuple[BakedHour, ...]
+    failed: tuple[FailedHour, ...]
+
+
+class PrunedHour(msgspec.Struct, frozen=True, kw_only=True):
+    """One raw hour in the report of ``tape prune``.
+
+    Attributes:
+        hour: ``YYYY-MM-DDTHH``.
+        prunable: Whether every condition of ADR 0025 holds.
+        reasons: Every condition that does not.
+        segments: Segments pruning deletes; zero unless prunable.
+        bytes: Bytes pruning frees; zero unless prunable.
+    """
+
+    hour: str
+    prunable: bool
+    reasons: tuple[str, ...]
+    segments: int
+    bytes: int
+
+
+class PruneSummary(msgspec.Struct, frozen=True, kw_only=True):
+    """What ``tape prune`` found and, with ``--apply``, did.
+
+    Attributes:
+        applied: Whether deletion was requested.
+        retention_hours: The raw retention window applied.
+        hours: Every hour with raw segments on disk, before any deletion.
+        prunable_hours: Hours every condition allows pruning.
+        prunable_bytes: Bytes those hours hold.
+        pruned_segments: Segments deleted; zero without ``--apply``.
+        pruned_bytes: Bytes deleted; zero without ``--apply``.
+    """
+
+    applied: bool
+    retention_hours: int
+    hours: tuple[PrunedHour, ...]
+    prunable_hours: int
+    prunable_bytes: int
+    pruned_segments: int
+    pruned_bytes: int
+
+
+def bake_archive(
+    settings: Settings,
+    *,
+    clock: Clock,
+    hour: HourKey | None,
+    force: bool,
+    clock_offset_ms: int | None,
+) -> BakeSummary:
+    """Bake closed hours under ``recorder.data_dir`` and record each in its day's manifest.
+
+    A failing hour is logged and reported, and the next hour is still baked.
+
+    Args:
+        settings: Loaded settings.
+        clock: The process clock; closes hours and times each bake.
+        hour: Bake only this hour; ``None`` bakes every closed hour that needs it.
+        force: Bake hours whose manifest is already up to date too.
+        clock_offset_ms: The host clock's offset, recorded in every manifest written.
+
+    Returns:
+        The hours baked and the hours that failed.
+
+    Raises:
+        ArchiveError: If another bake or prune holds the archive, or ``hour`` is not closed.
+        TapeCorruptionError: If a manifest does not decode.
+    """
+    layout = DataLayout.under(settings.recorder.data_dir)
+    grace_ns = settings.bake.grace_s * NS_PER_S
+    with archive_lock(layout):
+        now_wall_ns = int(clock.wall_ns())
+        if hour is not None and not closed_hours(
+            (hour,), now_wall_ns=now_wall_ns, grace_ns=grace_ns
+        ):
+            grace_s = settings.bake.grace_s
+            raise ArchiveError(f"{hour.label} is not closed; hours bake {grace_s} s after they end")
+        hours = hours_to_bake(
+            layout,
+            now_wall_ns=now_wall_ns,
+            grace_ns=grace_ns,
+            force=force,
+            candidates=None if hour is None else (hour,),
+        )
+        if hour is not None and not hours:
+            _log.info(
+                "nothing to bake: the hour is up to date, has no segments, or has pruned ones",
+                extra={"hour": hour.label},
+            )
+        baked: list[BakedHour] = []
+        failed: list[FailedHour] = []
+        for each in hours:
+            started_ns = int(clock.mono_ns())
+            try:
+                report = bake_hour(
+                    layout,
+                    each,
+                    software_version=__version__,
+                    max_part_rows=settings.bake.max_part_rows,
+                )
+                record_bake(
+                    layout, report, software_version=__version__, clock_offset_ms=clock_offset_ms
+                )
+            except (ArchiveError, TapeCorruptionError, OSError) as exc:
+                _log.exception("hour not baked", extra={"hour": each.label})
+                failed.append(FailedHour(hour=each.label, error=str(exc)))
+                continue
+            entry = BakedHour(
+                hour=each.label,
+                records=report.bake.accounting.total,
+                decode_failures=report.bake.accounting.failures,
+                rows={str(name): count for name, count in report.rows.items()},
+                raw_bytes=sum(segment.bytes for segment in report.segments),
+                baked_bytes=sum(part.bytes for parts in report.parts.values() for part in parts),
+                elapsed_ms=(int(clock.mono_ns()) - started_ns) // NS_PER_MS,
+                peak_rss_bytes=_peak_rss_bytes(),
+            )
+            _log.info("hour baked", extra=msgspec.to_builtins(entry))
+            baked.append(entry)
+    return BakeSummary(baked=tuple(baked), failed=tuple(failed))
+
+
+def prune_archive(settings: Settings, *, clock: Clock, apply: bool) -> PruneSummary:
+    """Decide every raw hour under ``recorder.data_dir`` and, with ``apply``, prune those allowed.
+
+    Args:
+        settings: Loaded settings.
+        clock: The process clock; ends the retention window and stamps each deletion.
+        apply: Delete the raw segments of every prunable hour; without it nothing is deleted.
+
+    Returns:
+        Every hour's decision and what was deleted.
+
+    Raises:
+        ArchiveError: If another bake or prune holds the archive.
+        TapeCorruptionError: If a manifest does not decode.
+        OSError: If a file cannot be inspected, a manifest written, or a segment deleted.
+    """
+    layout = DataLayout.under(settings.recorder.data_dir)
+    retention_hours = settings.bake.raw_retention_hours
+    with archive_lock(layout):
+        decisions = survey(
+            layout,
+            now_wall_ns=int(clock.wall_ns()),
+            retention_hours=retention_hours,
+            bake_version=BAKE_VERSION,
+        )
+        pruned = apply_prune(layout, decisions, clock=clock) if apply else ()
+    prunable = [decision for decision in decisions if decision.prunable]
+    return PruneSummary(
+        applied=apply,
+        retention_hours=retention_hours,
+        hours=tuple(
+            PrunedHour(
+                hour=decision.hour.label,
+                prunable=decision.prunable,
+                reasons=decision.reasons,
+                segments=len(decision.segments),
+                bytes=decision.bytes,
+            )
+            for decision in decisions
+        ),
+        prunable_hours=len(prunable),
+        prunable_bytes=sum(decision.bytes for decision in prunable),
+        pruned_segments=len(pruned),
+        pruned_bytes=sum(segment.bytes for segment in pruned),
+    )
+
+
+def chrony_offset_ms() -> int | None:
+    """The host clock's offset as ``chronyc`` reports it.
+
+    Returns:
+        Whole milliseconds, or ``None`` where chrony is not installed, fails, or does not answer
+        within :data:`_CHRONY_TIMEOUT_S`.
+    """
+    executable = shutil.which("chronyc")
+    if executable is None:
+        return None
+    try:
+        # Fixed arguments and no input, so nothing untrusted reaches the command.
+        completed = subprocess.run(  # noqa: S603
+            [executable, "-c", "tracking"],
+            capture_output=True,
+            text=True,
+            timeout=_CHRONY_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_chrony_tracking(completed.stdout)
+
+
+def _use_system_allocator() -> None:
+    """Allocate Arrow buffers with the system allocator for the rest of the process.
+
+    Arrow's default pools keep freed memory for reuse. A bake frees hundreds of megabytes every
+    time it finishes a part, and on the recorded archive the system allocator returned it,
+    lowering a busy hour's peak resident memory by about a third, which the 1 GB production host
+    shares with the recorder (ADR 0024).
+    """
+    pa.set_memory_pool(pa.system_memory_pool())
+
+
+def _peak_rss_bytes() -> int:
+    """The process's peak resident memory; ``ru_maxrss`` is bytes on macOS, kilobytes elsewhere."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024
 
 
 _NO_BUS_ENDPOINT: Final = (

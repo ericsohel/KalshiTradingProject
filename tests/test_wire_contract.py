@@ -12,6 +12,8 @@ import yaml
 
 from tape.wire import (
     ErrorMsg,
+    EventFeeUpdateMsg,
+    EventLifecycleMsg,
     FillMsg,
     MarketLifecycleV2Msg,
     OrderbookDeltaMsg,
@@ -33,6 +35,8 @@ STRUCT_FOR_MESSAGE: dict[str, type[msgspec.Struct] | None] = {
     "trade": TradeMsg,
     "ticker": TickerMsg,
     "marketLifecycleV2": MarketLifecycleV2Msg,
+    "eventLifecycle": EventLifecycleMsg,
+    "eventFeeUpdate": EventFeeUpdateMsg,
     "fill": FillMsg,
     "userOrder": UserOrderMsg,
     "subscribedResponse": SubscribedMsg,

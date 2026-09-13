@@ -42,7 +42,10 @@ FORMAT_VERSION: Final = 1
 _FILE_HEADER: Final = struct.Struct("<4sHI")
 _RECORD_HEADER: Final = struct.Struct("<BHQQI")
 _MAX_PAYLOAD: Final = (1 << 32) - 1
-_READ_CHUNK: Final = 1 << 20
+_READ_CHUNK: Final = 1 << 16
+"""Compressed bytes decompressed at once. Raw JSON compresses about twelve times, so a larger chunk
+means a transient buffer of megabytes per read, which the allocator keeps: on a busy hour 1 MiB
+chunks held about 190 MB, and 64 KiB chunks 38 MB, at the same speed."""
 _DEFAULT_LEVEL: Final = 3
 
 
@@ -175,7 +178,10 @@ class SegmentReader:
     """Streaming reader for one segment file.
 
     The header is parsed eagerly. Records are yielded lazily by ``records()``. After
-    iteration, ``truncated`` tells whether the file ended mid-record or mid-frame.
+    iteration, ``truncated`` tells whether the file ended mid-record or mid-frame, as a
+    crash leaves it, and ``damaged`` whether decompression failed or bytes followed the
+    end of the frame, which a writer never produces. Reading stops at either; the records
+    yielded before it remain valid.
 
     Raises:
         TapeCorruptionError: On a bad magic, unsupported version, or malformed header.
@@ -188,6 +194,7 @@ class SegmentReader:
         self._buffer = bytearray()
         self._eof = False
         self.truncated = False
+        self.damaged = False
         self.header = self._read_header()
 
     @property
@@ -239,7 +246,9 @@ class SegmentReader:
         """Decompress one chunk of input into the buffer. Returns False at end of input.
 
         An unfinished zstd frame at end of file (the writer never closed) marks the
-        reader as truncated; the records decoded before that point remain valid.
+        reader as truncated. A decompression error, or input left over after the frame
+        ended, marks it as damaged and ends the input. Either way the records decoded
+        before that point remain valid.
         """
         if self._eof:
             return False
@@ -253,8 +262,11 @@ class SegmentReader:
             chunk = self._dobj.decompress(raw)
         except zstandard.ZstdError:
             self._eof = True
-            self.truncated = True
+            self.damaged = True
             return False
+        if self._dobj.eof and self._dobj.unused_data:
+            self._eof = True
+            self.damaged = True
         if chunk:
             self._buffer.extend(chunk)
             return True

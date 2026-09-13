@@ -14,6 +14,7 @@ import pytest
 from tape.config import (
     DEFAULT_SHOWCASE_SERIES,
     ENDPOINTS,
+    BakeSettings,
     KalshiSettings,
     RecorderSettings,
     ServeSettings,
@@ -149,6 +150,9 @@ def test_only_env_and_the_data_dir_are_required_and_everything_else_has_a_defaul
         2,
         3600,
     )
+    bake = settings.bake
+    assert bake == BakeSettings()
+    assert (bake.grace_s, bake.raw_retention_hours, bake.max_part_rows) == (600, 72, 500_000)
     # Validation reads the file system but never changes it.
     assert not (tmp_path / "data").exists()
 
@@ -165,6 +169,7 @@ def test_the_example_file_is_valid_and_spells_out_the_defaults(tmp_path: Path, h
     )
     assert settings.recorder == RecorderSettings(data_dir=tmp_path / "data")
     assert settings.serve == ServeSettings()
+    assert settings.bake == BakeSettings()
     assert settings.recorder.universe.showcase_series == (
         "KXBTC15M",
         "KXPAYROLLS",
@@ -363,6 +368,13 @@ def test_an_override_into_a_value_that_is_not_a_table_is_refused(tmp_path: Path)
         (("serve", "metadata_ttl_s"), 59, r">= 60 - at `\$\.serve\.metadata_ttl_s`"),
         (("serve", "metadata_ttl_s"), 86_401, r"<= 86400 - at `\$\.serve\.metadata_ttl_s`"),
         (("serve", "bus_endpoint"), "ipc:///tmp/bus.sock", "unknown field `bus_endpoint`"),
+        (("bake", "grace_s"), 59, r">= 60 - at `\$\.bake\.grace_s`"),
+        (("bake", "grace_s"), 86_401, r"<= 86400 - at `\$\.bake\.grace_s`"),
+        (("bake", "raw_retention_hours"), 23, r">= 24 - at `\$\.bake\.raw_retention_hours`"),
+        (("bake", "raw_retention_hours"), 8_761, r"<= 8760 - at `\$\.bake\.raw_retention"),
+        (("bake", "max_part_rows"), 9_999, r">= 10000 - at `\$\.bake\.max_part_rows`"),
+        (("bake", "max_part_rows"), 50_000_001, r"<= 50000000 - at `\$\.bake\.max_part_rows`"),
+        (("bake", "raw_retention"), 72, "unknown field `raw_retention`"),
         (
             ("recorder.universe", "min_volume_24h"),
             "1.005",

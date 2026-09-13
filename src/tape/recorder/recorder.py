@@ -30,6 +30,8 @@ carry, so it never outgrows the plan; only the universe loop changes the plan, o
 time; a lifecycle event is noted without awaiting, and noting it never raises into the control
 connection's supervisor; a targeted re-listing starts at least :data:`RELIST_MIN_INTERVAL_S`
 after the previous one started, and only a full refresh replaces a category group's markets;
+a near-price group is listed again for one event at most :data:`NEAR_PRICE_FOLLOW_UPS` times
+while its admitted markets are not all priced;
 every catalog leaves out the markets reported determined or settled and gives close times as
 lifecycle events last moved them; a supervisor, sink, or internal loop that fails ends
 the run with its exception after a full shutdown, never silently; a periodic task or the
@@ -98,11 +100,13 @@ from tape.recorder.supervisor import (
 )
 from tape.recorder.tap import CompositeBookTap
 from tape.recorder.universe import (
+    MARKET_ORDER_NEAR_PRICE,
     MarketSummary,
     UniverseDecision,
     UniversePolicy,
     select,
     series_of,
+    yes_mid,
 )
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.segment import Record, RecordKind, SegmentHeader, write_keyframe
@@ -120,6 +124,7 @@ __all__ = [
     "FIRST_BOOK_CONN_ID",
     "LIFECYCLE_CHANNEL",
     "MAX_GROUP_SIZE",
+    "NEAR_PRICE_FOLLOW_UPS",
     "PINNED_SPEC_VERSIONS",
     "RELIST_DEBOUNCE_S",
     "RELIST_MAX_PAGES",
@@ -208,6 +213,15 @@ RELIST_MIN_INTERVAL_S: Final = 30
 RELIST_MAX_PAGES: Final = 10
 """Page cap per series on a targeted re-listing; one series lists a few hundred open markets."""
 
+NEAR_PRICE_FOLLOW_UPS: Final = 4
+"""Most follow-up re-listings of a ``near_price`` series group for one event whose admitted
+markets are not all priced (ADR 0029).
+
+A new event is often listed before its first quotes, when near-price order can only fall back to
+volume and ticker; its quotes usually arrive within a minute or two, which four attempts at the
+minimum interval span.
+"""
+
 _SECONDS_PER_MINUTE: Final = 60
 _SECONDS_PER_HOUR: Final = 3_600
 _NO_CATEGORIES: Final[Mapping[str, str]] = MappingProxyType({})
@@ -228,6 +242,18 @@ class _PendingRelist(msgspec.Struct, frozen=True, kw_only=True):
 
     due_ns: int
     requested_ns: int
+
+
+class _FollowUp(msgspec.Struct, frozen=True, kw_only=True):
+    """Follow-up re-listings of one ``near_price`` group for one event not yet all priced.
+
+    Attributes:
+        attempts: Follow-up re-listings requested so far, at most :data:`NEAR_PRICE_FOLLOW_UPS`.
+        gave_up: Whether the attempts ran out with the event still not all priced.
+    """
+
+    attempts: int
+    gave_up: bool
 
 
 def check_connection_budget(*, book_connections: int, max_connections: int) -> None:
@@ -634,6 +660,9 @@ class Recorder:
         self._relists: dict[str, _PendingRelist] = {}
         self._relist_allowed_ns = 0
         self._series_groups = _series_groups_by_series(config.universe)
+        # Near-price events admitted before their quotes, by group and event ticker.
+        self._follow_ups: dict[tuple[str, str], _FollowUp] = {}
+        self._follow_ups_given_up = 0
         self._stop_requested = asyncio.Event()
         self._periodic_stop = asyncio.Event()
         self._finished = asyncio.Event()
@@ -1314,6 +1343,9 @@ class Recorder:
         await self._apply_universe(decision)
         self._ended.intersection_update(market.ticker for market in listing.markets)
         self._forget_relists(list(self._relists), started_ns=started_ns)
+        self._follow_up_unpriced(
+            decision, [group.name for group in self._config.universe.groups], started_ns=started_ns
+        )
         self._log.info(
             "universe refreshed",
             extra={
@@ -1440,6 +1472,7 @@ class Recorder:
         )
         await self._apply_universe(decision)
         self._forget_relists(names, started_ns=started_ns)
+        self._follow_up_unpriced(decision, names, started_ns=started_ns)
         self._log.info(
             "universe groups re-listed",
             extra={
@@ -1464,7 +1497,8 @@ class Recorder:
         plan, and the latest-ticker table drops the markets it no longer carries. The book
         connections carry every selected market, because a selection never exceeds
         ``max_l2_markets`` and the configuration guarantees room for that many. Moved close times
-        are kept only for planned markets.
+        are kept only for planned markets, and near-price follow-ups only for events still
+        admitted by their group.
 
         Args:
             decision: The universe to record from now on.
@@ -1498,6 +1532,11 @@ class Recorder:
             for ticker, close_ts in self._moved_close_ts.items()
             if ticker in self._conn_of
         }
+        admitted = _admitted_events(decision)
+        for key in [key for key in self._follow_ups if key not in admitted]:
+            follow_up = self._follow_ups.pop(key)
+            if not follow_up.gave_up:
+                self._log_follow_ups_ended(key, follow_up, outcome="left_plan")
 
     def _note_lifecycle(self, event: MarketEvent) -> None:
         """Note what a lifecycle event means for the universe, and wake its loop (ADR 0029).
@@ -1551,6 +1590,99 @@ class Recorder:
             pending = self._relists.get(name)
             if pending is not None and pending.requested_ns <= started_ns:
                 del self._relists[name]
+
+    def _follow_up_unpriced(
+        self, decision: UniverseDecision, names: Collection[str], *, started_ns: int
+    ) -> None:
+        """List a near-price series group again while an event it admitted is not all priced.
+
+        A new event is often listed before its first quotes, when near-price order can only fall
+        back to volume and ticker (ADR 0029). For each group of ``names`` that selects by series
+        with ``market_order = "near_price"``, an admitted event with an admitted market that has
+        no :func:`yes_mid` makes the group due a targeted re-listing :data:`RELIST_MIN_INTERVAL_S`
+        after this listing started, so the minimum interval still holds, at most
+        :data:`NEAR_PRICE_FOLLOW_UPS` times for that group and event. An event whose admitted
+        markets are all priced ends its follow-ups. Never awaits and never raises.
+
+        Args:
+            decision: The decision the listing produced, already applied.
+            names: The groups the listing covered; a pinned group was not listed.
+            started_ns: Monotonic time the listing started.
+        """
+        followed = {
+            group.name
+            for group in self._config.universe.groups
+            if group.name in names
+            and group.series is not None
+            and group.market_order == MARKET_ORDER_NEAR_PRICE
+        }
+        summaries = {market.ticker: market for market in decision.markets}
+        due_ns = started_ns + RELIST_MIN_INTERVAL_S * NS_PER_S
+        for key, tickers in _admitted_events(decision).items():
+            if key[0] in followed:
+                unpriced = [ticker for ticker in tickers if yes_mid(summaries[ticker]) is None]
+                self._follow_up_event(key, unpriced, due_ns=due_ns)
+
+    def _follow_up_event(self, key: tuple[str, str], unpriced: list[str], *, due_ns: int) -> None:
+        """Request, end, or give up the follow-ups of one group's event after a listing.
+
+        Args:
+            key: The group's name and the event ticker.
+            unpriced: The event's admitted markets without a YES mid, in admission order.
+            due_ns: Monotonic time from which a follow-up re-listing may run.
+        """
+        held = self._follow_ups.get(key)
+        if not unpriced:
+            if held is not None:
+                del self._follow_ups[key]
+                if not held.gave_up:
+                    self._log_follow_ups_ended(key, held, outcome="priced")
+            return
+        if held is not None and held.gave_up:
+            return
+        attempts = 0 if held is None else held.attempts
+        if attempts >= NEAR_PRICE_FOLLOW_UPS:
+            gave_up = _FollowUp(attempts=attempts, gave_up=True)
+            self._follow_ups[key] = gave_up
+            self._follow_ups_given_up += 1
+            self._log_follow_ups_ended(key, gave_up, outcome="gave_up", unpriced=unpriced)
+            return
+        self._follow_ups[key] = _FollowUp(attempts=attempts + 1, gave_up=False)
+        now_ns = int(self._clock.mono_ns())
+        self._request_relist(key[0], due_ns=due_ns, now_ns=now_ns)
+        self._log.info(
+            "near-price follow-up re-listing requested",
+            extra={
+                "group": key[0],
+                "event": key[1],
+                "attempt": attempts + 1,
+                "max_attempts": NEAR_PRICE_FOLLOW_UPS,
+                "unpriced": unpriced,
+                "due_in_s": max(0, due_ns - now_ns) / NS_PER_S,
+            },
+        )
+
+    def _log_follow_ups_ended(
+        self,
+        key: tuple[str, str],
+        follow_up: _FollowUp,
+        *,
+        outcome: str,
+        unpriced: Sequence[str] = (),
+    ) -> None:
+        """Log how an event's near-price follow-ups ended: priced, left the plan, or gave up.
+
+        A give-up also carries the markets still unpriced and the events given up on since start.
+        """
+        extra: dict[str, object] = {
+            "group": key[0],
+            "event": key[1],
+            "attempts": follow_up.attempts,
+            "outcome": outcome,
+        }
+        if follow_up.gave_up:
+            extra |= {"unpriced": list(unpriced), "given_up_total": self._follow_ups_given_up}
+        self._log.info("near-price follow-ups ended", extra=extra)
 
     def _as_last_reported(self, markets: Iterable[MarketSummary]) -> list[MarketSummary]:
         """Markets as lifecycle events last reported them.
@@ -1764,6 +1896,16 @@ def _catalog(
             if market.ticker not in ended
         )
     )
+
+
+def _admitted_events(decision: UniverseDecision) -> dict[tuple[str, str], list[str]]:
+    """Every group's admitted markets by group name and event ticker, in admission order."""
+    event_of = {market.ticker: market.event_ticker for market in decision.markets}
+    events: dict[tuple[str, str], list[str]] = {}
+    for selection in decision.groups:
+        for ticker in selection.tickers:
+            events.setdefault((selection.name, event_of[ticker]), []).append(ticker)
+    return events
 
 
 def _admitted_by_group(decision: UniverseDecision) -> dict[str, tuple[str, ...]]:

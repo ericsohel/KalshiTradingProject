@@ -53,6 +53,7 @@ from tape.recorder.recorder import (
     CLOSE_TICK_DELAY_S,
     CONTROL_CONN_ID,
     FIRST_BOOK_CONN_ID,
+    NEAR_PRICE_FOLLOW_UPS,
     RELIST_DEBOUNCE_S,
     RELIST_MIN_INTERVAL_S,
     TICKER_CONN_ID,
@@ -106,6 +107,9 @@ def market(
     *,
     status: str = "active",
     close_time: str = "2026-12-31T00:00:00Z",
+    bid: str = "0.4000",
+    ask: str = "0.6000",
+    last: str = "0.5000",
 ) -> dict[str, object]:
     return {
         "ticker": ticker,
@@ -121,13 +125,13 @@ def market(
         "settlement_timer_seconds": 60,
         "status": status,
         "notional_value_dollars": "1.0000",
-        "yes_bid_dollars": "0.4000",
-        "yes_ask_dollars": "0.6000",
+        "yes_bid_dollars": bid,
+        "yes_ask_dollars": ask,
         "no_bid_dollars": "0.4000",
         "no_ask_dollars": "0.6000",
         "yes_bid_size_fp": "1.00",
         "yes_ask_size_fp": "1.00",
-        "last_price_dollars": "0.5000",
+        "last_price_dollars": last,
         "previous_yes_bid_dollars": "0.4000",
         "previous_yes_ask_dollars": "0.6000",
         "previous_price_dollars": "0.5000",
@@ -1904,3 +1908,234 @@ async def test_stop_does_not_wait_for_a_close_or_a_relisting_in_flight(
             await until(lambda: harness.rest.listings(HOURLY) == 1)
         # Within the 30-second shutdown deadline only if the universe loop raced the stop.
         await asyncio.wait_for(harness.recorder.stop(), timeout=5.0)
+
+
+# ------------------------------------------------ near-price events listed before their quotes
+
+NEAR_PRICE_POLICY: Final = UniversePolicy(
+    min_volume_24h=CountE2(100_000),
+    max_l2_markets=4,
+    groups=(
+        UniverseGroup(
+            name="hourly",
+            series=(HOURLY,),
+            events=1,
+            markets_per_event=2,
+            market_order="near_price",
+        ),
+    ),
+)
+
+
+def strike(
+    ticker: str, *, bid: str = "0.0000", ask: str = "1.0000", last: str = "0.0000", after_s: int
+) -> dict[str, object]:
+    """A threshold strike of an hourly event; by default it has neither quotes nor a trade."""
+    moment = datetime.fromtimestamp(NOON_S + after_s, tz=UTC)
+    listed = market(
+        ticker,
+        "10.00",
+        close_time=f"{moment:%Y-%m-%dT%H:%M:%SZ}",
+        bid=bid,
+        ask=ask,
+        last=last,
+    )
+    return listed | {"strike_type": "greater"}
+
+
+UNQUOTED_13: Final = tuple(
+    strike(f"KXHOUR-26SEP1013-T{price}", after_s=3_600) for price in (67599, 68099, 77199, 77299)
+)
+"""A new hourly event: nothing quoted, so near-price order falls back to ticker order."""
+QUOTED_13: Final = (
+    strike("KXHOUR-26SEP1013-T67599", bid="0.9900", ask="1.0000", last="0.9900", after_s=3_600),
+    strike("KXHOUR-26SEP1013-T68099", after_s=3_600),
+    strike("KXHOUR-26SEP1013-T77199", bid="0.6000", ask="0.6200", after_s=3_600),
+    strike("KXHOUR-26SEP1013-T77299", bid="0.3500", ask="0.3900", after_s=3_600),
+)
+"""The same event a minute later: the strikes around the price are quoted near 50 cents."""
+
+
+def follow_up_logs(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str, int, str]]:
+    """Each follow-up request and ending: event, message, attempt number or count, and outcome."""
+    logs: list[tuple[str, str, int, str]] = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if message.startswith("near-price follow-up"):
+            fields = record.__dict__
+            count = fields["attempt"] if "attempt" in fields else fields["attempts"]
+            logs.append((str(fields["event"]), message, int(count), str(fields.get("outcome", ""))))
+    return logs
+
+
+async def relistings(harness: Harness, count: int) -> None:
+    """Wait until the hourly series has been listed alone ``count`` times."""
+    await until(lambda: harness.rest.listings(HOURLY) == count)
+
+
+async def test_an_unquoted_near_price_event_is_listed_again_until_its_strikes_near_the_price(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, markets=UNQUOTED_13, universe=NEAR_PRICE_POLICY) as harness,
+    ):
+        recorder = harness.recorder
+        harness.rest.series_answers[HOURLY] = [listing(*UNQUOTED_13)[0], listing(*QUOTED_13)[0]]
+        harness.start()
+        await harness.subscribed(2)
+        await harness.parked()
+        # Ticker order among unpriced strikes: the lowest, far from the price.
+        assert planned(recorder) == {"KXHOUR-26SEP1013-T67599", "KXHOUR-26SEP1013-T68099"}
+        assert RELIST_MIN_INTERVAL_S in harness.time.requested
+
+        harness.time.advance(RELIST_MIN_INTERVAL_S - 1)
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == 0
+        harness.time.advance(1)
+        await until(lambda: harness.rest.listings(HOURLY) == 1)
+        await harness.parked()
+        # Still unquoted: another attempt, again at the minimum interval.
+        assert harness.time.requested[-1] == RELIST_MIN_INTERVAL_S
+        harness.time.advance(RELIST_MIN_INTERVAL_S)
+        near = {"KXHOUR-26SEP1013-T77199", "KXHOUR-26SEP1013-T77299"}
+        await until(lambda: planned(recorder) == near)
+        await harness.parked()
+        assert planned(recorder) == near
+
+        # Priced: no more follow-ups, only the full refresh.
+        harness.time.advance(300 - 2 * RELIST_MIN_INTERVAL_S - 1)
+        await harness.parked()
+        assert (harness.rest.listings(), harness.rest.listings(HOURLY)) == (1, 2)
+
+    assert follow_up_logs(caplog) == [
+        ("KXHOUR-26SEP1013", "near-price follow-up re-listing requested", 1, ""),
+        ("KXHOUR-26SEP1013", "near-price follow-up re-listing requested", 2, ""),
+        ("KXHOUR-26SEP1013", "near-price follow-ups ended", 2, "priced"),
+    ]
+    (first, *_) = logged(caplog, "near-price follow-up re-listing requested")
+    assert (first.__dict__["group"], first.__dict__["max_attempts"]) == ("hourly", 4)
+    assert first.__dict__["unpriced"] == ["KXHOUR-26SEP1013-T67599", "KXHOUR-26SEP1013-T68099"]
+    assert first.__dict__["due_in_s"] == RELIST_MIN_INTERVAL_S
+
+
+async def test_near_price_follow_ups_stop_at_their_bound_and_are_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, markets=UNQUOTED_13, universe=NEAR_PRICE_POLICY) as harness,
+    ):
+        harness.rest.series_answers[HOURLY] = listing(*UNQUOTED_13)
+        harness.start()
+        await harness.subscribed(2)
+        for attempt in range(1, NEAR_PRICE_FOLLOW_UPS + 1):
+            await harness.parked()
+            harness.time.advance(RELIST_MIN_INTERVAL_S)
+            await relistings(harness, attempt)
+        await until(lambda: bool(logged(caplog, "near-price follow-ups ended")))
+        # Nothing more until the full refresh, which does not start them again.
+        await harness.parked()
+        harness.time.advance(300 - NEAR_PRICE_FOLLOW_UPS * RELIST_MIN_INTERVAL_S)
+        await until(lambda: harness.rest.listings() == 2)
+        await harness.parked()
+        harness.time.advance(2 * RELIST_MIN_INTERVAL_S)
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == NEAR_PRICE_FOLLOW_UPS
+
+    requested = [
+        attempt for _, message, attempt, _ in follow_up_logs(caplog) if "requested" in message
+    ]
+    assert requested == [1, 2, 3, 4]
+    (ended,) = logged(caplog, "near-price follow-ups ended")
+    assert ended.levelno == logging.INFO
+    assert (ended.__dict__["outcome"], ended.__dict__["attempts"]) == ("gave_up", 4)
+    assert ended.__dict__["given_up_total"] == 1
+    assert ended.__dict__["unpriced"] == ["KXHOUR-26SEP1013-T67599", "KXHOUR-26SEP1013-T68099"]
+
+
+async def test_a_volume_group_never_follows_up_an_unquoted_event(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+    by_volume = msgspec.structs.replace(
+        NEAR_PRICE_POLICY,
+        groups=(msgspec.structs.replace(NEAR_PRICE_POLICY.groups[0], market_order="volume"),),
+    )
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, markets=UNQUOTED_13, universe=by_volume) as harness,
+    ):
+        harness.start()
+        await harness.subscribed(2)
+        await harness.parked()
+        harness.time.advance(2 * RELIST_MIN_INTERVAL_S)
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == 0
+    assert follow_up_logs(caplog) == []
+
+
+async def test_an_unquoted_event_that_leaves_the_plan_ends_its_follow_ups(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+    closing_soon = tuple(
+        strike(f"KXHOUR-26SEP1012-T{price}", after_s=10) for price in (77199, 77299)
+    )
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, markets=closing_soon, universe=NEAR_PRICE_POLICY) as harness,
+    ):
+        recorder = harness.recorder
+        # The close's re-listing finds the next event already quoted.
+        harness.rest.series_answers[HOURLY] = listing(*QUOTED_13)
+        harness.start()
+        await harness.subscribed(2)
+        await harness.parked()
+        harness.time.advance(10 + CLOSE_TICK_DELAY_S)
+        await until(lambda: "KXHOUR-26SEP1013-T77199" in planned(recorder))
+        await harness.parked()
+        harness.time.advance(2 * RELIST_MIN_INTERVAL_S)
+        await harness.parked()
+        # The follow-up asked for at startup was covered by the close's re-listing.
+        assert harness.rest.listings(HOURLY) == 1
+
+    assert follow_up_logs(caplog) == [
+        ("KXHOUR-26SEP1012", "near-price follow-up re-listing requested", 1, ""),
+        ("KXHOUR-26SEP1012", "near-price follow-ups ended", 1, "left_plan"),
+    ]
+
+
+async def test_a_full_refresh_that_prices_the_event_ends_its_pending_follow_up(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+    async with (
+        FakeKalshiWs() as fake,
+        recording(
+            fake.url,
+            tmp_path,
+            markets=UNQUOTED_13,
+            universe=NEAR_PRICE_POLICY,
+            universe_refresh_s=RELIST_MIN_INTERVAL_S // 2,
+        ) as harness,
+    ):
+        recorder = harness.recorder
+        harness.rest.answers["/markets"] = [listing(*UNQUOTED_13)[0], listing(*QUOTED_13)[0]]
+        harness.start()
+        await harness.subscribed(2)
+        await harness.parked()
+        harness.time.advance(RELIST_MIN_INTERVAL_S // 2)
+        await until(lambda: "KXHOUR-26SEP1013-T77199" in planned(recorder))
+        await harness.parked()
+        harness.time.advance(RELIST_MIN_INTERVAL_S)
+        await harness.parked()
+        assert harness.rest.listings(HOURLY) == 0
+        assert harness.rest.listings() >= 2
+
+    assert follow_up_logs(caplog) == [
+        ("KXHOUR-26SEP1013", "near-price follow-up re-listing requested", 1, ""),
+        ("KXHOUR-26SEP1013", "near-price follow-ups ended", 1, "priced"),
+    ]

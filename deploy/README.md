@@ -12,3 +12,4 @@ The configuration of the production host described in ADR 0024 and
 | `systemd/tape-bake.service` | `/etc/systemd/system/tape-bake.service` |
 | `systemd/tape-bake.timer` | `/etc/systemd/system/tape-bake.timer`, enabled with `systemctl enable --now` |
 | `caddy/Caddyfile` | `/etc/caddy/Caddyfile` |
+| `needrestart/tape.conf` | `/etc/needrestart/conf.d/tape.conf`: automatic library upgrades never restart the recorder or API |

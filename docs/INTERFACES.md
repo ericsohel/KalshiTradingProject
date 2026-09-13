@@ -92,7 +92,7 @@ Ticker(ticker, ts_ms, receipt, sid, last, bid, ask, bid_size, ask_size, volume, 
 Lifecycle(ticker, receipt, sid, seq, event_type, payload_json)
 GapEvent(receipt, sid, expected_seq, got_seq)
 BookRefresh(ticker, ts_ms, receipt, stale, bids, asks)    # the recorder's image of a live book (ADR 0022)
-CatalogEntry(ticker, series_ticker, event_ticker, volume_24h: CountE2, close_ts: int | None, showcase: bool)
+CatalogEntry(ticker, series_ticker, event_ticker, volume_24h: CountE2, close_ts: int | None, showcase: bool)   # showcase: a series group admitted it (ADR 0028)
 MarketCatalog(markets: tuple[CatalogEntry, ...])          # ctl.catalog: every recorded market (ADR 0023)
 ConnectionReport(conn_id, taped, frames, gaps, reconnects, stale_books, sink_dropped)
 StatusReport(interval_s, universe_size, subscribed_markets, connections: tuple[ConnectionReport, ...])
@@ -203,7 +203,7 @@ class KalshiRest:
     async def orderbook(ticker: str, *, depth: int = 0) -> OrderbookCountFp
     async def orderbooks(tickers: Sequence[str]) -> list[MarketOrderbookFp]   # <= 100
     async def trades(*, ticker=None, min_ts=None, max_ts=None, cursor=None) -> Page[Trade]
-    async def series(*, min_updated_ts=None) -> list[Series]
+    async def series(*, category=None, min_updated_ts=None) -> list[Series]   # never asks for volumes
     async def fee_changes(*, show_historical: bool = False) -> list[SeriesFeeChange]
     async def events(*, status=None, with_nested_markets=False, cursor=None) -> Page[EventData]
     async def event(event_ticker: str) -> GetEventResponse       # {event, markets}
@@ -318,29 +318,80 @@ def read_keyframe(path: Path, *, tickers: Collection[str] | None = None) -> list
 Pure planning and detection logic, tested without a network, plus the adapters that
 drive a live connection.
 
-### 8.1 `tape.recorder.universe`
+### 8.1 `tape.recorder.universe` and `tape.recorder.listing`
 
 ```python
+class UniverseGroup(Struct): name: str; events: int; markets_per_event: int;
+                             series: tuple[str, ...] | None = None; category: str | None = None;
+                             max_markets: int | None = None;    # exactly one of series, category
+                             max_hours_to_close: int | None = None
 class UniversePolicy(Struct): min_volume_24h: CountE2; max_l2_markets: int;
-                              showcase_series: frozenset[str]; exclude_mve: bool = True;
+                              groups: tuple[UniverseGroup, ...]; exclude_mve: bool = True;
                               max_seconds_to_close: int | None = None
+    categories: frozenset[str]                                  # those of its category groups
 class MarketSummary(Struct):  ticker; series_ticker; event_ticker; exchange_index; status;
                               volume_24h: CountE2; close_ts: int | None; is_mve: bool
     @classmethod
     def from_wire(cls, market: Market, *, is_mve: bool = False) -> MarketSummary
+class GroupSelection(Struct): name: str; tickers: tuple[str, ...];   # in admission order
+                              events: int; skipped_for_budget: int
 class UniverseDecision(Struct): l2_tickers: frozenset[str]; showcase: frozenset[str];
                                 markets: tuple[MarketSummary, ...];   # of l2_tickers, ticker order
+                                groups: tuple[GroupSelection, ...];   # one per group, in order
+                                group_of: Mapping[str, str];          # admitted ticker -> group name
                                 dropped_for_cap: int; reason_counts: Mapping[str, int]
-def select(markets: Sequence[MarketSummary], policy: UniversePolicy, *, now_ts: int) -> UniverseDecision
+def select(markets: Sequence[MarketSummary], policy: UniversePolicy, *, now_ts: int,
+           categories: Mapping[str, str] = {}) -> UniverseDecision   # categories: series -> category
 ```
 
-Eligibility first (status `"active"`, multivariate legs, already closed, close horizon),
-then every showcase-series market unconditionally, then the remaining budget by
-descending 24-hour volume with ties broken by ticker. Showcase markets are never dropped
-for the cap; overflow is reported in `dropped_for_cap`. A ticker repeated in one listing
-is counted once, and the copy kept is chosen by content rather than arrival order. The
-pinned spec carries no series field on a market, so `series_ticker` is the ticker's first
+Eligibility first (status `"active"`, multivariate legs, already closed, close horizon). A
+ticker repeated in one listing is counted once, and the copy kept is chosen by content rather
+than arrival order. The groups then apply in order (ADR 0028), each to the eligible markets that
+no earlier group chose:
+
+- A **series group** takes its series in the order listed and, of each, the `events` events
+  whose earliest market close is nearest; an event with no known close ranks last.
+- A **category group** takes the `events` events of its category with the highest 24-hour
+  volume summed over the event, among those at or above `min_volume_24h`. A series missing from
+  `categories` matches no category group.
+- A group with **`max_hours_to_close`** first sets aside every event whose earliest close, among
+  the markets the group can see, is unknown or more than that many hours after `now_ts`; the
+  bound is inclusive. A series group then takes the nearest events left, and a category group
+  ranks only those.
+
+From each chosen event a group takes at most `markets_per_event` markets by descending volume,
+then keeps its first `max_markets`. Ties break by close time, then ticker. Chosen markets are
+admitted in that order until `max_l2_markets` is reached; the rest, and everything later groups
+choose, are skipped for budget, so the decision never exceeds the budget. `showcase` is the
+markets admitted by series groups. Every market handed in is admitted or counted once in
+`reason_counts`: `duplicate`, `not_active`, `mve`, `closed`, `beyond_horizon`, `no_group`,
+`event_beyond_horizon`, `below_volume`, `event_not_chosen`, `over_markets_per_event`, `over_max_markets`, or `over_cap`
+(skipped for budget); a market several groups pass over is counted under the first one's reason.
+The pinned spec carries no series field on a market, so `series_ticker` is the ticker's first
 dash-separated segment.
+
+```python
+MARKET_PAGE_LIMIT = 1000; DEFAULT_MAX_MARKET_PAGES = 500; CATEGORY_REFRESH_S = 3600
+class MarketListing(Struct): markets: tuple[MarketSummary, ...]; truncated: bool;
+                             unreadable: int; first_error: str
+async def list_open_markets(rest: KalshiRest, *, exclude_mve: bool, max_pages: int) -> MarketListing
+class SeriesCategories:
+    def __init__(self, rest: KalshiRest, *, categories: Iterable[str], clock: Clock,
+                 refresh_s: int = CATEGORY_REFRESH_S, logger: Logger | None = None)
+    categories: tuple[str, ...]; known: bool
+    async def current(self) -> Mapping[str, str]                # series ticker -> category
+def series_per_category(by_series: Mapping[str, str], categories: Iterable[str]) -> dict[str, int]
+```
+
+`tape.recorder.listing` is the REST side of the universe, shared by `tape record` and
+`tape universe preview`. `list_open_markets` pages `GET /markets?status=open&limit=1000`, with
+`mve_filter=exclude` when multivariate legs are excluded, up to the page cap, and skips and counts
+markets that do not convert. `SeriesCategories` sends one `GET /series?category=<category>` per
+configured category, asks for nothing optional such as volumes, and keeps each series under the
+category the series reports. After a success it fetches again only `refresh_s` later on the
+monotonic clock. A failed or undecodable request leaves the last known map whole, is logged, and
+is retried at the next call; until a fetch succeeds the map is empty, so category groups admit
+nothing.
 
 ### 8.2 `tape.recorder.planner`
 
@@ -564,7 +615,9 @@ gap's length.
 
 Startup reads `GET /exchange/status` and resizes the rate limiter from
 `GET /account/limits`. Every `universe_refresh_s` the recorder pages the open,
-non-multivariate markets (logging when a listing is cut short by the page cap), selects the universe, replans with the previous plan, and gives each book connection its
+non-multivariate markets (logging when a listing is cut short by the page cap), reads the series
+categories when a category group exists (warning at every refresh while they are unknown, and at every refresh when there are no groups), selects
+the universe, replans with the previous plan, and gives each book connection its
 group through `set_group`, and the ticker connection a group of every planned market. The
 latest-ticker table then drops markets outside that group; an update for any other market is
 published but not kept, so `RecorderStatus.live_tickers` never exceeds the plan.
@@ -1089,10 +1142,17 @@ raw_retention_hours = 72         # 24 to 8760 hours after an hour ends before ta
 max_part_rows = 500000           # 10000 to 50000000 rows a bake sorts in memory at once
 
 [recorder.universe]
-min_volume_24h = "1000.00"      # fixed-point string, never a float
-max_l2_markets = 2000
-showcase_series = ["KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDECISION"]
+min_volume_24h = "1000.00"      # fixed-point string, never a float; floor on a category group's event volume
+max_l2_markets = 2000           # groups apply in order until this many markets are admitted
 exclude_mve = true
+
+[[recorder.universe.groups]]    # one table per group, applied in order (ADR 0028)
+name = "crypto 15-minute"       # unique; names the group in the log and the preview
+series = ["KXBTC15M", "KXETH15M"]   # or category = "Sports"; exactly one of the two
+events = 1                      # per series for series; across the group for category
+markets_per_event = 1           # highest 24-hour volume first
+max_markets = 10                # optional cap on the whole group
+max_hours_to_close = 48         # optional; only events whose earliest close is within 48 hours
 ```
 
 ```python
@@ -1109,8 +1169,16 @@ Rules:
   production by a typo in a URL. Demo and production credentials are separate.
 - **Environment overrides** are `TAPE_<SECTION>__<KEY>`, nesting with double
   underscores, for example `TAPE_RECORDER__UNIVERSE__MAX_L2_MARKETS=500`. A list takes
-  comma-separated items. `environ` is injected; the process environment is never read
-  globally.
+  comma-separated items; a list of tables, `recorder.universe.groups`, can be set only in the
+  file. `environ` is injected; the process environment is never read globally.
+- **Universe groups** (ADR 0028): `[[recorder.universe.groups]]` tables apply in order. Each has a
+  unique `name` and exactly one of `series`, a non-empty list of distinct series tickers, and
+  `category`, a Kalshi series category; `events` and `markets_per_event` are positive, and
+  `max_markets` and `max_hours_to_close`, when set, are positive. A group with both selectors or
+  neither is refused with its name and position. Without groups nothing is recorded, so
+  `tape record` warns at every universe refresh, `tape config check` warns on standard error, and
+  `tape universe preview` says so in its output. `showcase_series` is gone and is refused
+  as an unknown field; `tape universe preview` shows what the groups choose now.
 - **Paths**: a leading `~` expands from the injected `HOME`; relative paths resolve
   against the directory holding the configuration file, not the working directory.
 - **Validation**: positive intervals, ping interval and pong timeout each between 1 and

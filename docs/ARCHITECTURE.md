@@ -95,11 +95,14 @@ current hour, keyframes, or anything the recorder is writing.
 
 ## 5. Data flow
 
-1. **Universe.** The recorder paginates `GET /markets?status=open&limit=1000` and
-   `GET /series` at start and every five minutes, and subscribes to
-   `market_lifecycle_v2` (no ticker filter) for immediate created/activated/settled
-   notifications. The L2 universe is every active market above a configurable 24-hour
-   volume floor plus an always-on showcase list, capped by count. The `ticker` channel
+1. **Universe.** The recorder paginates `GET /markets?status=open&limit=1000` at start and
+   every five minutes, reads `GET /series?category=...` at most hourly when a group selects by
+   category, and subscribes to `market_lifecycle_v2` (no ticker filter) for immediate
+   created/activated/settled notifications. The L2 universe is chosen by ordered rule groups
+   (ADR 0028), re-applied at every refresh: each admits the nearest events of named series, or
+   the busiest events of a series category, a few markets per event, until the
+   `max_l2_markets` budget is reached. `tape universe preview` shows the current choice
+   without recording. The `ticker` channel
    covers the recorded markets on a live-only connection whose frames are held in memory
    and published but never taped (ADR 0018); its subscription follows every replan
    (ADR 0027).

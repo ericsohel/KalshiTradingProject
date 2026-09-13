@@ -73,7 +73,7 @@ the query string. Public market-data endpoints answer without headers.
 | `GET /markets/{ticker}/orderbook` | single audit | `depth=0` | `orderbook_fp.yes_dollars[]`, `orderbook_fp.no_dollars[]` as `[price, count_fp]` |
 | `GET /markets/orderbooks` | batch audit | `tickers` (up to 100) | `orderbooks[]{ticker, orderbook_fp}` |
 | `GET /markets/trades` | trade reconciliation | `ticker`, `min_ts`, `max_ts`, `limit=1000`, `cursor` | `trade_id`, `ticker`, `count_fp`, `yes_price_dollars`, `taker_book_side`, `created_time`, `is_block_trade` |
-| `GET /series` | fee regime, category | `include_volume`, `min_updated_ts` | `ticker`, `category`, `fee_type`, `fee_multiplier`, `settlement_sources[]`, `exchange_index` |
+| `GET /series` | fee regime, category, universe category groups (hourly) | `category`, `min_updated_ts`; never `include_volume` | `ticker`, `category`, `fee_type`, `fee_multiplier`, `settlement_sources[]`, `exchange_index` |
 | `GET /series/fee_changes` | scheduled fee changes | `show_historical=true` | `series_fee_change_arr[]{series_ticker, fee_type, fee_multiplier, scheduled_ts}` |
 | `GET /events` | event grouping | `status=open`, `with_nested_markets`, `limit=200`, `cursor` | `event_ticker`, `series_ticker`, `mutually_exclusive`, `fee_type_override`, `fee_multiplier_override` |
 | `GET /markets/candlesticks` | context before the tape starts | `market_tickers` (100), `start_ts`, `end_ts`, `period_interval` in {1,60,1440} | `end_period_ts`, `yes_bid{open,high,low,close}_dollars`, `yes_ask{...}`, `price{...}`, `volume_fp`, `open_interest_fp` |
@@ -507,8 +507,9 @@ between frames, so it equals the book after every message with a lower `bus_seq`
 
 `MarketCatalog` opens every refresh cycle: `markets`, one map per recorded market of the latest
 universe decision, in ticker order, `{ticker, series_ticker, event_ticker, volume_24h, close_ts,
-showcase}`, where `volume_24h` is a `count_e2` from the recorder's latest listing and `close_ts`
-is Unix seconds or null. Each catalog replaces the previous one. None is sent before the first
+showcase}`, where `volume_24h` is a `count_e2` from the recorder's latest listing, `close_ts`
+is Unix seconds or null, and `showcase` is true for a market a series group admitted (ADR 0028).
+Each catalog replaces the previous one. None is sent before the first
 decision (ADR 0023).
 
 `StatusReport` follows every status log line: `interval_s`, the seconds between reports;

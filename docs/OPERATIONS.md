@@ -155,6 +155,54 @@ port 8787: `npm --prefix web run mock` (add `-- --chaos` for random resyncs, sta
 closes), then `TAPE_API=http://127.0.0.1:8787 npm --prefix web run dev`; any local origin is
 accepted. `web/dev/mock-server.ts` lists the disruptions it can trigger on request.
 
+### 4.4 Choosing the recorded universe
+
+`[[recorder.universe.groups]]` decides which markets are recorded (ADR 0028). Changing the groups
+takes a recorder restart, which the tape records as a gap, so check first what they would choose
+now:
+
+```
+uv run tape universe preview --config tape.toml
+```
+
+The preview lists the open markets and, when a group selects by category, that category's series,
+from Kalshi's public endpoints without credentials. It opens no WebSocket and writes nothing.
+Holding no credentials, it cannot read its rate tier and paces itself at 2 requests a second, below
+Kalshi's unsigned allowance, so a listing of about 120 pages takes a minute. For
+each group it prints the chosen events and their markets with series, 24-hour volume, and close
+time, and what the group admitted, in how many events, and how many markets it chose that did not
+fit the budget; then the total against `max_l2_markets` and why every other listed market is not
+recorded. It also counts the series in each category, where zero usually means a misspelled
+category, and names series of series groups with no open market, such as a monthly series between
+releases.
+
+- **A group takes too much:** lower its `events` or `markets_per_event`, or set `max_markets`. On
+  a host short of CPU, a category group's `events` is the first dial.
+- **Season futures in a category group:** summed volume favours long-lived events with many
+  markets. Set `max_hours_to_close` so the group ranks only events whose earliest close is within
+  that many hours; the production sports group uses 48 (ADR 0028).
+- **Both books of a binary event:** raise `markets_per_event` for that group.
+- **Priority:** groups later in the list lose first when the budget runs out, and `skipped for
+  budget` shows by how much. A market is admitted by the first group that chooses it and does not
+  count against later groups.
+- **Volume floor:** series groups ignore `min_volume_24h`; a category group chooses only events whose
+  24-hour volume, summed over their markets, reaches it.
+
+Markets admitted by series groups carry the showcase flag in the catalog. A configuration without
+groups records nothing: every refresh warns `no universe groups are configured; no market will be
+recorded`, `tape config check` prints a warning on standard error, and the preview says so.
+
+Every universe refresh logs `universe refreshed` with `listed`, `truncated`, `selected` (never more
+than `max_l2_markets`), `showcase`, `dropped_for_cap`, `reason_counts`, `groups`, which gives per
+group `admitted`, `events`, and `skipped_for_budget`, and `book_groups`, the book connections in use.
+`reason_counts` accounts for every listed market: `duplicate`, `not_active`, `mve`, `closed`, and
+`beyond_horizon` before any group, then `no_group`, `event_beyond_horizon`, `below_volume`, `event_not_chosen`,
+`over_markets_per_event`, `over_max_markets`, and `over_cap`, which is skipped for budget. With a
+category group, series categories are fetched at the first refresh and then at most hourly:
+`series categories fetched` gives the series per category, a failure logs `series categories not
+fetched; keeping the last known` and is retried at the next refresh, and until the first success
+every refresh warns `series categories unknown; category groups admit nothing`.
+
 ## 5. Storage and retention
 
 Measured in production and revisited monthly. With the `ticker` channel live-only

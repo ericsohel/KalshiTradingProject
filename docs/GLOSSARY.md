@@ -19,6 +19,8 @@
 | **Bus** | The ZeroMQ PUB/SUB channel on which the recorder publishes live events to `tape serve` and the engine. Lossy per subscriber by design. |
 | **`bus_epoch` / `bus_seq`** | The publisher's start time, and the number of each message it attempts from 1. A new epoch or a skipped number means a subscriber lost messages. |
 | **Market catalog** | The recorder's list of the markets it records, with series, event, 24-hour volume, close time, and showcase flag, republished on `ctl.catalog` every `bus_refresh_s`. |
+| **Universe group** | One ordered rule of the recorded universe (ADR 0028): named series or a series category, how many events to take, how many markets per event, and optionally how soon an event must close (`max_hours_to_close`). Groups apply in order at every universe refresh until `max_l2_markets` is reached. |
+| **Showcase market** | A recorded market admitted by a series group; the catalog flags it. |
 | **Status report** | The recorder's health counters, published on `ctl.status` every `status_interval_s`; `tape serve` shows the latest in `/api/v1/status`. |
 | **Refresh image** | A `BookRefresh`: the recorder's own copy of one book, republished every `bus_refresh_s` so a bus consumer can recover that book after loss. |
 | **Segment** | One raw tape file: every frame received on one connection during one hour (or until rotation). |

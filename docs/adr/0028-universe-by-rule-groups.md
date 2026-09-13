@@ -46,7 +46,10 @@ counted again. A group selects markets by one of:
   over their markets, above `min_volume_24h`.
 
 Within each chosen event, at most `markets_per_event` markets are admitted, highest 24-hour
-volume first. A group may also cap its total with `max_markets`. Markets admitted by series
+volume first. A group may also cap its total with `max_markets`, and may set
+`max_hours_to_close`: an event is then eligible for that group only if the earliest close among
+its markets is within that many hours, checked before events are chosen, so a category group
+ranks games closing soon rather than long-lived futures. Markets admitted by series
 groups carry the showcase flag in the catalog. Multivariate legs, closed markets, and the
 close horizon are still excluded before any group applies. Series categories come from
 Kalshi's series listing, fetched no more often than hourly and cached, and only when a
@@ -54,15 +57,15 @@ category group needs them. `showcase_series` is removed.
 
 The production host's groups, in order:
 
-| Group | Selector | Events | Markets per event |
-|---|---|---|---|
-| crypto 15-minute | `KXBTC15M`, `KXETH15M` | 1 each | 1 |
-| Bitcoin hourly | `KXBTCD` | 1 | 6 |
-| stock indexes hourly | `KXINXU`, `KXNASDAQ100U` | 1 each | 6 |
-| economy | `KXFEDDECISION`, `KXCPIYOY`, `KXPAYROLLS`, `KXAAAGASW` | 1 each | 6 |
-| weather | `KXHIGHNY`, `KXHIGHLAX`, `KXHIGHCHI`, `KXHIGHMIA` | 1 each | 6 |
-| politics | category `Politics` | 5 | 1 |
-| sports | category `Sports` | 10 | 1 |
+| Group | Selector | Events | Markets per event | Closes within |
+|---|---|---|---|---|
+| crypto 15-minute | `KXBTC15M`, `KXETH15M` | 1 each | 1 | any |
+| Bitcoin hourly | `KXBTCD` | 1 | 6 | any |
+| stock indexes hourly | `KXINXU`, `KXNASDAQ100U` | 1 each | 6 | any |
+| economy | `KXFEDDECISION`, `KXCPIYOY`, `KXPAYROLLS`, `KXAAAGASW` | 1 each | 6 | any |
+| weather | `KXHIGHNY`, `KXHIGHLAX`, `KXHIGHCHI`, `KXHIGHMIA` | 1 each | 6 | any |
+| politics | category `Politics` | 5 | 1 | any |
+| sports | category `Sports` | 10 | 1 | 48 hours |
 
 ## Consequences
 
@@ -76,7 +79,8 @@ The production host's groups, in order:
 - **Categories.** Selection depends on Kalshi's categories, and category groups cost the
   recorder one cached listing request an hour.
 - **Configuration.** It is longer, but every recorded market is explained by the group
-  that admitted it, which the universe log and manifest report.
+  that admitted it, which the universe log and `tape universe preview` report. The decision
+  is not written to the tape, so the daily manifest cannot report it.
 
 ## What would reverse it
 

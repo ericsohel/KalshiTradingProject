@@ -41,11 +41,10 @@ from tape.recorder.recorder import (
     check_connection_budget,
     check_keyframe_interval,
 )
-from tape.recorder.universe import UniversePolicy
+from tape.recorder.universe import UniverseGroup, UniversePolicy
 from tape.recorder.writer import DEFAULT_MAX_QUEUED_RECORDS
 
 __all__ = [
-    "DEFAULT_SHOWCASE_SERIES",
     "ENDPOINTS",
     "ENV_PREFIX",
     "ENV_SEPARATOR",
@@ -57,6 +56,7 @@ __all__ = [
     "ServeSettings",
     "Settings",
     "SigningCredentials",
+    "UniverseGroupSettings",
     "UniverseSettings",
     "load_settings",
     "redacted",
@@ -71,9 +71,6 @@ ENV_PREFIX: Final = "TAPE_"
 
 ENV_SEPARATOR: Final = "__"
 """Separates the section and key names of an environment override."""
-
-DEFAULT_SHOWCASE_SERIES: Final = ("KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDECISION")
-"""Series captured in full whatever their volume."""
 
 _PRIVATE_KEY_FORBIDDEN_BITS: Final = stat.S_IRWXG | stat.S_IRWXO
 """A private key readable, writable, or executable by anyone but its owner is refused."""
@@ -169,6 +166,8 @@ _HOME: Final = "~"
 PositiveInt = Annotated[int, msgspec.Meta(gt=0)]
 NonNegativeInt = Annotated[int, msgspec.Meta(ge=0)]
 Word = Annotated[str, msgspec.Meta(pattern=r"^\S+$")]
+Label = Annotated[str, msgspec.Meta(pattern=r"^\S(.*\S)?$")]
+"""Text that may hold spaces, such as ``Climate and Weather``, but not start or end with one."""
 KeepaliveSeconds = Annotated[int, msgspec.Meta(ge=1, le=_MAX_KEEPALIVE_S)]
 AuditAllowanceMs = Annotated[int, msgspec.Meta(ge=1, le=_MAX_AUDIT_ALLOWANCE_MS)]
 AuditTapEvents = Annotated[int, msgspec.Meta(ge=1, le=_MAX_AUDIT_TAP_EVENTS)]
@@ -244,24 +243,79 @@ class KalshiSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_f
         return ENDPOINTS[self.env]
 
 
-class UniverseSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
-    """``[recorder.universe]``: which markets earn full order-book capture.
+class UniverseGroupSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """``[[recorder.universe.groups]]``: one rule of the recorded universe (ADR 0028).
 
     Attributes:
-        min_volume_24h: 24-hour volume floor as a fixed-point count string, for example
-            ``"1000.00"``. A string, never a TOML float, so the value is exact.
-        max_l2_markets: Budget of order-book subscriptions; showcase markets may exceed it.
-        showcase_series: Series captured whatever their volume.
-        exclude_mve: Leave legs of multivariate event collections out.
+        name: Names the group in the universe log and ``tape universe preview``; unique.
+        series: Series tickers the group selects from, in the order their events are admitted.
+            Set exactly one of ``series`` and ``category``.
+        category: Kalshi series category the group selects from, for example ``"Sports"``.
+        events: Events admitted: per series, the nearest, for a series group; across the group,
+            the busiest by 24-hour volume summed over the event, for a category group.
+        markets_per_event: Most markets admitted from one event, highest 24-hour volume first.
+        max_markets: Most markets the group admits in all; unset, only the other caps apply.
+        max_hours_to_close: Only events whose earliest close is within this many hours, inclusive,
+            are eligible for the group; unset, events of any horizon are.
 
     Raises:
-        ValueError: If ``min_volume_24h`` is not an exact, non-negative fixed-point count.
+        ValueError: If the group sets both selectors or neither, or lists a series twice; the
+            message names the group.
+    """
+
+    name: Label
+    series: Annotated[tuple[Word, ...], msgspec.Meta(min_length=1)] | None = None
+    category: Label | None = None
+    events: PositiveInt
+    markets_per_event: PositiveInt
+    max_markets: PositiveInt | None = None
+    max_hours_to_close: PositiveInt | None = None
+
+    def __post_init__(self) -> None:
+        self.group()
+
+    def group(self) -> UniverseGroup:
+        """Convert this table into the selector's group.
+
+        Returns:
+            The group ``tape.recorder.universe.select`` applies.
+
+        Raises:
+            ValueError: If the group sets both selectors or neither, or lists a series twice.
+        """
+        return UniverseGroup(
+            name=self.name,
+            events=self.events,
+            markets_per_event=self.markets_per_event,
+            series=self.series,
+            category=self.category,
+            max_markets=self.max_markets,
+            max_hours_to_close=self.max_hours_to_close,
+        )
+
+
+class UniverseSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """``[recorder.universe]``: which markets earn full order-book capture (ADR 0028).
+
+    Attributes:
+        min_volume_24h: Floor on an event's 24-hour volume, summed over its markets, for a
+            category group to choose it; a fixed-point count string, for example
+            ``"1000.00"``. A string, never a TOML float, so the value is exact.
+        max_l2_markets: Budget of order-book subscriptions; groups apply in order until it is
+            reached.
+        exclude_mve: Leave legs of multivariate event collections out.
+        groups: The ``[[recorder.universe.groups]]`` tables, in the order they apply. With
+            none, nothing is recorded.
+
+    Raises:
+        ValueError: If ``min_volume_24h`` is not an exact, non-negative fixed-point count, or
+            two groups share a name.
     """
 
     min_volume_24h: str = "1000.00"
     max_l2_markets: NonNegativeInt = 2000
-    showcase_series: tuple[Word, ...] = DEFAULT_SHOWCASE_SERIES
     exclude_mve: bool = True
+    groups: tuple[UniverseGroupSettings, ...] = ()
 
     def __post_init__(self) -> None:
         self.policy()
@@ -273,7 +327,8 @@ class UniverseSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
             The policy ``tape.recorder.universe.select`` applies.
 
         Raises:
-            ValueError: If ``min_volume_24h`` is not an exact, non-negative count.
+            ValueError: If ``min_volume_24h`` is not an exact, non-negative count, or two groups
+                share a name.
         """
         try:
             floor = parse_count(self.min_volume_24h)
@@ -284,7 +339,7 @@ class UniverseSettings(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown
         return UniversePolicy(
             min_volume_24h=floor,
             max_l2_markets=self.max_l2_markets,
-            showcase_series=frozenset(self.showcase_series),
+            groups=tuple(group.group() for group in self.groups),
             exclude_mve=self.exclude_mve,
         )
 
@@ -587,11 +642,14 @@ def _setting_type(
     """Find the type of the setting an override names.
 
     Raises:
-        ConfigError: If the keys name no setting, or name a whole section.
+        ConfigError: If the keys name no setting, a whole section, or a list of tables such as
+            ``recorder.universe.groups``, which only the file can express.
     """
     node = schema
     for depth, key in enumerate(keys):
         dotted = ".".join(keys[: depth + 1])
+        if _is_table_list(node):
+            raise ConfigError(_table_list_message(variable, keys[:depth]))
         if not isinstance(node, msgspec.inspect.StructType):
             raise ConfigError(f"{variable}: {'.'.join(keys[:depth])} is a setting, not a section")
         field = next((f for f in node.fields if f.encode_name == key), None)
@@ -600,7 +658,23 @@ def _setting_type(
         node = field.type
     if isinstance(node, msgspec.inspect.StructType):
         raise ConfigError(f"{variable}: {'.'.join(keys)} is a section, not a setting")
+    if _is_table_list(node):
+        raise ConfigError(_table_list_message(variable, keys))
     return node
+
+
+def _is_table_list(node: msgspec.inspect.Type) -> bool:
+    """Whether a setting is a list of tables, such as ``recorder.universe.groups``."""
+    return isinstance(node, msgspec.inspect.VarTupleType) and isinstance(
+        node.item_type, msgspec.inspect.StructType
+    )
+
+
+def _table_list_message(variable: str, keys: Sequence[str]) -> str:
+    return (
+        f"{variable}: {'.'.join(keys)} is a list of tables, which only the configuration file "
+        "can set"
+    )
 
 
 def _coerce(text: str, target: msgspec.inspect.Type, variable: str) -> object:

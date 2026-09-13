@@ -66,14 +66,22 @@ from tape.book import Book
 from tape.bus.ports import Subscriber
 from tape.bus.sockets import ZmqPublisher, ZmqSubscriber
 from tape.client.auth import RsaPssSigner
-from tape.client.ratelimit import BucketRateLimiter
+from tape.client.ratelimit import DEFAULT_TOKEN_COST, BucketLimits, BucketRateLimiter
 from tape.client.rest import KalshiRest, build_client
 from tape.client.ws import WsSession
 from tape.config import Settings, load_settings, redacted, signing_credentials
-from tape.errors import ArchiveError, ConfigError, TapeCorruptionError
+from tape.errors import ArchiveError, ConfigError, KalshiError, TapeCorruptionError, WireError
+from tape.fixedpoint import format_count
 from tape.recorder.auditor import Auditor
+from tape.recorder.listing import (
+    DEFAULT_MAX_MARKET_PAGES,
+    SeriesCategories,
+    list_open_markets,
+    series_per_category,
+)
 from tape.recorder.recorder import Recorder, RecorderConfig
 from tape.recorder.tap import BookTap
+from tape.recorder.universe import UniverseDecision, UniverseGroup, UniversePolicy, select
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.timeutil import NS_PER_MS, NS_PER_S, Clock, SystemClock
 
@@ -90,6 +98,7 @@ __all__ = [
     "PruneSummary",
     "PrunedHour",
     "TextLogFormatter",
+    "UniversePreview",
     "bake_archive",
     "build_api",
     "build_recorder",
@@ -97,8 +106,10 @@ __all__ = [
     "configure_logging",
     "listen_socket",
     "main",
+    "preview_universe",
     "prune_archive",
     "recorder_config",
+    "render_universe_preview",
     "serve_api",
     "serve_config",
 ]
@@ -130,6 +141,17 @@ _LISTEN_BACKLOG: Final = 128
 
 _CHRONY_TIMEOUT_S: Final = 5
 """Deadline for ``chronyc`` to report the clock offset recorded in a manifest."""
+
+_PREVIEW_REQUESTS_PER_S: Final = 2
+"""Pace of ``tape universe preview``, with one second of burst. It holds no credentials, so it
+cannot read its tier from ``GET /account/limits``. On 2026-09-13 unsigned listing pages were refused
+with 429 after 19 pages at the Basic tier's 20 a second and after 39 at 5 a second, which puts the
+public allowance near 3 a second; ``serve`` paces its unsigned requests at 2 by default too."""
+
+_NO_UNIVERSE_GROUPS: Final = (
+    "recorder.universe has no groups, so tape record would record no market; add "
+    "[[recorder.universe.groups]] tables (ADR 0028)"
+)
 
 _log = logging.getLogger(__name__)
 
@@ -199,6 +221,14 @@ def _parser() -> argparse.ArgumentParser:
         "--apply", action="store_true", help="delete the raw segments of every prunable hour"
     )
     prune.set_defaults(command=_prune)
+    universe = commands.add_parser("universe", help="inspect the recorded universe")
+    universe_commands = universe.add_subparsers(title="universe commands", required=True)
+    preview = universe_commands.add_parser(
+        "preview",
+        parents=[common],
+        help="show what the universe groups choose now, from public data only (ADR 0028)",
+    )
+    preview.set_defaults(command=_universe_preview)
     return parser
 
 
@@ -223,6 +253,8 @@ def _config_check(args: argparse.Namespace) -> int:
         return _EXIT_FAILURE
     shown = msgspec.json.format(msgspec.json.encode(redacted(settings)), indent=2)
     sys.stdout.write(f"{shown.decode()}\n")
+    if args.target == "record" and not settings.recorder.universe.groups:
+        sys.stderr.write(f"tape: warning: {_NO_UNIVERSE_GROUPS}\n")
     return _EXIT_OK
 
 
@@ -301,6 +333,209 @@ def _prune(args: argparse.Namespace) -> int:
         return _EXIT_FAILURE
     sys.stdout.write(f"{msgspec.json.format(msgspec.json.encode(summary), indent=2).decode()}\n")
     return _EXIT_OK
+
+
+def _universe_preview(args: argparse.Namespace) -> int:
+    configure_logging(log_format=args.log_format, level=args.log_level)
+    settings = _load(args.config)
+    if settings is None:
+        return _EXIT_FAILURE
+    try:
+        preview = asyncio.run(_run_universe_preview(settings))
+    except (KalshiError, WireError) as exc:
+        _log.error("universe preview failed", extra={"error": repr(exc)})
+        return _EXIT_FAILURE
+    sys.stdout.write(render_universe_preview(preview))
+    return _EXIT_OK
+
+
+async def _run_universe_preview(settings: Settings) -> UniversePreview:
+    """Preview the universe on real I/O.
+
+    Raises:
+        KalshiError: If a listing page cannot be fetched.
+        WireError: If a listing page does not decode.
+    """
+    timeout_s = settings.kalshi.rest_timeout_s
+    async with build_client(settings.kalshi.endpoints.rest_url, timeout_s=timeout_s) as http:
+        return await preview_universe(settings, http=http, clock=SystemClock())
+
+
+class UniversePreview(msgspec.Struct, frozen=True, kw_only=True):
+    """What ``tape universe preview`` found: what the groups choose now, and from what.
+
+    Attributes:
+        as_of_ts: Unix seconds the decision was made at.
+        listed: Open markets listed.
+        truncated: Whether the page cap cut the listing short.
+        unreadable: Markets skipped because they did not convert.
+        listing_ms: How long the listing took, rate limiting included.
+        categories_known: Whether the series categories were fetched; ``None`` when no group
+            selects by category, so none were requested.
+        series_by_category: Series known in each category a group selects from.
+        series_without_markets: Series named by a series group that have no open market, in
+            group order.
+        policy: The universe policy applied.
+        decision: What the recorder would subscribe to.
+    """
+
+    as_of_ts: int
+    listed: int
+    truncated: bool
+    unreadable: int
+    listing_ms: int
+    categories_known: bool | None
+    series_by_category: Mapping[str, int]
+    series_without_markets: tuple[str, ...]
+    policy: UniversePolicy
+    decision: UniverseDecision
+
+
+async def preview_universe(
+    settings: Settings, *, http: httpx.AsyncClient, clock: Clock
+) -> UniversePreview:
+    """List the open markets and apply the configured groups, as a universe refresh would.
+
+    Only public endpoints are called, unsigned and at :data:`_PREVIEW_REQUESTS_PER_S`, so no
+    credentials are needed; the series categories are fetched only when a group selects by
+    category. Nothing is subscribed, written, or published.
+
+    Args:
+        settings: Loaded settings; ``recorder.universe`` is applied.
+        http: REST transport for ``settings.kalshi.endpoints.rest_url``; the caller owns and
+            closes it.
+        clock: Time for the decision, the rate limiter, and the listing's duration.
+
+    Returns:
+        The decision and what it was made from.
+
+    Raises:
+        KalshiError: If a listing page cannot be fetched.
+        WireError: If a listing page does not decode.
+    """
+    policy = settings.recorder.universe.policy()
+    tokens_per_s = _PREVIEW_REQUESTS_PER_S * DEFAULT_TOKEN_COST
+    limits = BucketLimits(refill_per_s=tokens_per_s, capacity=tokens_per_s)
+    limiter = BucketRateLimiter(clock, read=limits, write=limits)
+    rest = KalshiRest(settings.kalshi.endpoints.rest_url, http, limiter, clock)
+    started_ns = int(clock.mono_ns())
+    listing = await list_open_markets(
+        rest, exclude_mve=policy.exclude_mve, max_pages=DEFAULT_MAX_MARKET_PAGES
+    )
+    listing_ms = (int(clock.mono_ns()) - started_ns) // NS_PER_MS
+    categories: Mapping[str, str] = {}
+    categories_known: bool | None = None
+    if policy.categories:
+        series_categories = SeriesCategories(rest, categories=policy.categories, clock=clock)
+        categories = await series_categories.current()
+        categories_known = series_categories.known
+    now_ts = int(clock.wall_ns()) // NS_PER_S
+    listed_series = {market.series_ticker for market in listing.markets}
+    return UniversePreview(
+        as_of_ts=now_ts,
+        listed=len(listing.markets),
+        truncated=listing.truncated,
+        unreadable=listing.unreadable,
+        listing_ms=listing_ms,
+        categories_known=categories_known,
+        series_by_category=series_per_category(categories, sorted(policy.categories)),
+        series_without_markets=tuple(
+            series
+            for group in policy.groups
+            if group.series is not None
+            for series in group.series
+            if series not in listed_series
+        ),
+        policy=policy,
+        decision=select(listing.markets, policy, now_ts=now_ts, categories=categories),
+    )
+
+
+def render_universe_preview(preview: UniversePreview) -> str:
+    """Render a preview for a person: each group's events and markets, then the totals.
+
+    Args:
+        preview: What :func:`preview_universe` returned.
+
+    Returns:
+        The text, ending in a newline.
+    """
+    decision = preview.decision
+    policy = preview.policy
+    listing = f"{preview.listed} open markets listed in {preview.listing_ms} ms"
+    if preview.truncated:
+        listing += ", cut short by the page cap"
+    if preview.unreadable:
+        listing += f", {preview.unreadable} unreadable"
+    lines = [f"Universe at {_utc(preview.as_of_ts)}: {listing}"]
+    if not policy.groups:
+        lines.append(f"Warning: {_NO_UNIVERSE_GROUPS}")
+    if preview.categories_known is True:
+        known = ", ".join(f"{name} {count}" for name, count in preview.series_by_category.items())
+        lines.append(f"Series per category: {known}")
+    elif preview.categories_known is False:
+        lines.append("Series categories unknown: category groups admit nothing")
+    if preview.series_without_markets:
+        lines.append(f"Series with no open market: {', '.join(preview.series_without_markets)}")
+    lines.append("Markets: ticker, series, 24-hour volume, close time (UTC)")
+    summaries = {market.ticker: market for market in decision.markets}
+    ticker_width = max((len(ticker) for ticker in summaries), default=0)
+    series_width = max((len(market.series_ticker) for market in summaries.values()), default=0)
+    volume_width = max(
+        (len(format_count(market.volume_24h)) for market in summaries.values()), default=0
+    )
+    for index, (group, selection) in enumerate(
+        zip(policy.groups, decision.groups, strict=True), start=1
+    ):
+        lines.extend(
+            (
+                "",
+                f"{index}. {group.name}: {_describe_group(group)}",
+                f"   admitted {len(selection.tickers)}, events {selection.events}, "
+                f"skipped for budget {selection.skipped_for_budget}",
+            )
+        )
+        event = None
+        for ticker in selection.tickers:
+            market = summaries[ticker]
+            if market.event_ticker != event:
+                event = market.event_ticker
+                lines.append(f"   {event}")
+            close = "unknown" if market.close_ts is None else _utc(market.close_ts)
+            lines.append(
+                f"     {ticker:<{ticker_width}}  {market.series_ticker:<{series_width}}  "
+                f"{format_count(market.volume_24h):>{volume_width}}  {close}"
+            )
+    not_recorded = ", ".join(
+        f"{reason} {count}" for reason, count in decision.reason_counts.items()
+    )
+    lines.extend(
+        (
+            "",
+            f"Total: admitted {len(decision.l2_tickers)} of max_l2_markets "
+            f"{policy.max_l2_markets}, skipped for budget {decision.dropped_for_cap}",
+            f"Not recorded: {not_recorded}",
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _describe_group(group: UniverseGroup) -> str:
+    """A group's settings, in the configuration's own words."""
+    if group.series is not None:
+        parts = [f"series {', '.join(group.series)}", f"events {group.events} per series"]
+    else:
+        parts = [f"category {group.category}", f"events {group.events}"]
+    parts.append(f"markets_per_event {group.markets_per_event}")
+    if group.max_markets is not None:
+        parts.append(f"max_markets {group.max_markets}")
+    if group.max_hours_to_close is not None:
+        parts.append(f"max_hours_to_close {group.max_hours_to_close}")
+    return "; ".join(parts)
+
+
+def _utc(unix_s: int) -> str:
+    return datetime.fromtimestamp(unix_s, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class BakedHour(msgspec.Struct, frozen=True, kw_only=True):

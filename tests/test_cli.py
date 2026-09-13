@@ -40,6 +40,7 @@ def write_settings(
     pem: bytes | None = None,
     credentials: bool = True,
     bus_endpoint: str | None = None,
+    groups: bool = True,
 ) -> Path:
     kalshi = '[kalshi]\nenv = "demo"\n'
     if credentials:
@@ -55,11 +56,17 @@ def write_settings(
         key.chmod(0o600)
         kalshi += f'key_id = "key-1"\nprivate_key_path = "{key}"\n'
     bus = "" if bus_endpoint is None else f'bus_endpoint = "{bus_endpoint}"\n'
+    universe = "[recorder.universe]\nmax_l2_markets = 1500\n"
+    if groups:
+        universe += (
+            '\n[[recorder.universe.groups]]\nname = "sports"\ncategory = "Sports"\n'
+            "events = 10\nmarkets_per_event = 1\n"
+        )
     config = tmp_path / "tape.toml"
     config.write_text(
         f"{kalshi}\n"
         f'[recorder]\ndata_dir = "data"\ngroup_size = {group_size}\nbook_connections = 3\n{bus}\n'
-        "[recorder.universe]\nmax_l2_markets = 1500\n"
+        f"{universe}"
     )
     return config
 
@@ -89,6 +96,22 @@ def test_config_check_prints_the_effective_settings_and_exits_0(
     assert shown["kalshi"]["private_key_path"] == str(tmp_path / "read.pem")
     assert shown["recorder"]["data_dir"] == str(tmp_path / "data")
     assert captured.err == ""
+
+
+def test_config_check_warns_when_no_group_would_record_a_market(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = write_settings(tmp_path, groups=False, bus_endpoint="tcp://127.0.0.1:5555")
+    assert main(["config", "check", "--config", str(config)]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["recorder"]["universe"]["groups"] == []
+    assert captured.err == (
+        "tape: warning: recorder.universe has no groups, so tape record would record no market; "
+        "add [[recorder.universe.groups]] tables (ADR 0028)\n"
+    )
+    # tape serve records nothing either way, so checking for it does not warn.
+    assert main(["config", "check", "--for", "serve", "--config", str(config)]) == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_config_check_names_the_invalid_setting_and_exits_1(

@@ -172,7 +172,7 @@ class CatalogEntry(msgspec.Struct, frozen=True, kw_only=True):
         event_ticker: Event the market belongs to.
         volume_24h: Contracts traded in the 24 hours before the listing the decision read.
         close_ts: Unix seconds at which the market closes, or ``None`` when unknown.
-        showcase: Whether the market is recorded because its series is a showcase series.
+        showcase: Whether a series group admitted the market (ADR 0028).
     """
 
     ticker: str

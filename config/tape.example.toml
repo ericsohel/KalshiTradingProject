@@ -4,7 +4,8 @@
 # configuration, and `tape config check --for serve` checks what it needs instead.
 #
 # Every setting can be overridden from the environment as TAPE_<SECTION>__<KEY>, for
-# example TAPE_RECORDER__BOOK_CONNECTIONS=6 or TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES=A,B.
+# example TAPE_RECORDER__BOOK_CONNECTIONS=6 or TAPE_SERVE__ALLOWED_ORIGINS=http://a:5173,http://b:5173;
+# universe groups can be set only in this file.
 # Relative paths resolve against this file's directory; a leading ~ is your home.
 # Secrets are never values here, only paths (docs/OPERATIONS.md 2).
 
@@ -57,11 +58,57 @@ bus_refresh_s = 10
 bus_send_hwm = 10000
 
 [recorder.universe]
-# A fixed-point string, never a float.
+# A category group chooses only events whose 24-hour volume, summed over their markets, is at
+# least this. A fixed-point string, never a float.
 min_volume_24h = "1000.00"
 max_l2_markets = 2000
-showcase_series = ["KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDECISION"]
 exclude_mve = true
+
+# Groups apply in order at every universe refresh until max_l2_markets markets are admitted; a
+# market an earlier group admitted is not counted again (ADR 0028). Each group sets exactly one of
+#   series:   events counts per series: the nearest events of each series, by earliest close;
+#   category: events counts across the group: the events with the highest summed 24-hour volume.
+# Each chosen event gives at most markets_per_event markets, busiest first, and max_markets caps
+# the whole group. max_hours_to_close keeps a group to events whose earliest close is within that
+# many hours, so a sports group records games in play rather than season futures. Markets of series groups are flagged showcase. See what the groups choose now
+# with `uv run tape universe preview --config tape.toml`.
+[[recorder.universe.groups]]
+name = "crypto 15-minute"
+series = ["KXBTC15M", "KXETH15M"]
+events = 1
+markets_per_event = 1
+
+[[recorder.universe.groups]]
+name = "hourly"
+series = ["KXBTCD", "KXETHD", "KXINXU", "KXNASDAQ100U"]
+events = 1
+markets_per_event = 10
+
+[[recorder.universe.groups]]
+name = "economy"
+series = ["KXFEDDECISION", "KXCPIYOY", "KXPAYROLLS", "KXAAAGASW"]
+events = 1
+markets_per_event = 10
+
+[[recorder.universe.groups]]
+name = "weather"
+series = ["KXHIGHNY", "KXHIGHLAX", "KXHIGHCHI", "KXHIGHMIA"]
+events = 1
+markets_per_event = 6
+
+[[recorder.universe.groups]]
+name = "politics"
+category = "Politics"
+events = 50
+markets_per_event = 4
+
+[[recorder.universe.groups]]
+name = "sports"
+category = "Sports"
+events = 200
+markets_per_event = 2
+max_markets = 300
+max_hours_to_close = 48
 
 [serve]
 # `tape serve` follows the recorder's bus at recorder.bus_endpoint, which must then be set, and

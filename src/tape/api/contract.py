@@ -175,7 +175,7 @@ class MarketRow(msgspec.Struct, frozen=True, kw_only=True):
         title: The event's title, or ``null`` until resolved.
         subtitle: The market's YES subtitle, or ``null`` until resolved.
         category: The series category, or ``null`` until resolved.
-        showcase: Whether the market is recorded because its series is a showcase series.
+        showcase: Whether a series group admitted the market to the recorded universe (ADR 0028).
         volume_24h_e2: Contracts traded in the 24 hours before the recorder's latest listing.
         close_ts: Unix seconds at which the market closes, or ``null`` when unknown.
         bid_e4: Best YES bid from the latest ticker update, or ``null``.

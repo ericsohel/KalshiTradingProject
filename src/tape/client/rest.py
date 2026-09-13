@@ -465,10 +465,17 @@ class KalshiRest:
         async for item in self._iter_pages(_page, max_pages=max_pages):
             yield item
 
-    async def series(self, *, min_updated_ts: int | None = None) -> list[Series]:
+    async def series(
+        self, *, category: str | None = None, min_updated_ts: int | None = None
+    ) -> list[Series]:
         """List series (fee regime and category metadata for recurring events).
 
+        Nothing optional is requested: the spec's ``include_volume`` and
+        ``include_product_metadata`` default to false and are not sent.
+
         Args:
+            category: Only series in this category, for example ``"Sports"``, or ``None``
+                for every category.
             min_updated_ts: Only series updated after this Unix timestamp, or ``None``
                 for all series.
 
@@ -480,7 +487,7 @@ class KalshiRest:
             RateLimitedError: The exchange answered 429.
             KalshiTransportError: A network-level failure.
         """
-        params = _drop_none({"min_updated_ts": min_updated_ts})
+        params = _drop_none({"category": category, "min_updated_ts": min_updated_ts})
         response = await self._request("GET", "/series", bucket="read", params=params)
         return list(_decode(response, GetSeriesListResponse).series)
 

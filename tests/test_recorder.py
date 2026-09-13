@@ -47,7 +47,6 @@ from tape.events import (
     Ticker,
 )
 from tape.fixedpoint import CountE2, PriceE4
-from tape.recorder.planner import Group
 from tape.recorder.recorder import (
     CLOCK_JUMP_THRESHOLD_NS,
     CONTROL_CONN_ID,
@@ -64,17 +63,25 @@ from tape.recorder.recorder import (
     universe_retry_delay_s,
 )
 from tape.recorder.tap import BookImage, TapWindow
-from tape.recorder.universe import UniversePolicy
+from tape.recorder.universe import UniverseGroup, UniversePolicy
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.segment import Record, RecordKind, SegmentHeader, SegmentReader, read_keyframe
 from tape.timeutil import NS_PER_MS, NS_PER_S, FrozenClock, Ns
 from tests.fakes import FakeConnection, FakeKalshiWs, RecordingPublisher
+from tests.fakes.rest_payloads import series_payload
 
 NOON: Final = int(datetime(2026, 9, 10, 12, tzinfo=UTC).timestamp()) * NS_PER_S
 REST_URL: Final = "https://rest.test/trade-api/v2"
+TEST_CATEGORY: Final = "Tests"
 POLICY: Final = UniversePolicy(
-    min_volume_24h=CountE2(100_000), max_l2_markets=4, showcase_series=frozenset({"KXSHOW"})
+    min_volume_24h=CountE2(100_000),
+    max_l2_markets=4,
+    groups=(
+        UniverseGroup(name="showcase", series=("KXSHOW",), events=1, markets_per_event=1),
+        UniverseGroup(name="busiest", category=TEST_CATEGORY, events=1, markets_per_event=3),
+    ),
 )
+"""A series group for ``KXSHOW``, then the busiest event of the ``KXA`` and ``KXLOW`` category."""
 LIMITS: Final = {
     "usage_tier": "advanced",
     "read": {"refill_rate": 300, "bucket_capacity": 600},
@@ -177,6 +184,17 @@ class FakeRest:
             ],
             "/account/limits": [httpx.Response(200, json=LIMITS)],
             "/markets": [httpx.Response(200, json={"markets": list(markets), "cursor": ""})],
+            "/series": [
+                httpx.Response(
+                    200,
+                    json={
+                        "series": [
+                            series_payload("KXA", TEST_CATEGORY),
+                            series_payload("KXLOW", TEST_CATEGORY),
+                        ]
+                    },
+                )
+            ],
         }
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -432,6 +450,7 @@ async def test_startup_sizes_the_limiter_and_subscribes_the_planned_groups(tmp_p
             "/trade-api/v2/exchange/status",
             "/trade-api/v2/account/limits",
             "/trade-api/v2/markets",
+            "/trade-api/v2/series",
         ]
         listing = harness.rest.requests[2].url.params
         assert (listing["status"], listing["limit"], listing["mve_filter"]) == (
@@ -439,6 +458,7 @@ async def test_startup_sizes_the_limiter_and_subscribes_the_planned_groups(tmp_p
             "1000",
             "exclude",
         )
+        assert dict(harness.rest.requests[3].url.params) == {"category": TEST_CATEGORY}
         universe = harness.recorder.universe
         assert universe is not None
         assert universe.l2_tickers == {"KXA-1", "KXA-2", "KXA-3", "KXSHOW-1"}
@@ -946,33 +966,112 @@ async def test_listing_quirks_are_logged_and_never_fatal(
     assert harness.recorder.universe.l2_tickers == {"KXA-1"}
 
 
-async def test_showcase_markets_beyond_book_capacity_are_left_out_and_logged(
+async def test_groups_drive_the_plan_and_the_ticker_subscription_as_categories_arrive(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    showcase = [market(f"KXSHOW-{index}", "0.00") for index in (1, 2, 3)]
+    """ADR 0028 with ADR 0027: until the series categories arrive only the series group
+    records; once they do, the category group's markets join the book and ticker
+    subscriptions, and the categories are not requested again within the hour."""
+    caplog.set_level(logging.INFO, logger="tape.recorder.recorder")
+
+    def series_requests() -> int:
+        return sum(1 for request in harness.rest.requests if request.url.path.endswith("/series"))
+
+    def refreshes() -> list[dict[str, Any]]:  # Any: structured log fields of several types
+        return [record.__dict__ for record in logged(caplog, "universe refreshed")]
+
+    async with FakeKalshiWs() as fake, recording(fake.url, tmp_path) as harness:
+        recorder = harness.recorder
+        harness.rest.answers["/series"].insert(0, httpx.Response(503))
+        harness.start()
+        ticker = await harness.connection(fake, TICKER_CONN_ID)
+        (subscribe,) = await ticker.wait_for_commands(1)
+        assert subscribe["params"] == {"channels": ["ticker"], "market_tickers": ["KXSHOW-1"]}
+        assert recorder.universe is not None
+        assert recorder.universe.l2_tickers == {"KXSHOW-1"}
+        (unknown,) = logged(caplog, "series categories unknown; category groups admit nothing")
+        assert unknown.__dict__["categories"] == [TEST_CATEGORY]
+
+        await harness.parked()
+        harness.time.advance(300)
+        commands = await ticker.wait_for_commands(3)
+        assert [command["params"] for command in commands[1:]] == [
+            {"sid": 1, "action": "add_markets", "market_tickers": ["KXA-1", "KXA-2"]},
+            {"sid": 1, "action": "add_markets", "market_tickers": ["KXA-3"]},
+        ]
+        await until(lambda: len(refreshes()) == 2)
+        universe = recorder.universe
+        assert universe is not None
+        assert universe.group_of == {
+            "KXSHOW-1": "showcase",
+            "KXA-1": "busiest",
+            "KXA-2": "busiest",
+            "KXA-3": "busiest",
+        }
+        assert universe.showcase == {"KXSHOW-1"}
+        planned: set[str] = set()
+        for conn_id in (2, 3):
+            group = recorder.supervisors[conn_id].group
+            assert group is not None
+            planned |= group.tickers
+        assert planned == universe.l2_tickers
+        # Moving a market costs a resnapshot, so the one planned first stays put.
+        assert recorder.sink_for("KXSHOW-1") is harness.sinks[2]
+
+        await harness.parked()
+        harness.time.advance(300)
+        await until(lambda: len(refreshes()) == 3)
+        assert series_requests() == 2
+        await harness.parked()
+        harness.time.advance(3600)
+        await until(lambda: len(refreshes()) == 4)
+        assert series_requests() == 3
+
+    first, second = refreshes()[:2]
+    assert first["groups"] == {
+        "showcase": {"admitted": 1, "events": 1, "skipped_for_budget": 0},
+        "busiest": {"admitted": 0, "events": 0, "skipped_for_budget": 0},
+    }
+    assert first["reason_counts"]["no_group"] == 4
+    assert second["groups"]["busiest"] == {"admitted": 3, "events": 1, "skipped_for_budget": 0}
+    assert (second["reason_counts"]["below_volume"], second["reason_counts"]["no_group"]) == (1, 0)
+
+
+async def test_a_universe_without_category_groups_never_requests_series(tmp_path: Path) -> None:
+    series_only = msgspec.structs.replace(POLICY, groups=POLICY.groups[:1])
     async with (
         FakeKalshiWs() as fake,
-        recording(
-            fake.url,
-            tmp_path,
-            markets=showcase,
-            universe=msgspec.structs.replace(POLICY, max_l2_markets=2),
-            group_size=1,
-        ) as harness,
+        recording(fake.url, tmp_path, universe=series_only) as harness,
     ):
         harness.start()
         await until(lambda: harness.recorder.universe is not None)
-        supervisors = harness.recorder.supervisors
-        assert [supervisors[conn_id].group for conn_id in (2, 3)] == [
-            Group(group_id="g0000", conn_id=2, tickers=frozenset({"KXSHOW-1"})),
-            Group(group_id="g0001", conn_id=3, tickers=frozenset({"KXSHOW-2"})),
-        ]
-        assert harness.recorder.sink_for("KXSHOW-3") is None
+        universe = harness.recorder.universe
+        assert universe is not None
+        assert universe.l2_tickers == {"KXSHOW-1"}
+    assert not any(request.url.path.endswith("/series") for request in harness.rest.requests)
 
-    (left_out,) = logged(caplog, "markets left without a book connection")
-    assert left_out.levelno == logging.ERROR
-    assert (left_out.__dict__["unplaced"], left_out.__dict__["first_unplaced"]) == (1, "KXSHOW-3")
-    assert left_out.__dict__["book_capacity"] == 2
+
+async def test_a_universe_without_groups_warns_at_every_refresh(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    empty = msgspec.structs.replace(POLICY, groups=())
+    warning = "no universe groups are configured; no market will be recorded"
+    async with (
+        FakeKalshiWs() as fake,
+        recording(fake.url, tmp_path, universe=empty) as harness,
+    ):
+        harness.start()
+        await until(lambda: harness.recorder.universe is not None)
+        await harness.parked()
+        harness.time.advance(300)
+        await until(lambda: len(logged(caplog, warning)) == 2)
+        universe = harness.recorder.universe
+        assert universe is not None
+        assert universe.l2_tickers == frozenset()
+        # Every active market: KXA-1 to KXA-3, KXSHOW-1, and KXLOW-1.
+        assert universe.reason_counts["no_group"] == 5
+
+    assert all(record.levelno == logging.WARNING for record in logged(caplog, warning))
 
 
 async def test_a_startup_failure_is_raised_before_anything_connects(tmp_path: Path) -> None:

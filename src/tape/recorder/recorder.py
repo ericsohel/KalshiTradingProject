@@ -3,15 +3,16 @@
 Responsibility: orchestrate the recorder process (docs/ARCHITECTURE.md 4, 5, and 7.1) out
 of parts tested on their own. At start it reads the exchange status and sizes the rate
 limiter from the account's tier; then it runs one ``ConnectionSupervisor`` per WebSocket
-connection, lists and selects the order-book universe and hands each book connection its
-subscription groups every ``universe_refresh_s`` (sooner, on a capped backoff, while a
-refresh is failing), writes keyframes, logs a status line, tapes a ``clock_jump`` record
-when the host slept, and runs auxiliary periodic tasks such as the auditor, which reads books,
-sinks, and book taps through it (:meth:`Recorder.open_book_tap`). With a bus publisher it also
-publishes every event its supervisors decode; every ``bus_refresh_s``, the catalog of the
-markets it records followed by a refresh image of each book it holds, paced in slices across
-the interval (ADR 0022); and its status every ``status_interval_s`` (ADR 0023). Dependencies
-arrive fully built, so the orchestration is tested against a fake exchange in virtual time.
+connection, lists the open markets, selects the order-book universe by its groups (ADR 0028),
+and hands each book connection its subscription groups every ``universe_refresh_s`` (sooner, on
+a capped backoff, while a refresh is failing), writes keyframes, logs a status line, tapes a
+``clock_jump`` record when the host slept, and runs auxiliary periodic tasks such as the auditor,
+which reads books, sinks, and book taps through it (:meth:`Recorder.open_book_tap`). With a bus
+publisher it also publishes every event its supervisors decode; every ``bus_refresh_s``, the
+catalog of the markets it records followed by a refresh image of each book it holds, paced in
+slices across the interval (ADR 0022); and its status every ``status_interval_s`` (ADR 0023).
+Dependencies arrive fully built, so the orchestration is tested against a fake exchange in
+virtual time.
 
 Connection layout (ADR 0018): connection 0 is live-only and carries the ``ticker`` channel
 for every market of the current plan, one group that follows each replan (ADR 0027), whose
@@ -55,7 +56,7 @@ from tape.bus.ports import Publisher
 from tape.client.ratelimit import BucketLimits, RateLimiter
 from tape.client.rest import KalshiRest
 from tape.client.ws import WsSession
-from tape.errors import FixedPointError, KalshiError, WireError
+from tape.errors import KalshiError, WireError
 from tape.events import (
     BookRefresh,
     CatalogEntry,
@@ -67,6 +68,12 @@ from tape.events import (
     StatusReport,
     Ticker,
 )
+from tape.recorder.listing import (
+    DEFAULT_MAX_MARKET_PAGES,
+    MarketListing,
+    SeriesCategories,
+    list_open_markets,
+)
 from tape.recorder.planner import Group, Plan, plan
 from tape.recorder.supervisor import (
     ORDERBOOK_CHANNEL,
@@ -75,7 +82,7 @@ from tape.recorder.supervisor import (
     backoff_delay_s,
 )
 from tape.recorder.tap import CompositeBookTap
-from tape.recorder.universe import MarketSummary, UniverseDecision, UniversePolicy, select
+from tape.recorder.universe import UniverseDecision, UniversePolicy, select
 from tape.recorder.writer import HeaderFactory, SegmentSink
 from tape.segment import Record, RecordKind, SegmentHeader, write_keyframe
 from tape.timeutil import NS_PER_S, Clock, Ns, wall_ns_to_datetime
@@ -87,11 +94,9 @@ __all__ = [
     "CONTROL_CONN_ID",
     "DEFAULT_BUS_REFRESH_S",
     "DEFAULT_KEYFRAME_WRITE_TIMEOUT_S",
-    "DEFAULT_MAX_MARKET_PAGES",
     "DEFAULT_SHUTDOWN_TIMEOUT_S",
     "FIRST_BOOK_CONN_ID",
     "LIFECYCLE_CHANNEL",
-    "MARKET_PAGE_LIMIT",
     "MAX_GROUP_SIZE",
     "PINNED_SPEC_VERSIONS",
     "TICKER_CHANNEL",
@@ -139,12 +144,6 @@ PINNED_SPEC_VERSIONS: Final[Mapping[str, str]] = MappingProxyType(
 )
 """Versions of the Kalshi specifications in ``specs/`` that ``tape.wire`` mirrors."""
 
-MARKET_PAGE_LIMIT: Final = 1000
-"""Markets per ``GET /markets`` page, the largest Kalshi serves."""
-
-DEFAULT_MAX_MARKET_PAGES: Final = 500
-"""Page cap on one universe listing (docs/ENGINEERING_STANDARDS.md 3.6)."""
-
 DEFAULT_SHUTDOWN_TIMEOUT_S: Final = 30
 """Deadline for each shutdown stage before stragglers are cancelled."""
 
@@ -169,8 +168,7 @@ BUS_REFRESH_SLICES_PER_S: Final = 10
 
 _SECONDS_PER_MINUTE: Final = 60
 _SECONDS_PER_HOUR: Final = 3_600
-_OPEN_MARKET_STATUS: Final = "open"
-_MVE_FILTER_EXCLUDE: Final = "exclude"
+_NO_CATEGORIES: Final[Mapping[str, str]] = MappingProxyType({})
 
 
 def check_connection_budget(*, book_connections: int, max_connections: int) -> None:
@@ -559,6 +557,14 @@ class Recorder:
         self._tickers: dict[str, Ticker] = {}
         self._plan = Plan(groups=())
         self._universe: UniverseDecision | None = None
+        # Series categories cost a request per category an hour, so only category groups ask.
+        self._categories = (
+            SeriesCategories(
+                rest, categories=config.universe.categories, clock=clock, logger=logger
+            )
+            if config.universe.categories
+            else None
+        )
         self._conn_of: dict[str, int] = {}
         self._universe_failures = 0
         self._universe_wait_s: float = config.universe_refresh_s
@@ -1137,16 +1143,27 @@ class Recorder:
     async def _refresh_universe(self) -> None:
         """List open markets, select the universe, replan, and hand each connection its group.
 
-        Book connections get their planner groups; the ticker connection gets every market
-        of the plan, and the latest-ticker table drops the markets it no longer carries.
+        Series categories are read first when a category group needs them (ADR 0028). Book
+        connections get their planner groups; the ticker connection gets every market of the
+        plan, and the latest-ticker table drops the markets it no longer carries. The book
+        connections carry every selected market, because a selection never exceeds
+        ``max_l2_markets`` and the configuration guarantees room for that many.
 
         Raises:
             KalshiError: If a listing page cannot be fetched.
             WireError: If a listing page does not decode.
         """
-        summaries, truncated = await self._list_markets()
+        if not self._config.universe.groups:
+            self._log.warning("no universe groups are configured; no market will be recorded")
+        listing = await self._list_markets()
+        categories = await self._series_categories()
         now_wall_ns = int(self._clock.wall_ns())
-        decision = select(summaries, self._config.universe, now_ts=now_wall_ns // NS_PER_S)
+        decision = select(
+            listing.markets,
+            self._config.universe,
+            now_ts=now_wall_ns // NS_PER_S,
+            categories=categories,
+        )
         desired = plan(
             decision.l2_tickers,
             max_per_group=self._config.group_size,
@@ -1164,18 +1181,6 @@ class Recorder:
             await self._supervisors[conn_id].set_group(group_of_conn.get(conn_id))
         await self._supervisors[TICKER_CONN_ID].set_group(_ticker_group(desired))
         self._forget_unrecorded_tickers()
-        unplaced = decision.l2_tickers - desired.tickers
-        if unplaced:
-            # Possible only when showcase markets alone exceed the budget, which configuration
-            # validation otherwise guarantees the book connections can carry.
-            self._log.error(
-                "markets left without a book connection; raise book_connections",
-                extra={
-                    "unplaced": len(unplaced),
-                    "first_unplaced": sorted(unplaced)[0],
-                    "book_capacity": self._config.book_connections * self._config.group_size,
-                },
-            )
         self._plan = desired
         self._universe = decision
         self._conn_of = {
@@ -1186,64 +1191,59 @@ class Recorder:
         self._log.info(
             "universe refreshed",
             extra={
-                "listed": len(summaries),
-                "truncated": truncated,
+                "listed": len(listing.markets),
+                "truncated": listing.truncated,
                 "selected": len(decision.l2_tickers),
                 "showcase": len(decision.showcase),
                 "dropped_for_cap": decision.dropped_for_cap,
                 "reason_counts": dict(decision.reason_counts),
-                "groups": len(desired.groups),
-                "unplaced": len(unplaced),
+                "groups": _group_counts(decision),
+                "book_groups": len(desired.groups),
             },
         )
 
-    async def _list_markets(self) -> tuple[list[MarketSummary], bool]:
-        """Page through the open markets, up to the page cap.
-
-        A market that does not convert is skipped and counted rather than failing the whole
-        listing, because one malformed entry must not unsubscribe every other market.
+    async def _list_markets(self) -> MarketListing:
+        """Page through the open markets, logging a listing that skipped markets or was cut short.
 
         Returns:
-            The summaries, and whether the page cap cut the listing short.
+            The listing.
 
         Raises:
             KalshiError: If a page cannot be fetched.
             WireError: If a page does not decode.
         """
-        mve_filter = _MVE_FILTER_EXCLUDE if self._config.universe.exclude_mve else None
-        summaries: list[MarketSummary] = []
-        unreadable = 0
-        first_error = ""
-        cursor: str | None = None
-        truncated = True
-        for _ in range(self._config.max_market_pages):
-            page = await self._rest.markets(
-                status=_OPEN_MARKET_STATUS,
-                cursor=cursor,
-                limit=MARKET_PAGE_LIMIT,
-                mve_filter=mve_filter,
-            )
-            for market in page.items:
-                try:
-                    summaries.append(MarketSummary.from_wire(market))
-                except (WireError, FixedPointError) as exc:
-                    unreadable += 1
-                    first_error = first_error or repr(exc)
-            if not page.cursor:
-                truncated = False
-                break
-            cursor = page.cursor
-        if unreadable:
+        listing = await list_open_markets(
+            self._rest,
+            exclude_mve=self._config.universe.exclude_mve,
+            max_pages=self._config.max_market_pages,
+        )
+        if listing.unreadable:
             self._log.warning(
                 "markets skipped because they did not convert",
-                extra={"skipped": unreadable, "first_error": first_error},
+                extra={"skipped": listing.unreadable, "first_error": listing.first_error},
             )
-        if truncated:
+        if listing.truncated:
             self._log.warning(
                 "market listing cut short by the page cap; the universe is partial",
                 extra={"max_market_pages": self._config.max_market_pages},
             )
-        return summaries, truncated
+        return listing
+
+    async def _series_categories(self) -> Mapping[str, str]:
+        """The category of each series for category groups; nothing when there is none.
+
+        Until a fetch succeeds the map is empty, category groups admit nothing, and every
+        refresh says so.
+        """
+        if self._categories is None:
+            return _NO_CATEGORIES
+        categories = await self._categories.current()
+        if not self._categories.known:
+            self._log.warning(
+                "series categories unknown; category groups admit nothing",
+                extra={"categories": list(self._categories.categories)},
+            )
+        return categories
 
     def _ticker_markets(self) -> frozenset[str]:
         """Markets the ticker connection is meant to carry: the plan's, as last handed to it."""
@@ -1386,6 +1386,18 @@ def _catalog(decision: UniverseDecision) -> MarketCatalog:
             for market in decision.markets
         )
     )
+
+
+def _group_counts(decision: UniverseDecision) -> dict[str, dict[str, int]]:
+    """What each universe group admitted, by group name, for the universe log line (ADR 0028)."""
+    return {
+        group.name: {
+            "admitted": len(group.tickers),
+            "events": group.events,
+            "skipped_for_budget": group.skipped_for_budget,
+        }
+        for group in decision.groups
+    }
 
 
 def _status_report(status: RecorderStatus, *, interval_s: int) -> StatusReport:

@@ -25,8 +25,53 @@ status_interval_s = 60
 [recorder.universe]
 min_volume_24h = "1000.00"
 max_l2_markets = 200
-showcase_series = ["KXBTC15M", "KXPAYROLLS", "KXHIGHNY", "KXFEDDECISION"]
 exclude_mve = true
+
+# The groups of ADR 0028, applied in order at every universe refresh. Check what they choose with
+# `tape universe preview --config /etc/tape/tape.toml` before restarting the recorder.
+[[recorder.universe.groups]]
+name = "crypto 15-minute"
+series = ["KXBTC15M", "KXETH15M"]
+events = 1
+markets_per_event = 1
+
+[[recorder.universe.groups]]
+name = "Bitcoin hourly"
+series = ["KXBTCD"]
+events = 1
+markets_per_event = 6
+
+[[recorder.universe.groups]]
+name = "stock indexes hourly"
+series = ["KXINXU", "KXNASDAQ100U"]
+events = 1
+markets_per_event = 6
+
+[[recorder.universe.groups]]
+name = "economy"
+series = ["KXFEDDECISION", "KXCPIYOY", "KXPAYROLLS", "KXAAAGASW"]
+events = 1
+markets_per_event = 6
+
+[[recorder.universe.groups]]
+name = "weather"
+series = ["KXHIGHNY", "KXHIGHLAX", "KXHIGHCHI", "KXHIGHMIA"]
+events = 1
+markets_per_event = 6
+
+[[recorder.universe.groups]]
+name = "politics"
+category = "Politics"
+events = 5
+markets_per_event = 1
+
+[[recorder.universe.groups]]
+name = "sports"
+category = "Sports"
+events = 10
+markets_per_event = 1
+# Games closing within two days, not season futures, whose summed volume would otherwise win.
+max_hours_to_close = 48
 
 [serve]
 listen_host = "127.0.0.1"

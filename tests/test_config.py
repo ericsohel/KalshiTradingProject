@@ -12,7 +12,6 @@ import msgspec
 import pytest
 
 from tape.config import (
-    DEFAULT_SHOWCASE_SERIES,
     ENDPOINTS,
     BakeSettings,
     KalshiSettings,
@@ -20,6 +19,7 @@ from tape.config import (
     ServeSettings,
     Settings,
     SigningCredentials,
+    UniverseGroupSettings,
     UniverseSettings,
     load_settings,
     redacted,
@@ -27,14 +27,24 @@ from tape.config import (
 )
 from tape.errors import ConfigError
 from tape.fixedpoint import CountE2
-from tape.recorder.universe import UniversePolicy
+from tape.recorder.universe import UniverseGroup, UniversePolicy
 
-EXAMPLE: Final = Path(__file__).resolve().parents[1] / "config" / "tape.example.toml"
+ROOT: Final = Path(__file__).resolve().parents[1]
+EXAMPLE: Final = ROOT / "config" / "tape.example.toml"
+SERVER_EXAMPLE: Final = ROOT / "deploy" / "tape.server.example.toml"
 DELETE: Final = object()
 """Marks a key to leave out of a rendered table."""
 
 type TomlValue = str | int | bool | list[str]
 type Tables = dict[str, dict[str, TomlValue]]
+type GroupTable = dict[str, TomlValue]
+
+VALID_GROUP: Final[GroupTable] = {
+    "name": "g",
+    "series": ["KXA"],
+    "events": 1,
+    "markets_per_event": 1,
+}
 
 
 def toml_value(value: TomlValue) -> str:
@@ -69,6 +79,21 @@ def tables(key: Path) -> Tables:
         "kalshi": {"env": "demo", "key_id": "key-1", "private_key_path": str(key)},
         "recorder": {"data_dir": "data"},
     }
+
+
+def render_with_groups(tables: Tables, *groups: GroupTable) -> str:
+    """Render tables, then one ``[[recorder.universe.groups]]`` table per group."""
+    return render(tables) + "".join(
+        "\n[[recorder.universe.groups]]\n"
+        + "".join(f"{key} = {toml_value(value)}\n" for key, value in group.items())
+        for group in groups
+    )
+
+
+def load_groups(tmp_path: Path, tables: Tables, *groups: GroupTable) -> Settings:
+    path = tmp_path / "tape.toml"
+    path.write_text(render_with_groups(tables, *groups))
+    return load_settings(path, environ={})
 
 
 def load(
@@ -126,11 +151,9 @@ def test_only_env_and_the_data_dir_are_required_and_everything_else_has_a_defaul
         10,
         10_000,
     )
+    # Without groups nothing is recorded; every host names its own (ADR 0028).
     assert recorder.universe.policy() == UniversePolicy(
-        min_volume_24h=CountE2(100_000),
-        max_l2_markets=2000,
-        showcase_series=frozenset(DEFAULT_SHOWCASE_SERIES),
-        exclude_mve=True,
+        min_volume_24h=CountE2(100_000), max_l2_markets=2000, groups=(), exclude_mve=True
     )
     serve = settings.serve
     assert serve == ServeSettings()
@@ -166,14 +189,65 @@ def test_the_example_file_is_valid_and_spells_out_the_defaults(tmp_path: Path, h
     assert settings.kalshi == KalshiSettings(
         env="prod", key_id=settings.kalshi.key_id, private_key_path=settings.kalshi.private_key_path
     )
-    assert settings.recorder == RecorderSettings(data_dir=tmp_path / "data")
+    recorder = settings.recorder
+    assert msgspec.structs.replace(recorder, universe=UniverseSettings()) == RecorderSettings(
+        data_dir=tmp_path / "data"
+    )
     assert settings.serve == ServeSettings()
     assert settings.bake == BakeSettings()
-    assert settings.recorder.universe.showcase_series == (
-        "KXBTC15M",
-        "KXPAYROLLS",
-        "KXHIGHNY",
-        "KXFEDDECISION",
+    # The groups are the one part of the example that is not a default.
+    assert msgspec.structs.replace(recorder.universe, groups=()) == UniverseSettings()
+    policy = recorder.universe.policy()
+    assert any(group.series is not None for group in policy.groups)
+    assert policy.categories == frozenset({"Politics", "Sports"})
+
+
+def test_the_server_example_records_the_groups_of_adr_0028(tmp_path: Path, home: Path) -> None:
+    path = tmp_path / "tape.toml"
+    shutil.copy(SERVER_EXAMPLE, path)
+    # The host's data directory does not exist here; everything else is read as written.
+    environ = {"HOME": str(home), "TAPE_RECORDER__DATA_DIR": str(tmp_path / "data")}
+    policy = load_settings(path, environ=environ).recorder.universe.policy()
+
+    assert (policy.min_volume_24h, policy.max_l2_markets, policy.exclude_mve) == (
+        CountE2(100_000),
+        200,
+        True,
+    )
+    assert policy.groups == (
+        UniverseGroup(
+            name="crypto 15-minute",
+            series=("KXBTC15M", "KXETH15M"),
+            events=1,
+            markets_per_event=1,
+        ),
+        UniverseGroup(name="Bitcoin hourly", series=("KXBTCD",), events=1, markets_per_event=6),
+        UniverseGroup(
+            name="stock indexes hourly",
+            series=("KXINXU", "KXNASDAQ100U"),
+            events=1,
+            markets_per_event=6,
+        ),
+        UniverseGroup(
+            name="economy",
+            series=("KXFEDDECISION", "KXCPIYOY", "KXPAYROLLS", "KXAAAGASW"),
+            events=1,
+            markets_per_event=6,
+        ),
+        UniverseGroup(
+            name="weather",
+            series=("KXHIGHNY", "KXHIGHLAX", "KXHIGHCHI", "KXHIGHMIA"),
+            events=1,
+            markets_per_event=6,
+        ),
+        UniverseGroup(name="politics", category="Politics", events=5, markets_per_event=1),
+        UniverseGroup(
+            name="sports",
+            category="Sports",
+            events=10,
+            markets_per_event=1,
+            max_hours_to_close=48,
+        ),
     )
 
 
@@ -235,7 +309,6 @@ def test_environment_overrides_replace_and_add_values(
             "TAPE_RECORDER__BUS_ENDPOINT": "ipc:///run/tape/bus.sock",
             "TAPE_RECORDER__BUS_REFRESH_S": "60",
             "TAPE_RECORDER__BUS_SEND_HWM": "1000",
-            "TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES": "KXA, KXB,",
             "TAPE_RECORDER__UNIVERSE__EXCLUDE_MVE": "false",
             "TAPE_RECORDER__UNIVERSE__MIN_VOLUME_24H": "5.00",
             "TAPE_TEST_ENV": "demo",  # no separator: not an override
@@ -257,9 +330,7 @@ def test_environment_overrides_replace_and_add_values(
         60,
         1000,
     )
-    assert settings.recorder.universe == UniverseSettings(
-        min_volume_24h="5.00", showcase_series=("KXA", "KXB"), exclude_mve=False
-    )
+    assert settings.recorder.universe == UniverseSettings(min_volume_24h="5.00", exclude_mve=False)
 
 
 @pytest.mark.parametrize(
@@ -288,6 +359,19 @@ def test_environment_overrides_replace_and_add_values(
             {"TAPE_RECORDER__GROUP_SIZE": "501"},
             r"<= 500 - at `\$\.recorder\.group_size` \(environment overrides: "
             r"TAPE_RECORDER__GROUP_SIZE\)",
+        ),
+        (
+            {"TAPE_RECORDER__UNIVERSE__SHOWCASE_SERIES": "KXA,KXB"},
+            r"there is no setting recorder\.universe\.showcase_series$",
+        ),
+        (
+            {"TAPE_RECORDER__UNIVERSE__GROUPS": "KXA"},
+            r"^TAPE_RECORDER__UNIVERSE__GROUPS: recorder\.universe\.groups is a list of tables, "
+            r"which only the configuration file can set$",
+        ),
+        (
+            {"TAPE_RECORDER__UNIVERSE__GROUPS__EVENTS": "2"},
+            r"^TAPE_RECORDER__UNIVERSE__GROUPS__EVENTS: recorder\.universe\.groups is a list of",
         ),
     ],
 )
@@ -392,7 +476,12 @@ def test_an_override_into_a_value_that_is_not_a_table_is_refused(tmp_path: Path)
         ),
         (("recorder.universe", "min_volume_24h"), 1000, r"Expected `str`, got `int`"),
         (("recorder.universe", "max_l2_markets"), -1, r"at `\$\.recorder\.universe\.max_l2"),
-        (("recorder.universe", "showcase_series"), ["KXA", ""], r"showcase_series\[1\]`"),
+        # Removed by ADR 0028: an old file that still sets it is refused by name.
+        (
+            ("recorder.universe", "showcase_series"),
+            ["KXBTC15M"],
+            r"unknown field `showcase_series` - at `\$\.recorder\.universe`",
+        ),
         (("recorder.universe", "exclude_mve"), "yes", r"Expected `bool`, got `str`"),
     ],
 )
@@ -408,6 +497,113 @@ def test_every_invalid_value_is_refused_with_its_location(
         body[setting] = value
     with pytest.raises(ConfigError, match=message):
         load_all(tmp_path, tables)
+
+
+def test_universe_groups_are_read_in_order_into_the_policy(tmp_path: Path, tables: Tables) -> None:
+    tables["recorder.universe"] = {"max_l2_markets": 100}
+    settings = load_groups(
+        tmp_path,
+        tables,
+        {
+            "name": "crypto 15-minute",
+            "series": ["KXBTC15M", "KXETH15M"],
+            "events": 1,
+            "markets_per_event": 1,
+        },
+        {
+            "name": "sports",
+            "category": "Sports",
+            "events": 10,
+            "markets_per_event": 2,
+            "max_markets": 15,
+            "max_hours_to_close": 6,
+        },
+    )
+    policy = settings.recorder.universe.policy()
+    assert policy.groups == (
+        UniverseGroup(
+            name="crypto 15-minute",
+            series=("KXBTC15M", "KXETH15M"),
+            events=1,
+            markets_per_event=1,
+        ),
+        UniverseGroup(
+            name="sports",
+            category="Sports",
+            events=10,
+            markets_per_event=2,
+            max_markets=15,
+            max_hours_to_close=6,
+        ),
+    )
+    assert policy.categories == frozenset({"Sports"})
+    assert redacted(settings)["recorder"]["universe"]["groups"][1] == {
+        "name": "sports",
+        "series": None,
+        "category": "Sports",
+        "events": 10,
+        "markets_per_event": 2,
+        "max_markets": 15,
+        "max_hours_to_close": 6,
+    }
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"category": "Sports"},
+            r"universe group 'g' must set exactly one of series and category - at "
+            r"`\$\.recorder\.universe\.groups\[1\]`",
+        ),
+        (
+            {"series": DELETE},
+            r"universe group 'g' must set exactly one of series and category - at "
+            r"`\$\.recorder\.universe\.groups\[1\]`",
+        ),
+        ({"series": []}, r"length >= 1 - at `\$\.recorder\.universe\.groups\[1\]\.series`"),
+        ({"series": ["KXA", "KXB", "KXA"]}, r"universe group 'g' lists KXA more than once"),
+        ({"series": ["KX A"]}, r"at `\$\.recorder\.universe\.groups\[1\]\.series\[0\]`"),
+        ({"series": DELETE, "category": ""}, r"at `\$\.recorder\.universe\.groups\[1\]\.category`"),
+        ({"name": ""}, r"at `\$\.recorder\.universe\.groups\[1\]\.name`"),
+        ({"name": " padded"}, r"at `\$\.recorder\.universe\.groups\[1\]\.name`"),
+        ({"events": 0}, r">= 1 - at `\$\.recorder\.universe\.groups\[1\]\.events`"),
+        (
+            {"markets_per_event": DELETE},
+            r"missing required field `markets_per_event` - at "
+            r"`\$\.recorder\.universe\.groups\[1\]`",
+        ),
+        ({"max_markets": 0}, r">= 1 - at `\$\.recorder\.universe\.groups\[1\]\.max_markets`"),
+        (
+            {"max_hours_to_close": 0},
+            r">= 1 - at `\$\.recorder\.universe\.groups\[1\]\.max_hours_to_close`",
+        ),
+        (
+            {"showcase": True},
+            r"unknown field `showcase` - at `\$\.recorder\.universe\.groups\[1\]`",
+        ),
+    ],
+)
+def test_every_invalid_group_is_refused_with_its_location(
+    tmp_path: Path, tables: Tables, changes: dict[str, object], message: str
+) -> None:
+    broken = dict(VALID_GROUP)
+    for key, value in changes.items():
+        if value is DELETE:
+            del broken[key]
+        else:
+            assert isinstance(value, str | int | bool | list)
+            broken[key] = value
+    with pytest.raises(ConfigError, match=message):
+        load_groups(tmp_path, tables, VALID_GROUP | {"name": "first"}, broken)
+
+
+def test_group_names_must_be_unique(tmp_path: Path, tables: Tables) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"universe group names must be unique; repeated: 'g' - at `\$\.recorder\.universe`",
+    ):
+        load_groups(tmp_path, tables, VALID_GROUP, VALID_GROUP | {"series": ["KXB"]})
 
 
 def test_a_universe_the_book_connections_cannot_carry_is_refused_with_the_fix(
@@ -538,13 +734,18 @@ def test_redacted_shows_identity_paths_and_endpoints_as_json(
         "ws_url": "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
     }
     assert shown["recorder"]["data_dir"] == str(tmp_path / "data")
-    assert tuple(shown["recorder"]["universe"]["showcase_series"]) == DEFAULT_SHOWCASE_SERIES
+    assert tuple(shown["recorder"]["universe"]["groups"]) == ()
     assert json.loads(msgspec.json.encode(shown))["kalshi"] == shown["kalshi"]
 
 
 def test_settings_built_in_code_are_validated_too() -> None:
     with pytest.raises(ValueError, match="fixed-point count"):
         UniverseSettings(min_volume_24h="lots")
+    with pytest.raises(ValueError, match="'g' must set exactly one of series and category"):
+        UniverseGroupSettings(name="g", events=1, markets_per_event=1)
+    sports = UniverseGroupSettings(name="g", category="Sports", events=1, markets_per_event=1)
+    with pytest.raises(ValueError, match="names must be unique"):
+        UniverseSettings(groups=(sports, sports))
     with pytest.raises(ValueError, match="needs 17 connections"):
         RecorderSettings(data_dir=Path("data"), book_connections=15)
     with pytest.raises(ValueError, match="whole number of minutes"):

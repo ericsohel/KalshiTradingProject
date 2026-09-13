@@ -20,6 +20,7 @@ from tape.errors import KalshiHttpError, KalshiTransportError, RateLimitedError,
 from tape.fixedpoint import CountE2
 from tape.timeutil import NS_PER_MS, FrozenClock
 from tape.wire.rest import CreateOrderV2Request
+from tests.fakes.rest_payloads import series_payload
 
 BASE_URL: Final = "https://api.example.com/trade-api/v2"
 
@@ -717,6 +718,18 @@ async def test_series_and_fee_changes_decode() -> None:
     assert series[0].ticker == "S"
     assert fee_changes[0].fee_multiplier == 0.5
     assert router.requests[1].url.params.get("show_historical") == "true"
+
+
+async def test_series_are_filtered_by_category_and_nothing_optional_is_requested() -> None:
+    """ADR 0028 reads categories hourly; volumes and product metadata are left at their default."""
+    router = Router()
+    body = {"series": [series_payload("KXNFLGAME", "Sports")]}
+    router.add("GET", "/series", httpx.Response(200, json=body))
+    async with make_client(router) as client:
+        rest = KalshiRest(BASE_URL, client, FakeRateLimiter(), FrozenClock())
+        series = await rest.series(category="Sports")
+    assert [(entry.ticker, entry.category) for entry in series] == [("KXNFLGAME", "Sports")]
+    assert dict(router.requests[0].url.params) == {"category": "Sports"}
 
 
 async def test_events_decodes_with_nested_markets_flag() -> None:
